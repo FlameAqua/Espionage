@@ -1,0 +1,30 @@
+@import 'tailwindcss';
+
+/* Class-based dark mode: `dark:` variants activate when <html> has .dark. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+}
+
+/* Cytoscape forces the container's position to relative on init, so it must
+   carry its own explicit size rather than rely on absolute positioning. */
+#graph {
+  width: 100%;
+  height: 100%;
+}

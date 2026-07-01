@@ -1,0 +1,539 @@
+// Builds a TopologyGraph from the raw 3CX entity collections.
+//
+// 3CX's xapi destination/forwarding fields vary by version, so resolution is
+// deliberately tolerant: nodes are indexed by extension number and by id, and
+// routing targets are discovered by scanning destination-shaped sub-objects
+// rather than hard-coding one schema. Anything that can't be resolved is kept
+// as an "unresolved" node and recorded as a warning so it's visible, not lost.
+
+import type { Topology } from '../../../shared/types'
+import type { GraphEdge, GraphNode, NodeKind, TopologyGraph } from './model'
+
+type Obj = Record<string, unknown>
+
+// 3CX destination types that are real targets but aren't fetched as their own
+// collection — routed to, but rendered as terminal "endpoint" nodes.
+const KNOWN_ENDPOINT_TYPES =
+  /fax|conference|voicemail|routepoint|announcement|callflow|parking|sharedparking/i
+
+function prettyType(type: string): string {
+  return type
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/RoutePoint/i, 'Route Point')
+    .trim()
+}
+
+const str = (v: unknown): string => (v == null ? '' : String(v)).trim()
+const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** First non-empty value among the given keys (case-insensitive). */
+function pick(o: Obj, ...keys: string[]): unknown {
+  const lower: Record<string, unknown> = {}
+  for (const k of Object.keys(o)) lower[k.toLowerCase()] = o[k]
+  for (const k of keys) {
+    const v = lower[k.toLowerCase()]
+    if (v !== undefined && v !== null && v !== '') return v
+  }
+  return undefined
+}
+
+function displayName(o: Obj): string {
+  const dn = str(pick(o, 'DisplayName', 'Name', 'RuleName', 'FriendlyName'))
+  if (dn) return dn
+  const first = str(pick(o, 'FirstName'))
+  const last = str(pick(o, 'LastName'))
+  const full = `${first} ${last}`.trim()
+  return full
+}
+
+class Builder {
+  nodes: GraphNode[] = []
+  edges: GraphEdge[] = []
+  warnings: string[] = []
+
+  private byId = new Map<string, GraphNode>() // id -> node (our composite id)
+  private byNumber = new Map<string, GraphNode>() // extension number -> node
+  private byEntityId = new Map<string, GraphNode>() // 3CX numeric Id -> node
+  private edgeByPair = new Map<string, GraphEdge>() // "source->target" -> collapsed edge
+
+  addNode(kind: NodeKind, key: string, label: string, raw: Obj, number?: string): GraphNode {
+    const id = `${kind}:${key}`
+    const existing = this.byId.get(id)
+    if (existing) return existing
+    const node: GraphNode = { id, kind, label: label || id, raw, number }
+    this.nodes.push(node)
+    this.byId.set(id, node)
+    if (number) this.byNumber.set(number, node)
+    const eid = str(raw['Id'])
+    if (eid) this.byEntityId.set(eid, node)
+    return node
+  }
+
+  getById(id: string): GraphNode | undefined {
+    return this.byId.get(id)
+  }
+
+  getByNumber(number: string): GraphNode | undefined {
+    return this.byNumber.get(number)
+  }
+
+  getByEntityId(id: string): GraphNode | undefined {
+    return this.byEntityId.get(id)
+  }
+
+  /** Collapse every relationship between the same source→target into one edge,
+   *  accumulating the individual labels. Fewer elements = faster layout. */
+  addEdge(source: string, target: string, kind: GraphEdge['kind'], label?: string): void {
+    if (source === target) return
+    const id = `${source}->${target}`
+    let edge = this.edgeByPair.get(id)
+    if (!edge) {
+      edge = { id, source, target, kind, labels: [] }
+      this.edges.push(edge)
+      this.edgeByPair.set(id, edge)
+    }
+    if (label && !edge.labels.includes(label)) edge.labels.push(label)
+  }
+
+  /** Resolve a destination reference (by number, then id) to an existing node,
+   *  or synthesize an external/unresolved node so the route stays visible. */
+  resolveTarget(
+    ref: { number?: string; id?: string; type?: string; external?: string },
+    context: string
+  ): GraphNode | null {
+    if (ref.number) {
+      const n = this.byNumber.get(ref.number)
+      if (n) return n
+    }
+    if (ref.id) {
+      const n = this.byEntityId.get(ref.id)
+      if (n) return n
+    }
+    const type = (ref.type ?? '').toLowerCase()
+    if (ref.external || type.includes('external') || type.includes('outbound')) {
+      const key = ref.external || ref.number || 'external'
+      return this.addNode('external', key, ref.external || ref.number || 'External', {
+        External: ref.external,
+        Number: ref.number,
+        Type: ref.type
+      })
+    }
+    // Recognised 3CX targets we don't fetch as their own collection (fax,
+    // conference, voicemail, call-flow route points, …). These are real
+    // destinations, not errors — show them as terminal endpoint nodes.
+    if (KNOWN_ENDPOINT_TYPES.test(type) && ref.number) {
+      const label = `${prettyType(ref.type!)} ${ref.number}`.trim()
+      return this.addNode('endpoint', `${type}:${ref.number}`, label, {
+        Number: ref.number,
+        Type: ref.type
+      })
+    }
+    // Pure "end call / hangup" style targets aren't worth a node.
+    if (!ref.number && !ref.id) return null
+    const key = ref.number || ref.id || 'unknown'
+    this.warnings.push(
+      `Unresolved route target "${key}"${ref.type ? ` (type ${ref.type})` : ''} from ${context}.`
+    )
+    return this.addNode('unknown', key, ref.number ? `#${ref.number}` : key, {
+      Number: ref.number,
+      Id: ref.id,
+      Type: ref.type
+    })
+  }
+
+  build(): TopologyGraph {
+    return { nodes: this.nodes, edges: this.edges, warnings: this.warnings }
+  }
+}
+
+/** Detect & normalise a destination-shaped object into a target reference. */
+function asDestRef(
+  v: unknown
+): { number?: string; id?: string; type?: string; external?: string } | null {
+  if (!isObj(v)) return null
+  // Newer xapi nests the real target under a Peer/Destination object.
+  const peer = v['Peer'] ?? v['Destination'] ?? v['To']
+  if (isObj(peer)) {
+    const inner = asDestRef(peer)
+    if (inner) {
+      const external = str(pick(v, 'External', 'ExternalNumber'))
+      if (external && !inner.external) inner.external = external
+      return inner
+    }
+  }
+  const number = str(pick(v, 'Number', 'Extension', 'DialNumber'))
+  const id = str(pick(v, 'Id', 'PeerId', 'DestinationId'))
+  const type = str(pick(v, 'Type', 'To', 'PeerType', 'DestinationType'))
+  const external = str(pick(v, 'External', 'ExternalNumber'))
+  if (number || external || (id && type)) {
+    return {
+      number: number || undefined,
+      id: id || undefined,
+      type: type || undefined,
+      external: external || undefined
+    }
+  }
+  return null
+}
+
+const DEST_KEY_RE =
+  /dest|forward|route|overflow|noanswer|no_answer|busy|timeout|fwd|fail|target|menu|prompt|option|office|holiday|invalid/i
+
+/** Collect routing edges from any destination-shaped fields on an entity. */
+function collectRoutes(b: Builder, sourceId: string, entity: Obj, contextLabel: string): void {
+  for (const [key, value] of Object.entries(entity)) {
+    if (!DEST_KEY_RE.test(key)) continue
+    routeFromValue(b, sourceId, key, value, contextLabel)
+  }
+}
+
+function routeFromValue(
+  b: Builder,
+  sourceId: string,
+  key: string,
+  value: unknown,
+  contextLabel: string
+): void {
+  if (Array.isArray(value)) {
+    for (const el of value) {
+      if (!isObj(el)) continue
+      // IVR-menu style: element carries its own DTMF label + a destination.
+      const input = str(pick(el, 'Input', 'Digit', 'Digits', 'Key', 'Dtmf', 'DtmfDigit', 'Number'))
+      const ref = asDestRef(el) ?? firstNestedDest(el)
+      if (ref) {
+        const target = b.resolveTarget(ref, contextLabel)
+        if (target) b.addEdge(sourceId, target.id, 'route', input ? `key ${input}` : prettyKey(key))
+      }
+    }
+    return
+  }
+  if (isObj(value)) {
+    const ref = asDestRef(value)
+    if (ref) {
+      const target = b.resolveTarget(ref, contextLabel)
+      if (target) {
+        const kind = /overflow|noanswer|no_answer|busy|timeout|fail/i.test(key)
+          ? 'overflow'
+          : 'route'
+        b.addEdge(sourceId, target.id, kind, prettyKey(key))
+      }
+    } else {
+      // Nested wrapper (e.g. OfficeRoute: { Forward: {...} }) — scan one level in.
+      for (const [k2, v2] of Object.entries(value)) {
+        if (DEST_KEY_RE.test(k2) || asDestRef(v2))
+          routeFromValue(b, sourceId, `${key} ${k2}`, v2, contextLabel)
+      }
+    }
+  }
+}
+
+function firstNestedDest(o: Obj): ReturnType<typeof asDestRef> {
+  for (const v of Object.values(o)) {
+    const ref = asDestRef(v)
+    if (ref) return ref
+  }
+  return null
+}
+
+/** Compute the 3CX management-console deep-link path for each node. Inbound
+ *  rules live under their owning trunk (matched by DID → trunk DidNumbers). */
+function setThreecxPaths(b: Builder, topo: Topology): void {
+  const didToTrunk = new Map<string, string>()
+  for (const t of topo.trunks.value as Obj[]) {
+    const tid = str(pick(t, 'Id'))
+    const dids = t['DidNumbers']
+    if (tid && Array.isArray(dids)) for (const d of dids) if (str(d)) didToTrunk.set(str(d), tid)
+  }
+  for (const node of b.nodes) {
+    const id = str(node.raw['Id'])
+    switch (node.kind) {
+      case 'user':
+        if (id) node.threecxPath = `users/edit/${id}`
+        break
+      case 'queue':
+        if (id) node.threecxPath = `call-handling/queue/${id}`
+        break
+      case 'ringGroup':
+        if (id) node.threecxPath = `call-handling/ring-group/${id}`
+        break
+      case 'ivr':
+        if (id) node.threecxPath = `call-handling/digital-receptionist/${id}`
+        break
+      case 'trunk':
+        if (id) node.threecxPath = `voice-and-chat/trunk/edit/${id}`
+        break
+      case 'bridge':
+        if (id) node.threecxPath = `voice-and-chat/bridge/edit/${id}`
+        break
+      case 'inboundRule': {
+        const did = str(pick(node.raw, 'Data', 'DID', 'Did', 'DidNumber', 'Number')).split(
+          /[,\s;]+/
+        )[0]
+        const tid = did ? didToTrunk.get(did) : undefined
+        if (tid) node.threecxPath = `voice-and-chat/trunk/edit/${tid}`
+        break
+      }
+    }
+  }
+}
+
+/** Record, on each bridge node, the outbound-rule prefixes routed across it
+ *  (i.e. which extension ranges this system sends to the remote PBX). */
+function attachBridgeOutbound(b: Builder, topo: Topology): void {
+  for (const rule of (topo.outboundRules?.value ?? []) as Obj[]) {
+    const prefix = str(pick(rule, 'Prefix'))
+    const name = str(pick(rule, 'Name'))
+    const routes = rule['Routes']
+    if (!Array.isArray(routes)) continue
+    const seen = new Set<string>()
+    for (const r of routes) {
+      if (!isObj(r)) continue
+      const tid = str(pick(r, 'TrunkId'))
+      if (!tid || tid === '-1' || seen.has(tid)) continue
+      seen.add(tid)
+      const node = b.getByEntityId(tid)
+      if (!node || node.kind !== 'bridge') continue
+      node.info ??= []
+      const value = prefix ? `${prefix}${name ? ` — ${name}` : ''}` : name
+      if (value) node.info.push({ label: 'Sends', value })
+      // Label the bridge → remote-system edge with the sent prefixes.
+      const host = str(pick(node.raw, 'RemoteMyPhoneUriHost'))
+      if (host && prefix) b.addEdge(node.id, `system:${host}`, 'trunk', prefix)
+    }
+  }
+}
+
+function prettyKey(key: string): string {
+  return key
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .trim()
+}
+
+export function buildTopology(topo: Topology): TopologyGraph {
+  const b = new Builder()
+
+  // --- Pass 1: create nodes for everything addressable so routes can resolve.
+  for (const raw of topo.users.value as Obj[]) {
+    const number = str(pick(raw, 'Number', 'Extension'))
+    if (!number) continue
+    b.addNode('user', number, displayName(raw) || `#${number}`, raw, number)
+  }
+  for (const raw of topo.queues.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    b.addNode(
+      'queue',
+      number || str(pick(raw, 'Id')),
+      displayName(raw) || `Queue ${number}`,
+      raw,
+      number || undefined
+    )
+  }
+  for (const raw of topo.ringGroups.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    b.addNode(
+      'ringGroup',
+      number || str(pick(raw, 'Id')),
+      displayName(raw) || `Ring Group ${number}`,
+      raw,
+      number || undefined
+    )
+  }
+  for (const raw of topo.receptionists.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    b.addNode(
+      'ivr',
+      number || str(pick(raw, 'Id')),
+      displayName(raw) || `IVR ${number}`,
+      raw,
+      number || undefined
+    )
+  }
+  for (const raw of topo.trunks.value as Obj[]) {
+    const id = str(pick(raw, 'Id'))
+    const number = str(pick(raw, 'Number'))
+    const gw = isObj(raw['Gateway']) ? (raw['Gateway'] as Obj) : {}
+    // The trunk's real name lives on the Gateway (there's no top-level Name).
+    const name =
+      str(pick(gw, 'Name')) || displayName(raw) || str(pick(raw, 'ProviderName')) || `Trunk ${id}`
+    const remoteHost = str(pick(raw, 'RemoteMyPhoneUriHost'))
+    const gwType = str(pick(gw, 'Type'))
+    // A real cross-PBX bridge is a Bridge* gateway that names a remote 3CX host
+    // (this excludes the internal "WebMeeting bridge").
+    if (/bridge/i.test(gwType) && remoteHost) {
+      const node = b.addNode('bridge', id || number, name, raw, number || undefined)
+      node.info = [
+        {
+          label: 'Role',
+          value: /master/i.test(gwType) ? 'Master' : /slave/i.test(gwType) ? 'Slave' : gwType
+        },
+        { label: 'Remote system', value: remoteHost }
+      ]
+      const prefix = str(pick(raw, 'RemotePBXPreffix'))
+      if (prefix) node.info.push({ label: 'Remote prefix', value: prefix })
+      // Draw the bridge going off to the remote PBX so it's not floating alone.
+      const sys = b.addNode('system', remoteHost, remoteHost, { Host: remoteHost })
+      b.addEdge(node.id, sys.id, 'trunk')
+    } else {
+      b.addNode('trunk', id || number, name, raw, number || undefined)
+    }
+  }
+  for (const raw of topo.inboundRules.value as Obj[]) {
+    const id = str(pick(raw, 'Id'))
+    // Show the dialled number (DID) on the rule itself — DIDs aren't their own
+    // nodes; the Inbound Rule is what routing hangs off.
+    const did = ruleDid(raw)
+    b.addNode('inboundRule', id || displayName(raw), displayName(raw) || `Rule ${id}`, raw, did)
+  }
+
+  // Departments become badges on their members, not nodes on the canvas.
+  attachDepartments(b, topo)
+  // Outbound rules tell us which number ranges each bridge sends to its system.
+  attachBridgeOutbound(b, topo)
+  // Deep-link paths for the "Open in 3CX" action.
+  setThreecxPaths(b, topo)
+
+  // --- Pass 2: membership edges (explicit, well-known shapes).
+  for (const raw of topo.queues.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const self = `queue:${number || str(pick(raw, 'Id'))}`
+    addMembers(b, self, raw, ['Agents'], 'agent')
+    addMembers(b, self, raw, ['Managers'], 'manager')
+  }
+  for (const raw of topo.ringGroups.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const self = `ringGroup:${number || str(pick(raw, 'Id'))}`
+    addMembers(b, self, raw, ['Members', 'Agents'], 'member')
+  }
+
+  // --- Pass 3: routing edges (tolerant destination scan).
+  for (const raw of topo.inboundRules.value as Obj[]) {
+    const id = str(pick(raw, 'Id'))
+    const self = `inboundRule:${id || displayName(raw)}`
+    collectRoutes(b, self, raw, `inbound rule "${displayName(raw) || id}"`)
+    linkRuleTrunk(b, self, raw)
+  }
+  for (const raw of topo.receptionists.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const self = `ivr:${number || str(pick(raw, 'Id'))}`
+    collectRoutes(b, self, raw, `IVR "${displayName(raw) || number}"`)
+    collectDnForwards(b, self, raw, `IVR "${displayName(raw) || number}"`)
+  }
+  for (const raw of topo.queues.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const self = `queue:${number || str(pick(raw, 'Id'))}`
+    collectRoutes(b, self, raw, `queue "${displayName(raw) || number}"`)
+    collectDnForwards(b, self, raw, `queue "${displayName(raw) || number}"`)
+  }
+  for (const raw of topo.ringGroups.value as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const self = `ringGroup:${number || str(pick(raw, 'Id'))}`
+    collectRoutes(b, self, raw, `ring group "${displayName(raw) || number}"`)
+    collectDnForwards(b, self, raw, `ring group "${displayName(raw) || number}"`)
+  }
+
+  return b.build()
+}
+
+/** Handle 3CX's split "<Prefix>ForwardDN" (target number) + "<Prefix>ForwardType"
+ *  (destination type) pairs, e.g. Timeout / InvalidKey / digit-key IVR options. */
+function collectDnForwards(b: Builder, sourceId: string, entity: Obj, context: string): void {
+  for (const [key, val] of Object.entries(entity)) {
+    const m = /^(.*)ForwardDN$/.exec(key)
+    if (!m) continue
+    const number = str(val)
+    if (!number) continue
+    const type = str(entity[`${m[1]}ForwardType`])
+    if (/endcall|hangup|voicemail|none/i.test(type)) continue
+    const target = b.resolveTarget({ number, type: type || undefined }, context)
+    if (target) b.addEdge(sourceId, target.id, 'route', prettyKey(m[1]) || 'forward')
+  }
+}
+
+function addMembers(
+  b: Builder,
+  sourceId: string,
+  entity: Obj,
+  keys: string[],
+  kind: GraphEdge['kind']
+): void {
+  for (const key of keys) {
+    const arr = entity[key]
+    if (!Array.isArray(arr)) continue
+    for (const m of arr) {
+      if (!isObj(m)) continue
+      const ref = asDestRef(m) ?? {
+        number: str(pick(m, 'Number', 'Extension')) || undefined,
+        id: str(pick(m, 'Id')) || undefined
+      }
+      const target = b.resolveTarget(ref, `${sourceId} ${key}`)
+      if (target) b.addEdge(sourceId, target.id, kind, kind)
+    }
+  }
+}
+
+function linkRuleTrunk(b: Builder, ruleId: string, rule: Obj): void {
+  const trunkId = str(pick(rule, 'TrunkId', 'GatewayId'))
+  const trunkNumber = str(pick(rule, 'TrunkNumber'))
+  let trunk: GraphNode | undefined
+  if (trunkId) trunk = b.getById(`trunk:${trunkId}`)
+  if (!trunk && trunkNumber) trunk = b.getByNumber(trunkNumber)
+  if (trunk) b.addEdge(trunk.id, ruleId, 'trunk', 'inbound')
+}
+
+/** The dialled number(s) an inbound rule matches, shown on the rule node.
+ *  3CX keeps the DID in `Data` when Condition is BasedOnDID. */
+function ruleDid(rule: Obj): string | undefined {
+  const multi = (s: string): string | undefined => {
+    const parts = s.split(/[,\s;]+/).filter(Boolean)
+    if (!parts.length) return undefined
+    return parts.length > 1 ? `${parts[0]} +${parts.length - 1}` : parts[0]
+  }
+  const cond = str(pick(rule, 'Condition'))
+  const data = str(pick(rule, 'Data'))
+  if (data && /did/i.test(cond)) return multi(data)
+  const direct = str(pick(rule, 'DID', 'Did', 'DidNumber', 'Number'))
+  if (direct) return multi(direct)
+  const list = rule['DIDs'] ?? rule['DidNumbers'] ?? rule['Dids']
+  if (Array.isArray(list) && list.length) {
+    const nums = list
+      .map((d) => (isObj(d) ? str(pick(d, 'Number', 'DidNumber', 'DID', 'Did')) : str(d)))
+      .filter(Boolean)
+    if (nums.length) return nums.length > 1 ? `${nums[0]} +${nums.length - 1}` : nums[0]
+  }
+  return data ? multi(data) : undefined
+}
+
+/** Attach department (group) names to the user nodes that belong to them. */
+function attachDepartments(b: Builder, topo: Topology): void {
+  const add = (num: string, dept: string): void => {
+    const node = b.getByNumber(num)
+    if (!node) return
+    node.departments ??= []
+    if (!node.departments.includes(dept)) node.departments.push(dept)
+  }
+  // 3CX's tenant-wide "DEFAULT" group is noise as a department badge.
+  const isReal = (dept: string): boolean => !!dept && !/^default$/i.test(dept)
+  // From each group's member list.
+  for (const raw of topo.groups.value as Obj[]) {
+    const dept = displayName(raw)
+    if (!isReal(dept)) continue
+    const members = raw['Members'] ?? raw['Users']
+    if (!Array.isArray(members)) continue
+    for (const m of members) {
+      const num = isObj(m) ? str(pick(m, 'Number', 'Extension')) : str(m)
+      if (num) add(num, dept)
+    }
+  }
+  // From each user's own expanded Groups (Name holds the department).
+  for (const raw of topo.users.value as Obj[]) {
+    const num = str(pick(raw, 'Number', 'Extension'))
+    const groups = raw['Groups']
+    if (!num || !Array.isArray(groups)) continue
+    for (const g of groups) {
+      const dept = isObj(g) ? str(pick(g, 'Name')) : str(g)
+      if (isReal(dept)) add(num, dept)
+    }
+  }
+}
