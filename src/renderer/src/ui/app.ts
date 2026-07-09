@@ -17,10 +17,19 @@ import { renderDetails } from './details'
 import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
+import { auditTopology, groupFindings } from '../graph/audit'
 
 interface AppCallbacks {
   onReload: () => void
   onDisconnect: () => void
+  onOpenSnapshot: () => void
+}
+
+interface DidRow {
+  id: string
+  did: string
+  name: string
+  dests: string[]
 }
 
 const esc = (s: unknown): string =>
@@ -107,7 +116,11 @@ export function renderApp(
       <div id="body" class="grid grid-cols-[12rem_1fr_20rem] min-h-0">
         <aside class="min-h-0 flex flex-col bg-white border-r border-slate-200 dark:bg-slate-900 dark:border-slate-800">
           <div class="flex-1 overflow-y-auto p-3">
-            <h3 class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-2">Categories</h3>
+            <button id="catHeader" type="button" class="w-full flex items-center justify-between mb-2">
+              <span class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Categories</span>
+              <span id="catChevron" class="text-slate-400 text-[10px] leading-none">▾</span>
+            </button>
+            <div id="catBody">
             <p class="text-[10px] text-slate-400 mb-1.5">Checkbox shows/hides · click a name to highlight it</p>
             <ul id="legend" class="space-y-0.5">
               ${presentKinds
@@ -124,12 +137,17 @@ export function renderApp(
                 )
                 .join('')}
             </ul>
+            </div>
 
             ${
               deptList.length
                 ? `
-            <h3 class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-2 mt-4">Departments</h3>
-            <p class="text-[10px] text-slate-400 mb-1.5">Focus on one tenant — cross-department links stay visible.</p>
+            <button id="deptHeader" type="button" class="w-full flex items-center justify-between mb-2 mt-4">
+              <span class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Departments</span>
+              <span id="deptChevron" class="text-slate-400 text-[10px] leading-none">▾</span>
+            </button>
+            <div id="deptBody">
+            <p class="text-[10px] text-slate-400 mb-1.5">Click on a department to focus on it</p>
             <ul id="deptList" class="space-y-0.5">
               <li>
                 <button data-dept="" class="w-full flex items-center gap-2 text-left rounded px-1.5 py-1 text-xs font-semibold bg-sky-100 dark:bg-sky-900/40 hover:bg-slate-100 dark:hover:bg-slate-800">
@@ -148,7 +166,8 @@ export function renderApp(
               </li>`
                 )
                 .join('')}
-            </ul>`
+            </ul>
+            </div>`
                 : ''
             }
           </div>
@@ -183,7 +202,7 @@ export function renderApp(
         <aside id="details" class="min-h-0 bg-white border-l border-slate-200 overflow-hidden dark:bg-slate-900 dark:border-slate-800"></aside>
       </div>
 
-      <div id="ctxmenu" class="hidden fixed z-50 py-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-md shadow-xl border border-slate-200 dark:border-slate-700 text-sm"></div>
+      <div id="ctxmenu" class="hidden fixed z-50 w-max py-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-md shadow-xl border border-slate-200 dark:border-slate-700 text-sm"></div>
 
       <div id="helpModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
         <div class="w-[300px] max-w-full bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 p-4">
@@ -322,36 +341,46 @@ export function renderApp(
   // --- Context menu -------------------------------------------------------
   const hideCtx = (): void => ctxEl.classList.add('hidden')
   const showCtx = (node: GraphNode, x: number, y: number): void => {
-    const item = (label: string, fn: () => void): HTMLElement => {
+    const item = (icon: string, label: string, fn: () => void): HTMLElement => {
       const b = document.createElement('button')
       b.className =
-        'w-full text-left px-2.5 py-1 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap'
-      b.textContent = label
+        'w-full text-left flex items-center gap-2 px-2.5 py-1 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap'
+      b.innerHTML = `<span class="w-4 text-center shrink-0">${icon}</span><span>${esc(label)}</span>`
       b.addEventListener('click', () => {
         hideCtx()
         fn()
       })
       return b
     }
+    const divider = (): HTMLElement => {
+      const d = document.createElement('div')
+      d.className = 'my-1 border-t border-slate-200 dark:border-slate-700'
+      return d
+    }
     ctxEl.innerHTML = ''
-    ctxEl.append(item('Focus here', () => enterFocus(node.id)))
+    ctxEl.append(item('🎯', 'Focus here', () => enterFocus(node.id)))
+    ctxEl.append(item('🧭', 'Trace call flow', () => showTracePanel(node)))
     ctxEl.append(
-      item('Open in new window', () =>
+      item('🪟', 'Open in new window', () =>
         window.api.app.openWindow(`#focus=${encodeURIComponent(node.id)}`)
       )
     )
     if (threecxUrl(baseUrl, node))
       ctxEl.append(
-        item('Open in 3CX', () => window.api.app.openExternal(threecxUrl(baseUrl, node)!))
+        item('🔗', 'Open in 3CX', () => window.api.app.openExternal(threecxUrl(baseUrl, node)!))
       )
-    ctxEl.append(item('Copy name', () => window.api.app.copy(node.label)))
+    // Copy actions, grouped below a divider so they're easy to pick out.
+    ctxEl.append(divider())
+    ctxEl.append(item('📋', 'Copy name', () => window.api.app.copy(node.label)))
     if (node.number)
-      ctxEl.append(item(`Copy ext ${node.number}`, () => window.api.app.copy(node.number!)))
+      ctxEl.append(item('📞', `Copy ext ${node.number}`, () => window.api.app.copy(node.number!)))
     const rawId = node.raw['Id']
-    if (rawId != null) ctxEl.append(item('Copy ID', () => window.api.app.copy(String(rawId))))
-    ctxEl.style.left = `${Math.min(x, window.innerWidth - 150)}px`
-    ctxEl.style.top = `${Math.min(y, window.innerHeight - 180)}px`
+    if (rawId != null) ctxEl.append(item('🆔', 'Copy ID', () => window.api.app.copy(String(rawId))))
+    // Clamp to the viewport using the menu's real size once it's laid out.
     ctxEl.classList.remove('hidden')
+    const rect = ctxEl.getBoundingClientRect()
+    ctxEl.style.left = `${Math.min(x, window.innerWidth - rect.width - 8)}px`
+    ctxEl.style.top = `${Math.min(y, window.innerHeight - rect.height - 8)}px`
   }
   const onDocClick = (): void => hideCtx()
   document.addEventListener('click', onDocClick)
@@ -447,6 +476,32 @@ export function renderApp(
     })
   })
 
+  // --- Collapsible sidebar sections (expanded by default, remembered) ------
+  const setupCollapse = (
+    key: string,
+    headerSel: string,
+    bodySel: string,
+    chevSel: string
+  ): void => {
+    const header = root.querySelector<HTMLButtonElement>(headerSel)
+    const body = root.querySelector<HTMLElement>(bodySel)
+    const chev = root.querySelector<HTMLElement>(chevSel)
+    if (!header || !body) return
+    let collapsed = localStorage.getItem(key) === '1'
+    const apply = (): void => {
+      body.classList.toggle('hidden', collapsed)
+      if (chev) chev.textContent = collapsed ? '▸' : '▾'
+    }
+    apply()
+    header.addEventListener('click', () => {
+      collapsed = !collapsed
+      localStorage.setItem(key, collapsed ? '1' : '0')
+      apply()
+    })
+  }
+  setupCollapse('3cx-spy.collapse.categories', '#catHeader', '#catBody', '#catChevron')
+  setupCollapse('3cx-spy.collapse.departments', '#deptHeader', '#deptBody', '#deptChevron')
+
   // Minimap show/hide toggle sits just under the map.
   const mapToggle = root.querySelector<HTMLButtonElement>('#mapToggle')!
   mapToggle.addEventListener('mousedown', (e) => e.stopPropagation())
@@ -534,7 +589,11 @@ export function renderApp(
         toggleTheme
       )
     )
+    menuEl.append(item('🩺', 'Health check', showAuditPanel))
+    menuEl.append(item('🗂', 'DID table', showDidTable))
     menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
+    menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
+    menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
     menuEl.append(item('↻', 'Reload', cb.onReload))
     menuEl.append(item('⬆', 'Check for updates', () => checkForUpdates()))
     menuEl.append(item('⏏', 'Disconnect', cb.onDisconnect))
@@ -611,6 +670,144 @@ export function renderApp(
   root
     .querySelector('#unresolved')
     ?.addEventListener('click', () => showPanel('Unresolved routes', graph.warnings))
+
+  // Shared shell for the richer panels below (health check, DID table, trace).
+  const nodeById = new Map(graph.nodes.map((n) => [n.id, n]))
+  const panelShell = (title: string, bodyHtml: string, actionsHtml = ''): void => {
+    panel.innerHTML = `
+      <div class="flex items-center justify-between mb-2 sticky top-0 bg-white dark:bg-slate-800 pb-1">
+        <h3 class="font-semibold text-slate-700 dark:text-slate-200">${esc(title)}</h3>
+        <div class="flex items-center gap-2">${actionsHtml}<button id="closePanel" class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100">✕</button></div>
+      </div>${bodyHtml}`
+    panel.classList.remove('hidden')
+    panel
+      .querySelector('#closePanel')!
+      .addEventListener('click', () => panel.classList.add('hidden'))
+  }
+  const wireNav = (): void => {
+    panel.querySelectorAll<HTMLElement>('[data-nav]').forEach((el) => {
+      el.addEventListener('click', () => navigate(el.dataset.nav!, true))
+    })
+  }
+
+  // --- Health check -------------------------------------------------------
+  const showAuditPanel = (): void => {
+    const findings = auditTopology(graph)
+    if (!findings.length) {
+      panelShell(
+        'Health check',
+        `<p class="text-slate-500 dark:text-slate-400">No issues found. 🎉</p>`
+      )
+      return
+    }
+    const body = groupFindings(findings)
+      .map((g) => {
+        const rows = g.items
+          .map((f) => {
+            const dot = f.severity === 'warn' ? 'bg-amber-500' : 'bg-slate-400'
+            const clickable = f.nodeId
+              ? `data-nav="${esc(f.nodeId)}" class="cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"`
+              : ''
+            return `<li ${clickable}><div class="flex items-center gap-2 px-1.5 py-0.5 rounded"><span class="w-1.5 h-1.5 rounded-full shrink-0 ${dot}"></span><span class="flex-1 break-words">${esc(f.label)}</span></div></li>`
+          })
+          .join('')
+        return `<div class="mb-2"><h4 class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">${esc(g.category)} <span class="text-slate-400">(${g.items.length})</span></h4><ul class="space-y-0.5 text-slate-600 dark:text-slate-300">${rows}</ul></div>`
+      })
+      .join('')
+    panelShell(`Health check — ${findings.length} finding${findings.length === 1 ? '' : 's'}`, body)
+    wireNav()
+  }
+
+  // --- DID routing table --------------------------------------------------
+  const showDidTable = (): void => {
+    const rows: DidRow[] = graph.nodes
+      .filter((n) => n.kind === 'inboundRule')
+      .map((r) => ({
+        id: r.id,
+        did: r.number ?? '',
+        name: r.label,
+        dests: graph.edges
+          .filter((e) => e.source === r.id)
+          .map((e) => {
+            const t = nodeById.get(e.target)
+            return t ? (t.number ? `${t.label} (${t.number})` : t.label) : e.target
+          })
+      }))
+      .sort((a, b) => a.did.localeCompare(b.did))
+    const bodyRows = rows
+      .map(
+        (r) => `
+        <tr class="border-t border-slate-100 dark:border-slate-700/50 align-top">
+          <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(r.did || '—')}</td>
+          <td class="py-1 pr-2"><button data-nav="${esc(r.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(r.name)}</button></td>
+          <td class="py-1">${r.dests.length ? esc(r.dests.join(', ')) : '<span class="text-amber-500">nowhere</span>'}</td>
+        </tr>`
+      )
+      .join('')
+    const body = `<div class="overflow-x-auto"><table class="w-full text-[11px]"><thead><tr class="text-left text-slate-400"><th class="pr-2 font-medium">DID</th><th class="pr-2 font-medium">Rule</th><th class="font-medium">Routes to</th></tr></thead><tbody>${bodyRows || '<tr><td colspan="3" class="py-2 text-slate-400">No inbound rules.</td></tr>'}</tbody></table></div>`
+    const actions = rows.length
+      ? `<button id="didCsv" class="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-[11px]">Export CSV</button>`
+      : ''
+    panelShell(`DID routing — ${rows.length}`, body, actions)
+    wireNav()
+    panel.querySelector('#didCsv')?.addEventListener('click', () => exportDidCsv(rows, host))
+  }
+
+  // --- Trace-a-call -------------------------------------------------------
+  const showTracePanel = (node: GraphNode): void => {
+    const terminals = view.traceDownstream(node.id)
+    const body = terminals.length
+      ? `<p class="text-slate-500 dark:text-slate-400 mb-1.5">A call entering <span class="font-medium text-slate-700 dark:text-slate-200">${esc(node.label)}</span> can end at ${terminals.length} destination${terminals.length === 1 ? '' : 's'} (highlighted on the graph):</p>
+         <ul class="space-y-0.5 text-slate-600 dark:text-slate-300">${terminals
+           .map(
+             (t) =>
+               `<li data-nav="${esc(t.id)}" class="flex items-center gap-2 px-1.5 py-0.5 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"><span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META[t.kind].color}"></span><span class="flex-1 truncate">${esc(t.label)}${t.number ? ` <span class="text-slate-400 font-mono">${esc(t.number)}</span>` : ''}</span></li>`
+           )
+           .join('')}</ul>`
+      : `<p class="text-slate-500 dark:text-slate-400">No downstream destinations — this node doesn't route anywhere (or only loops back).</p>`
+    panelShell(`Call trace — ${node.label}`, body)
+    wireNav()
+  }
+
+  // --- Snapshot save ------------------------------------------------------
+  const saveSnapshot = async (): Promise<void> => {
+    const res = await window.api.app.saveSnapshot(topology)
+    if (res.error) flash(res.error, true)
+    else if (res.path) flash('Snapshot saved.')
+  }
+}
+
+/** A brief transient toast at the bottom of the window (save confirmations, …). */
+function flash(message: string, isError = false): void {
+  const el = document.createElement('div')
+  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] px-3 py-1.5 rounded-md text-sm shadow-lg ${
+    isError ? 'bg-red-600 text-white' : 'bg-slate-800 text-slate-100 dark:bg-slate-700'
+  }`
+  el.textContent = message
+  document.body.appendChild(el)
+  setTimeout(() => el.remove(), 2500)
+}
+
+function exportDidCsv(rows: DidRow[], host: string): void {
+  const cell = (s: string): string => {
+    // Guard against CSV formula injection: a value a spreadsheet would treat as
+    // a formula (=, +, -, @, tab, CR) gets a leading apostrophe. 3CX display
+    // names are attacker-influenceable data in an audit context.
+    const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s
+    return `"${safe.replace(/"/g, '""')}"`
+  }
+  const lines = [
+    'DID,Rule,Routes to',
+    ...rows.map((r) => [cell(r.did), cell(r.name), cell(r.dests.join('; '))].join(','))
+  ]
+  // Prepend a BOM so Excel reads UTF-8 correctly.
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `espionage-dids-${host.replace(/[^\w.-]/g, '_')}.csv`
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 function exportPng(view: GraphView, theme: ThemeName, host: string): void {

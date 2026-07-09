@@ -35,7 +35,8 @@ export interface GraphNode {
   raw: Record<string, unknown>
 }
 
-export type EdgeKind = 'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk'
+export type EdgeKind =
+  'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk' | 'afterhours'
 
 export interface GraphEdge {
   id: string

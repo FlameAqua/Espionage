@@ -2,6 +2,9 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import type { ConnectRequest, ConnectResult, Topology, UpdateStatus } from '../shared/types'
 
+type SaveSnapshotResult = { canceled?: boolean; path?: string; error?: string }
+type OpenSnapshotResult = { canceled?: boolean; topology?: Topology; error?: string }
+
 // Custom API exposed to the renderer for talking to the 3CX backend.
 const api = {
   threecx: {
@@ -14,7 +17,10 @@ const api = {
   app: {
     openWindow: (hash: string): Promise<void> => ipcRenderer.invoke('app:openWindow', hash),
     copy: (text: string): Promise<void> => ipcRenderer.invoke('app:copy', text),
-    openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url)
+    openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url),
+    saveSnapshot: (topology: Topology): Promise<SaveSnapshotResult> =>
+      ipcRenderer.invoke('app:saveSnapshot', topology),
+    openSnapshot: (): Promise<OpenSnapshotResult> => ipcRenderer.invoke('app:openSnapshot')
   },
   updates: {
     /** Manually trigger an update check (burger menu → "Check for updates"). */

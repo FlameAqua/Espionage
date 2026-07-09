@@ -1,7 +1,13 @@
 // Renders the right-hand details panel for a selected node: its key facts,
 // inbound/outbound relationships (each clickable to navigate), and raw JSON.
 
-import { NODE_KIND_META, type GraphEdge, type GraphNode, type TopologyGraph } from '../graph/model'
+import {
+  NODE_KIND_META,
+  SHARED_DEPARTMENT,
+  type GraphEdge,
+  type GraphNode,
+  type TopologyGraph
+} from '../graph/model'
 
 const esc = (s: unknown): string =>
   String(s ?? '').replace(
@@ -78,7 +84,7 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
       <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
         <div id="egomap" class="h-44 w-full rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50"></div>
         ${info}
-        ${depts ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Departments</h3>${depts}</div>` : ''}
+        ${depts ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${node.deptGroup === SHARED_DEPARTMENT ? 'Shared across departments' : 'Departments'}</h3>${depts}</div>` : ''}
         ${facts}
         <details class="group">
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">View more info</summary>

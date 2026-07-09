@@ -26,7 +26,8 @@ const EDGE_COLOR: Record<string, string> = {
   agent: '#3b82f6',
   manager: '#6366f1',
   member: '#14b8a6',
-  trunk: '#a855f7'
+  trunk: '#a855f7',
+  afterhours: '#0891b2'
 }
 
 interface ViewCallbacks {
@@ -224,6 +225,10 @@ export class GraphView {
     this.layoutName = name
     if (name === 'department') this.enterDepartmentMode()
     else this.exitDepartmentMode()
+    // Reparenting into/out of department boxes resets element visibility, so
+    // recompute it (kind filters, focus, dept filter, hide-unconnected) before
+    // laying out — otherwise "Hide unconnected" silently reverts on a view switch.
+    this.applyVisibility()
     this.runLayout()
   }
 
@@ -309,23 +314,25 @@ export class GraphView {
           ...base
         } as cytoscape.LayoutOptions
       case 'department':
-        // fcose is compound-aware: each department becomes a tidy packed box.
-        // randomize:false starts from the current (deterministic, dagre-based
-        // Flow) positions instead of reseeding random noise every run, so
-        // repeat layouts settle into the same arrangement instead of a new
-        // one each time.
+        // Same dagre (LR flow) engine as Flow, but compound-aware:
+        // cytoscape-dagre lays each department box's members out internally in
+        // call-flow order AND arranges the boxes themselves along the flow, with
+        // shared / department-less nodes flowing between them. This replaces the
+        // old fcose force layout, which packed nodes into blobs and dropped the
+        // boxes in seemingly random places. Spacing is a touch looser than Flow
+        // so the box padding + titles have room to breathe.
         return {
-          name: 'fcose',
-          quality: 'proof',
-          randomize: false,
-          nodeSeparation: 90,
-          nodeRepulsion: () => 9000,
-          idealEdgeLength: () => 90,
-          gravity: 0.3,
-          nestingFactor: 0.12,
-          packComponents: true,
+          name: 'dagre',
+          // @ts-ignore dagre options — larger nodeSep gives vertically-stacked
+          // sibling department boxes clearance for their outside top labels, so
+          // adjacent boxes (and their titles) don't overlap.
+          rankDir: 'LR',
+          nodeSep: 42,
+          rankSep: 150,
+          edgeSep: 10,
+          ranker: 'tight-tree',
           ...base
-        } as cytoscape.LayoutOptions
+        }
       case 'breadthfirst':
         return {
           name: 'breadthfirst',
@@ -606,6 +613,26 @@ export class GraphView {
     })
   }
 
+  /** Highlight the whole set of nodes reachable downstream from `id` (following
+   *  edge direction) and return the terminal destinations a call can end at —
+   *  the leaves of the reachable sub-flow. */
+  traceDownstream(id: string): GraphNode[] {
+    const start = this.cy.getElementById(id)
+    if (start.empty() || !start.data('model')) return []
+    const hood = start.successors().union(start)
+    this.cy.elements().removeClass('selected')
+    this.cy.elements().not('.dept-parent').addClass('faded')
+    hood.removeClass('faded')
+    start.addClass('selected')
+    const terminals: GraphNode[] = []
+    hood.nodes().forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      // A terminal is a real node with no onward edge (end of the call path).
+      if (model && n.id() !== id && n.outgoers('edge').empty()) terminals.push(model)
+    })
+    return terminals
+  }
+
   /** Search by name/number, then append nodes whose category matches the term
    *  (e.g. "external" lists all External nodes at the end). */
   search(term: string): GraphNode[] {
@@ -644,9 +671,35 @@ export class GraphView {
   }
 }
 
+/** True only when a raw flag is explicitly false — an absent field is "unknown"
+ *  and must not be styled as a problem. */
+function rawIsFalse(raw: Record<string, unknown>, ...keys: string[]): boolean {
+  for (const k of keys) {
+    const v = raw[k]
+    if (v === false || v === 'false' || v === 0) return true
+    if (v === true || v === 'true' || v === 1) return false
+  }
+  return false
+}
+
 function toElements(graph: TopologyGraph): ElementDefinition[] {
   const els: ElementDefinition[] = []
+  // Queue / ring-group ids that actually have agents or members.
+  const hasMembers = new Set<string>()
+  for (const e of graph.edges) {
+    if (e.kind === 'agent' || e.kind === 'member') hasMembers.add(e.source)
+  }
   for (const n of graph.nodes) {
+    const classes: string[] = [n.kind]
+    if (n.kind === 'user' && rawIsFalse(n.raw, 'Enabled', 'IsEnabled'))
+      classes.push('status-disabled')
+    if (
+      (n.kind === 'trunk' || n.kind === 'bridge') &&
+      rawIsFalse(n.raw, 'IsRegistered', 'Registered')
+    )
+      classes.push('status-unregistered')
+    if ((n.kind === 'queue' || n.kind === 'ringGroup') && !hasMembers.has(n.id))
+      classes.push('status-empty')
     els.push({
       data: {
         id: n.id,
@@ -654,7 +707,7 @@ function toElements(graph: TopologyGraph): ElementDefinition[] {
         kind: n.kind,
         model: n
       },
-      classes: n.kind
+      classes: classes.join(' ')
     })
   }
   const ids = new Set(graph.nodes.map((n) => n.id))
@@ -711,28 +764,6 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
         'text-background-padding': '1px'
       }
     },
-    { selector: 'node.faded', style: { opacity: 0.12 } },
-    { selector: 'edge.faded', style: { opacity: 0.05 } },
-    {
-      selector: 'node.selected',
-      style: { 'border-width': 4, 'border-color': '#0ea5e9', 'border-opacity': 1 }
-    },
-    // Cytoscape's own selected state (right-drag box selection / group move).
-    {
-      selector: 'node:selected',
-      style: {
-        'border-width': 3,
-        'border-color': '#f59e0b',
-        'border-opacity': 1,
-        'overlay-color': '#f59e0b',
-        'overlay-opacity': 0.15,
-        'overlay-padding': 2
-      }
-    },
-    { selector: '.hidden', style: { display: 'none' } },
-    // While panning (padlock / Space) elements pass pointer events through to
-    // the core so a drag starting on a node/edge pans instead of grabbing it.
-    { selector: '.pan-through', style: { events: 'no' } },
     // Department (Department layout) compound container boxes.
     {
       selector: 'node.dept-parent',
@@ -751,10 +782,12 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
         'font-size': 13,
         'font-weight': 700,
         color: 'data(deptColor)',
-        padding: '34px',
-        'min-width': '120px',
-        'min-height': '80px',
-        'compound-sizing-wrt-labels': 'include'
+        // Tight, uniform padding so a box hugs its members. No min-width/height
+        // (single-node departments were inflated by the old 80px floor), and
+        // exclude the top label from sizing so a lone node's box isn't padded
+        // taller than a multi-node one.
+        padding: '10px',
+        'compound-sizing-wrt-labels': 'exclude'
       }
     }
   ]
@@ -775,5 +808,72 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
       style: { 'line-color': color, 'target-arrow-color': color }
     })
   }
+
+  // --- Status flags (after the kind colours so they win the border) ---------
+  style.push(
+    // Disabled extension: dimmed fill + dashed, faint border.
+    {
+      selector: 'node.status-disabled',
+      style: {
+        'background-opacity': dark ? 0.12 : 0.08,
+        'border-style': 'dashed',
+        'border-opacity': 0.5
+      }
+    },
+    // Unregistered trunk / bridge: red dashed border — a link that's down.
+    {
+      selector: 'node.status-unregistered',
+      style: {
+        'border-color': '#ef4444',
+        'border-style': 'dashed',
+        'border-width': 2.5,
+        'border-opacity': 0.95
+      }
+    },
+    // Queue / ring group with no members: amber dashed border.
+    {
+      selector: 'node.status-empty',
+      style: {
+        'border-color': '#f59e0b',
+        'border-style': 'dashed',
+        'border-width': 2.5,
+        'border-opacity': 0.95
+      }
+    },
+    // Out-of-hours / holiday routing renders dashed so it isn't read as the
+    // default business-hours path.
+    { selector: 'edge.afterhours', style: { 'line-style': 'dashed', 'line-dash-pattern': [6, 3] } }
+  )
+
+  // --- Interaction states (LAST so they always win) -------------------------
+  style.push(
+    { selector: 'node.faded', style: { opacity: 0.12 } },
+    { selector: 'edge.faded', style: { opacity: 0.05 } },
+    {
+      selector: 'node.selected',
+      style: {
+        'border-width': 4,
+        'border-color': '#0ea5e9',
+        'border-style': 'solid',
+        'border-opacity': 1
+      }
+    },
+    // Cytoscape's own selected state (right-drag box selection / group move).
+    {
+      selector: 'node:selected',
+      style: {
+        'border-width': 3,
+        'border-color': '#f59e0b',
+        'border-opacity': 1,
+        'overlay-color': '#f59e0b',
+        'overlay-opacity': 0.15,
+        'overlay-padding': 2
+      }
+    },
+    { selector: '.hidden', style: { display: 'none' } },
+    // While panning (padlock / Space) elements pass pointer events through to
+    // the core so a drag starting on a node/edge pans instead of grabbing it.
+    { selector: '.pan-through', style: { events: 'no' } }
+  )
   return style
 }

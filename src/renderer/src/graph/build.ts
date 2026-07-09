@@ -217,12 +217,7 @@ function routeFromValue(
     const ref = asDestRef(value)
     if (ref) {
       const target = b.resolveTarget(ref, contextLabel)
-      if (target) {
-        const kind = /overflow|noanswer|no_answer|busy|timeout|fail/i.test(key)
-          ? 'overflow'
-          : 'route'
-        b.addEdge(sourceId, target.id, kind, prettyKey(key))
-      }
+      if (target) b.addEdge(sourceId, target.id, routeKind(key), prettyKey(key))
     } else {
       // Nested wrapper (e.g. OfficeRoute: { Forward: {...} }) — scan one level in.
       for (const [k2, v2] of Object.entries(value)) {
@@ -317,6 +312,16 @@ function prettyKey(key: string): string {
     .trim()
 }
 
+/** Classify a routing edge from the source field name: out-of-hours / holiday
+ *  destinations render distinctly (dashed) so the graph doesn't imply calls
+ *  always take the business-hours path. Failure branches stay "overflow". */
+function routeKind(key: string): GraphEdge['kind'] {
+  if (/outofoffice|out_of_office|afterhours|after_hours|nonbusiness|holiday|breaktime/i.test(key))
+    return 'afterhours'
+  if (/overflow|noanswer|no_answer|busy|timeout|fail/i.test(key)) return 'overflow'
+  return 'route'
+}
+
 export function buildTopology(topo: Topology): TopologyGraph {
   const b = new Builder()
 
@@ -391,7 +396,7 @@ export function buildTopology(topo: Topology): TopologyGraph {
     // Show the dialled number (DID) on the rule itself — DIDs aren't their own
     // nodes; the Inbound Rule is what routing hangs off.
     const did = ruleDid(raw)
-    b.addNode('inboundRule', id || displayName(raw), displayName(raw) || `Rule ${id}`, raw, did)
+    b.addNode('inboundRule', id || displayName(raw), ruleName(raw, id), raw, did)
   }
 
   // Departments become badges on their members, not nodes on the canvas.
@@ -496,9 +501,15 @@ function computeDeptGroups(b: Builder): void {
       }
       if (neighbourDepts.size === 1) {
         n.deptGroup = [...neighbourDepts][0]
+        // Surface the inferred department in the details panel too — these
+        // nodes (queues, IVRs, …) carry no department data of their own.
+        n.departments = [n.deptGroup]
         changed = true
       } else if (neighbourDepts.size > 1) {
         n.deptGroup = SHARED_DEPARTMENT
+        // Record which departments it's shared between so the details panel can
+        // show them instead of appearing to belong to nothing.
+        n.departments = [...neighbourDepts].sort()
         changed = true
       }
     }
@@ -517,7 +528,7 @@ function collectDnForwards(b: Builder, sourceId: string, entity: Obj, context: s
     const type = str(entity[`${m[1]}ForwardType`])
     if (/endcall|hangup|voicemail|none/i.test(type)) continue
     const target = b.resolveTarget({ number, type: type || undefined }, context)
-    if (target) b.addEdge(sourceId, target.id, 'route', prettyKey(m[1]) || 'forward')
+    if (target) b.addEdge(sourceId, target.id, routeKind(m[1]), prettyKey(m[1]) || 'forward')
   }
 }
 
@@ -558,6 +569,18 @@ function linkRuleTrunk(b: Builder, ruleId: string, rule: Obj): void {
  *  match on DID/CallerID (BasedOnDID etc.). */
 function isTrunkDefaultRule(rule: Obj): boolean {
   return /^forwardall$/i.test(str(pick(rule, 'Condition')))
+}
+
+/** A human name for an inbound rule. 3CX often leaves rules unnamed, so fall
+ *  back to what the rule actually matches on (its Condition) rather than an
+ *  opaque "Rule 42". */
+function ruleName(raw: Obj, id: string): string {
+  const name = displayName(raw)
+  if (name) return name
+  const cond = str(pick(raw, 'Condition')).toLowerCase()
+  if (cond.includes('callerid')) return 'Caller ID Rule'
+  if (cond.includes('did')) return 'DID Rule'
+  return id ? `Rule ${id}` : 'Inbound Rule'
 }
 
 /** The dialled number(s) an inbound rule matches, shown on the rule node.

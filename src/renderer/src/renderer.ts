@@ -59,12 +59,16 @@ function showError(err: unknown): void {
 }
 
 function showLogin(): void {
-  renderLogin(root, async (req: ConnectRequest): Promise<string | null> => {
-    const res = await window.api.threecx.connect(req)
-    if (!res.ok) return res.error ?? 'Connection failed.'
-    void loadAndShow()
-    return null
-  })
+  renderLogin(
+    root,
+    async (req: ConnectRequest): Promise<string | null> => {
+      const res = await window.api.threecx.connect(req)
+      if (!res.ok) return res.error ?? 'Connection failed.'
+      void loadAndShow()
+      return null
+    },
+    () => void openSnapshot()
+  )
 }
 
 async function loadAndShow(): Promise<void> {
@@ -83,10 +87,42 @@ async function loadAndShow(): Promise<void> {
     topology,
     {
       onReload: () => void loadAndShow(),
-      onDisconnect: () => void disconnect()
+      onDisconnect: () => void disconnect(),
+      onOpenSnapshot: () => void openSnapshot()
     },
     focusFromHash()
   )
+}
+
+/** Render a loaded snapshot offline (no live 3CX session). Reload just re-renders
+ *  the same data; disconnect returns to the login screen. */
+function showSnapshot(topology: Topology): void {
+  renderApp(root, topology, {
+    onReload: () => showSnapshot(topology),
+    onDisconnect: () => showLogin(),
+    onOpenSnapshot: () => void openSnapshot()
+  })
+}
+
+async function openSnapshot(): Promise<void> {
+  const res = await window.api.app.openSnapshot()
+  if (res.canceled) return
+  if (res.error || !res.topology) {
+    notify(res.error ?? 'Could not open snapshot.', true)
+    return
+  }
+  showSnapshot(res.topology)
+}
+
+/** Non-destructive transient toast (snapshot errors, etc.). */
+function notify(message: string, isError = false): void {
+  const el = document.createElement('div')
+  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] px-3 py-1.5 rounded-md text-sm shadow-lg ${
+    isError ? 'bg-red-600 text-white' : 'bg-slate-800 text-slate-100'
+  }`
+  el.textContent = message
+  document.body.appendChild(el)
+  setTimeout(() => el.remove(), 3000)
 }
 
 async function disconnect(): Promise<void> {

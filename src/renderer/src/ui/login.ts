@@ -11,13 +11,15 @@ interface SavedConn {
 
 export function renderLogin(
   root: HTMLElement,
-  onConnect: (req: ConnectRequest) => Promise<string | null>
+  onConnect: (req: ConnectRequest) => Promise<string | null>,
+  onOpenSnapshot?: () => void
 ): void {
   const saved: Partial<SavedConn> = readSaved()
 
   root.innerHTML = `
-    <div class="min-h-screen flex items-center justify-center bg-slate-900 text-slate-100">
-      <form id="login" class="w-[380px] bg-slate-800 rounded-xl shadow-2xl p-7 space-y-4">
+    <div class="relative min-h-screen flex items-center justify-center overflow-hidden bg-slate-900 text-slate-100">
+      <canvas id="matrix" class="absolute inset-0 w-full h-full pointer-events-none"></canvas>
+      <form id="login" class="relative z-10 w-[380px] bg-slate-800/95 backdrop-blur-sm rounded-xl shadow-2xl p-7 space-y-4">
         <div class="text-center">
           <div class="flex items-center justify-center gap-2.5">
             <span class="shrink-0">${logoSvg(40)}</span>
@@ -48,12 +50,24 @@ export function renderLogin(
           class="w-full py-2 rounded-md bg-sky-600 hover:bg-sky-500 text-sm font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
           Connect
         </button>
+        <div class="text-center">
+          <button id="openSnapshot" type="button" class="text-xs text-slate-400 hover:text-slate-200 underline underline-offset-2">
+            Open a saved snapshot
+          </button>
+        </div>
       </form>
     </div>`
+
+  const canvas = root.querySelector<HTMLCanvasElement>('#matrix')
+  if (canvas) startMatrix(canvas)
 
   const form = root.querySelector<HTMLFormElement>('#login')!
   const errBox = root.querySelector<HTMLElement>('#error')!
   const submit = root.querySelector<HTMLButtonElement>('#submit')!
+
+  const openSnap = root.querySelector<HTMLButtonElement>('#openSnapshot')!
+  if (onOpenSnapshot) openSnap.addEventListener('click', onOpenSnapshot)
+  else openSnap.classList.add('hidden')
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
@@ -99,4 +113,48 @@ function writeSaved(c: SavedConn): void {
 
 function attr(s: string): string {
   return s.replace(/"/g, '&quot;')
+}
+
+/** A subtle "digital rain" backdrop for the login screen. Self-cleaning: the
+ *  animation loop stops (and drops its resize listener) as soon as the canvas
+ *  leaves the DOM, e.g. when we navigate to the graph view. */
+function startMatrix(canvas: HTMLCanvasElement): void {
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  // Half-width katakana + digits + a few hex letters — the classic glyph soup.
+  const glyphs = 'アイウエオカキクケコサシスセソタチツテトナニヌネノ0123456789ABCDEF'
+  const fontSize = 14
+  let columns = 0
+  let drops: number[] = []
+
+  const resize = (): void => {
+    canvas.width = canvas.clientWidth
+    canvas.height = canvas.clientHeight
+    columns = Math.max(1, Math.floor(canvas.width / fontSize))
+    // Seed each column at a random negative offset so they don't fall in step.
+    drops = Array.from({ length: columns }, () => Math.floor(Math.random() * -60))
+  }
+  resize()
+  window.addEventListener('resize', resize)
+
+  const draw = (): void => {
+    if (!canvas.isConnected) {
+      window.removeEventListener('resize', resize)
+      return // navigated away — stop the loop and release the listener
+    }
+    // Translucent fade over the previous frame leaves fading trails.
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.09)'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.fillStyle = 'rgba(34, 197, 94, 0.28)' // dim green — dull, not flashy
+    ctx.font = `${fontSize}px monospace`
+    for (let i = 0; i < columns; i++) {
+      const ch = glyphs[Math.floor(Math.random() * glyphs.length)]
+      ctx.fillText(ch, i * fontSize, drops[i] * fontSize)
+      // Once a column runs off the bottom, randomly restart it near the top.
+      if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) drops[i] = 0
+      drops[i]++
+    }
+    requestAnimationFrame(draw)
+  }
+  requestAnimationFrame(draw)
 }
