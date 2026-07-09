@@ -32,11 +32,14 @@ jobs:
 
       - run: npm ci
 
-      - name: Build & publish installers
+      # Build the installers WITHOUT electron-builder's own uploader — its
+      # GitHub publisher races the release creation in CI and can drop the
+      # large .exe while still exiting 0. We publish deterministically below.
+      # `--publish never` still writes dist/latest.yml because a `publish`
+      # provider is configured in electron-builder.yml.
+      - name: Build installers
         shell: bash
         env:
-          # Publishing to this repo's Releases uses the automatic Actions token.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Read-only PAT embedded into the app so installed clients can read
           # updates from the private repo. Add it under
           # Settings → Secrets and variables → Actions → UPDATE_READ_TOKEN.
@@ -45,12 +48,26 @@ jobs:
           set -euo pipefail
           # Strip the leading "v": v1.0.0-beta.2 -> 1.0.0-beta.2
           VERSION="${GITHUB_REF_NAME#v}"
-          # Anything with a pre-release suffix (-beta.N, -rc.N) ships as a GitHub
-          # pre-release; a bare x.y.z ships as a normal release.
-          if [[ "$VERSION" == *-* ]]; then RELEASE_TYPE=prerelease; else RELEASE_TYPE=release; fi
-          echo "Releasing $VERSION as $RELEASE_TYPE"
-
+          echo "Building $VERSION"
           npm run build
-          npx electron-builder --win --publish always \
-            -c.extraMetadata.version="$VERSION" \
-            -c.publish.releaseType="$RELEASE_TYPE"
+          npx electron-builder --win --publish never -c.extraMetadata.version="$VERSION"
+          echo "=== dist artifacts ==="
+          ls -la dist
+
+      # Create/update the GitHub Release for this tag and upload every updater
+      # artifact (installer + blockmap + latest.yml) with the first-party gh CLI.
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # A -beta/-rc suffix ships as a pre-release; a bare x.y.z as a release.
+          if [[ "$VERSION" == *-* ]]; then PRERELEASE=--prerelease; else PRERELEASE=; fi
+          FILES=(dist/*.exe dist/*.exe.blockmap dist/latest.yml)
+          echo "Uploading: ${FILES[*]}"
+          # Idempotent: create on first run, clobber-upload on re-runs.
+          gh release create "$GITHUB_REF_NAME" "${FILES[@]}" \
+            --title "$VERSION" $PRERELEASE --notes "Automated release of $VERSION." \
+            || gh release upload "$GITHUB_REF_NAME" "${FILES[@]}" --clobber
