@@ -196,7 +196,7 @@ export function renderApp(
             <button id="mapToggle" class="absolute bottom-1 left-1 z-30 px-1.5 py-0.5 rounded bg-slate-700/90 hover:bg-slate-600 text-slate-100 text-[10px] shadow pointer-events-auto" title="Toggle minimap">Hide</button>
           </div>
           <button id="reopen" class="hidden absolute bottom-3 right-3 z-20 px-2 py-1 rounded bg-slate-700 text-slate-100 text-xs shadow">Details ›</button>
-          <div id="panel" class="hidden absolute z-20 inset-x-4 bottom-4 max-h-[40%] bg-white dark:bg-slate-800 dark:text-slate-200 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 overflow-y-auto p-3 text-xs"></div>
+          <div id="panel" class="hidden absolute z-20 inset-x-4 bottom-4 max-h-[40%] bg-white dark:bg-slate-800 dark:text-slate-200 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 flex flex-col overflow-hidden text-xs"></div>
         </main>
 
         <aside id="details" class="min-h-0 bg-white border-l border-slate-200 overflow-hidden dark:bg-slate-900 dark:border-slate-800"></aside>
@@ -656,11 +656,11 @@ export function renderApp(
   const panel = root.querySelector<HTMLElement>('#panel')!
   const showPanel = (title: string, items: string[]): void => {
     panel.innerHTML = `
-      <div class="flex items-center justify-between mb-2">
+      <div class="shrink-0 flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-700">
         <h3 class="font-semibold text-slate-700 dark:text-slate-200">${esc(title)}</h3>
         <button id="closePanel" class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100">✕</button>
       </div>
-      <ul class="space-y-1 text-slate-600 dark:text-slate-300">${items.map((i) => `<li>• ${esc(i)}</li>`).join('')}</ul>`
+      <ul class="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-1 text-slate-600 dark:text-slate-300">${items.map((i) => `<li>• ${esc(i)}</li>`).join('')}</ul>`
     panel.classList.remove('hidden')
     panel
       .querySelector('#closePanel')!
@@ -675,10 +675,11 @@ export function renderApp(
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]))
   const panelShell = (title: string, bodyHtml: string, actionsHtml = ''): void => {
     panel.innerHTML = `
-      <div class="flex items-center justify-between mb-2 sticky top-0 bg-white dark:bg-slate-800 pb-1">
-        <h3 class="font-semibold text-slate-700 dark:text-slate-200">${esc(title)}</h3>
-        <div class="flex items-center gap-2">${actionsHtml}<button id="closePanel" class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100">✕</button></div>
-      </div>${bodyHtml}`
+      <div class="shrink-0 flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-200 dark:border-slate-700">
+        <h3 class="font-semibold text-slate-700 dark:text-slate-200 truncate">${esc(title)}</h3>
+        <div class="flex items-center gap-2 shrink-0">${actionsHtml}<button id="closePanel" class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100">✕</button></div>
+      </div>
+      <div class="flex-1 min-h-0 overflow-y-auto px-3 py-2">${bodyHtml}</div>`
     panel.classList.remove('hidden')
     panel
       .querySelector('#closePanel')!

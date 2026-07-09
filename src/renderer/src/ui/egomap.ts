@@ -75,17 +75,21 @@ export class EgoMap {
 
     requestAnimationFrame(() => {
       this.cy.resize()
-      this.cy
-        .layout({
-          name: 'concentric',
-          // @ts-ignore concentric callback
-          concentric: (n) => (n.hasClass('center') ? 2 : 1),
-          levelWidth: () => 1,
-          minNodeSpacing: 12,
-          padding: 8,
-          animate: false
-        })
-        .run()
+      // Concentric layout throws on a lone node (empty bounding box), so only run
+      // it when the centre actually has neighbours.
+      if (this.cy.nodes().length > 1) {
+        this.cy
+          .layout({
+            name: 'concentric',
+            // @ts-ignore concentric callback
+            concentric: (n) => (n.hasClass('center') ? 2 : 1),
+            levelWidth: () => 1,
+            minNodeSpacing: 12,
+            padding: 8,
+            animate: false
+          })
+          .run()
+      }
       this.cy.fit(undefined, 10)
     })
   }
