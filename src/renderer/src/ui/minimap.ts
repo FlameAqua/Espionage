@@ -72,11 +72,13 @@ export class Minimap {
   sync(): void {
     const els: ElementDefinition[] = []
     this.main.nodes(':visible').forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      if (!model) return // department container — the minimap only shows real nodes
       const p = n.position()
       els.push({
-        data: { id: n.id(), kind: (n.data('model') as GraphNode).kind },
+        data: { id: n.id(), kind: model.kind },
         position: { x: p.x, y: p.y },
-        classes: (n.data('model') as GraphNode).kind
+        classes: model.kind
       })
     })
     this.main.edges(':visible').forEach((e) => {

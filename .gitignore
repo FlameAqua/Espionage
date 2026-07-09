@@ -4,3 +4,8 @@ out
 .DS_Store
 .eslintcache
 *.log*
+
+# Local secrets — never commit the embedded update token
+.env
+.env.*
+!.env.example

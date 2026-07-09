@@ -1,6 +1,6 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
-import type { ConnectRequest, ConnectResult, Topology } from '../shared/types'
+import type { ConnectRequest, ConnectResult, Topology, UpdateStatus } from '../shared/types'
 
 // Custom API exposed to the renderer for talking to the 3CX backend.
 const api = {
@@ -15,6 +15,18 @@ const api = {
     openWindow: (hash: string): Promise<void> => ipcRenderer.invoke('app:openWindow', hash),
     copy: (text: string): Promise<void> => ipcRenderer.invoke('app:copy', text),
     openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url)
+  },
+  updates: {
+    /** Manually trigger an update check (burger menu → "Check for updates"). */
+    check: (): Promise<void> => ipcRenderer.invoke('updates:check'),
+    /** Quit and install a downloaded update, then relaunch. */
+    install: (): Promise<void> => ipcRenderer.invoke('updates:install'),
+    /** Subscribe to update lifecycle events. Returns an unsubscribe function. */
+    onStatus: (cb: (status: UpdateStatus) => void): (() => void) => {
+      const listener = (_e: IpcRendererEvent, status: UpdateStatus): void => cb(status)
+      ipcRenderer.on('updates:status', listener)
+      return () => ipcRenderer.removeListener('updates:status', listener)
+    }
   }
 }
 

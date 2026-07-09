@@ -3,6 +3,7 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { registerThreecxIpc } from './threecx/ipc'
+import { initUpdater } from './updater'
 
 /** Create a window. `hash` (e.g. "#focus=user:1001") opens it on a node. */
 function createWindow(hash = ''): void {
@@ -13,7 +14,8 @@ function createWindow(hash = ''): void {
     show: false,
     title: 'Espionage',
     autoHideMenuBar: true,
-    ...(process.platform === 'linux' ? { icon } : {}),
+    // macOS uses the app-bundle icon; Windows/Linux take the window icon.
+    ...(process.platform === 'darwin' ? {} : { icon }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false
@@ -64,8 +66,9 @@ function registerAppIpc(): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
-  // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
+  // Set app user model id for windows (must match appId in electron-builder.yml
+  // so Windows notifications and the NSIS auto-updater target the same app).
+  electronApp.setAppUserModelId('com.espionage.app')
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
@@ -77,6 +80,9 @@ app.whenReady().then(() => {
   // 3CX API bridge + app-level helpers for the renderer.
   registerThreecxIpc()
   registerAppIpc()
+
+  // Auto-updates: wire IPC + kick off a silent check (packaged builds only).
+  initUpdater()
 
   createWindow()
 

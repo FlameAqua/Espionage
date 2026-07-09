@@ -5,10 +5,18 @@
 import type { Topology } from '../../../shared/types'
 import { buildTopology } from '../graph/build'
 import { GraphView, type LayoutName, type ThemeName } from '../graph/view'
-import { NODE_KIND_META, type GraphNode, type NodeKind } from '../graph/model'
+import {
+  NODE_KIND_META,
+  SHARED_DEPARTMENT,
+  departmentColor,
+  departmentLabel,
+  type GraphNode,
+  type NodeKind
+} from '../graph/model'
 import { renderDetails } from './details'
 import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
+import { checkForUpdates } from './updates'
 
 interface AppCallbacks {
   onReload: () => void
@@ -56,11 +64,22 @@ export function renderApp(
   const baseUrl = topology.baseUrl.replace(/\/+$/, '')
   const errors = collectErrors(topology)
 
+  // Department buckets (see computeDeptGroups in build.ts): real departments
+  // sorted alphabetically, with the catch-all "Shared" bucket always last.
+  const deptCounts = new Map<string, number>()
+  for (const n of graph.nodes) {
+    if (n.deptGroup) deptCounts.set(n.deptGroup, (deptCounts.get(n.deptGroup) ?? 0) + 1)
+  }
+  const deptList = [...deptCounts.entries()].sort(([a], [b]) => {
+    if (a === SHARED_DEPARTMENT) return 1
+    if (b === SHARED_DEPARTMENT) return -1
+    return a.localeCompare(b)
+  })
+
   root.innerHTML = `
     <div class="h-screen grid grid-rows-[3rem_1fr] bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-200">
       <header class="flex items-center gap-2 px-3 bg-slate-900 text-slate-100">
-        <span class="font-bold tracking-tight">Espionage</span>
-        <span class="text-xs text-slate-400 font-mono truncate max-w-[220px]">${esc(host)}</span>
+        <span class="text-xs text-slate-400 font-mono truncate max-w-[240px]">${esc(host)}</span>
         <div class="relative ml-2 w-56">
           <input id="search" type="text" placeholder="Search…"
             class="w-full px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" />
@@ -71,6 +90,7 @@ export function renderApp(
           <option value="flow">Flow</option>
           <option value="compact">Compact</option>
           <option value="force">Spread</option>
+          <option value="department">Department</option>
         </select>
 
         <div class="ml-auto flex items-center gap-1.5 text-sm">
@@ -104,6 +124,33 @@ export function renderApp(
                 )
                 .join('')}
             </ul>
+
+            ${
+              deptList.length
+                ? `
+            <h3 class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-2 mt-4">Departments</h3>
+            <p class="text-[10px] text-slate-400 mb-1.5">Focus on one tenant — cross-department links stay visible.</p>
+            <ul id="deptList" class="space-y-0.5">
+              <li>
+                <button data-dept="" class="w-full flex items-center gap-2 text-left rounded px-1.5 py-1 text-xs font-semibold bg-sky-100 dark:bg-sky-900/40 hover:bg-slate-100 dark:hover:bg-slate-800">
+                  All departments
+                </button>
+              </li>
+              ${deptList
+                .map(
+                  ([bucket, count]) => `
+              <li>
+                <button data-dept="${esc(bucket)}" class="w-full flex items-center gap-2 text-left rounded px-1.5 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800">
+                  <span class="w-3 h-3 rounded shrink-0" style="background:${departmentColor(bucket)}"></span>
+                  <span class="flex-1 truncate">${esc(departmentLabel(bucket))}</span>
+                  <span class="text-slate-400">${count}</span>
+                </button>
+              </li>`
+                )
+                .join('')}
+            </ul>`
+                : ''
+            }
           </div>
           <div class="shrink-0 border-t border-slate-200 dark:border-slate-800 p-3 space-y-2">
             <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
@@ -125,9 +172,9 @@ export function renderApp(
         <main class="relative min-h-0 min-w-0 bg-slate-100 dark:bg-slate-950">
           <div id="graph" class="w-full h-full"></div>
           <div id="breadcrumb" class="absolute top-3 right-3 z-20 flex items-center flex-wrap justify-end gap-x-0.5 max-w-[65%] px-2.5 py-1 rounded-md bg-white/90 dark:bg-slate-800/90 border border-slate-200 dark:border-slate-700 shadow text-xs text-slate-600 dark:text-slate-300"></div>
-          <div class="absolute bottom-3 left-3 z-20">
-            <div id="minimap" class="w-52 h-36 rounded-md border border-slate-300 dark:border-slate-700 bg-white/80 dark:bg-slate-900/80 shadow overflow-hidden cursor-pointer"></div>
-            <button id="mapToggle" class="absolute top-1 left-1 z-30 px-1.5 py-0.5 rounded bg-slate-700/90 hover:bg-slate-600 text-slate-100 text-[10px] shadow" title="Toggle minimap">Hide</button>
+          <div class="absolute bottom-3 left-3 z-20 w-52 h-36 pointer-events-none">
+            <div id="minimap" class="relative w-full h-full rounded-md border border-slate-300 dark:border-slate-700 bg-white/80 dark:bg-slate-900/80 shadow overflow-hidden cursor-pointer pointer-events-auto"></div>
+            <button id="mapToggle" class="absolute bottom-1 left-1 z-30 px-1.5 py-0.5 rounded bg-slate-700/90 hover:bg-slate-600 text-slate-100 text-[10px] shadow pointer-events-auto" title="Toggle minimap">Hide</button>
           </div>
           <button id="reopen" class="hidden absolute bottom-3 right-3 z-20 px-2 py-1 rounded bg-slate-700 text-slate-100 text-xs shadow">Details ›</button>
           <div id="panel" class="hidden absolute z-20 inset-x-4 bottom-4 max-h-[40%] bg-white dark:bg-slate-800 dark:text-slate-200 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 overflow-y-auto p-3 text-xs"></div>
@@ -148,6 +195,7 @@ export function renderApp(
             ${helpRow(mouseSvg('left'), 'Click', 'details')}
             ${helpRow(mouseSvg('left', '×2'), 'Double-click', 'focus')}
             ${helpRow(mouseSvg('right'), 'Right-click', 'actions')}
+            ${helpRow(mouseSvg('right'), 'Right-drag', 'select group → move together')}
             ${helpRow(mouseSvg('wheel'), 'Scroll', 'zoom (Ctrl = faster)')}
             ${helpRow(dragSvg(), 'Drag', 'pan / move node')}
             ${helpRow(keyCap('space'), 'Space / 🔒', 'pan through nodes')}
@@ -193,10 +241,12 @@ export function renderApp(
     const node = graph.nodes.find((n) => n.id === id)
     if (!node) return
     clearHighlightUI()
-    // If the target isn't currently on-screen (focus filter or "Hide
-    // unconnected"), focus on it so it's laid out cleanly and centred rather
-    // than revealed at a stale, overlapping position.
-    if (opts.focus || !view.isVisible(id)) view.focusNeighbourhood(id)
+    // If the target isn't currently on-screen (focus filter, department filter,
+    // or "Hide unconnected"), focus on it so it's laid out cleanly and centred
+    // rather than revealed at a stale, overlapping position.
+    const willFocus = opts.focus || !view.isVisible(id)
+    if (willFocus) clearDeptUI() // node-focus is mutually exclusive with dept filter
+    if (willFocus) view.focusNeighbourhood(id)
     else view.centerOn(id)
     if (detailsHidden) toggleDetails(true)
     showDetails(node)
@@ -246,6 +296,7 @@ export function renderApp(
         if (v === 'all') {
           history.length = 0
           view.clearFocus()
+          clearDeptUI()
           showDetails(null)
           renderBreadcrumb()
         } else {
@@ -366,6 +417,36 @@ export function renderApp(
   const layoutSel = root.querySelector<HTMLSelectElement>('#layout')!
   layoutSel.addEventListener('change', () => view.setLayout(layoutSel.value as LayoutName))
 
+  // --- Department filter ---------------------------------------------------
+  const deptButtons = root.querySelectorAll<HTMLElement>('#deptList [data-dept]')
+  let activeDept: string | null = null
+  const clearDeptUI = (): void => {
+    activeDept = null
+    deptButtons.forEach((el) => el.classList.remove('bg-sky-100', 'dark:bg-sky-900/40'))
+  }
+  const setDept = (bucket: string | null): void => {
+    activeDept = bucket
+    view.setDepartmentFilter(bucket)
+    clearHighlightUI()
+    deptButtons.forEach((el) => {
+      const on = (el.dataset.dept || null) === bucket
+      el.classList.toggle('bg-sky-100', on)
+      el.classList.toggle('dark:bg-sky-900/40', on)
+    })
+    // Drilling into one department is clearest with the coloured boxes on.
+    if (bucket && layoutSel.value !== 'department') {
+      layoutSel.value = 'department'
+      view.setLayout('department')
+    }
+  }
+  deptButtons.forEach((b) => {
+    b.addEventListener('click', () => {
+      const raw = b.dataset.dept ?? ''
+      const bucket = raw === '' ? null : raw
+      setDept(bucket === activeDept ? null : bucket)
+    })
+  })
+
   // Minimap show/hide toggle sits just under the map.
   const mapToggle = root.querySelector<HTMLButtonElement>('#mapToggle')!
   mapToggle.addEventListener('mousedown', (e) => e.stopPropagation())
@@ -455,6 +536,7 @@ export function renderApp(
     )
     menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
     menuEl.append(item('↻', 'Reload', cb.onReload))
+    menuEl.append(item('⬆', 'Check for updates', () => checkForUpdates()))
     menuEl.append(item('⏏', 'Disconnect', cb.onDisconnect))
   }
   menuBtn.addEventListener('click', (e) => {

@@ -1,0 +1,782 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:9e02b6af-8c75-4edb-9c38-47c4f2580342",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-07-09T10:29:51.373Z",
+    "lifecycles": [
+      {
+        "phase": "build"
+      }
+    ],
+    "tools": [
+      {
+        "vendor": "npm",
+        "name": "cli",
+        "version": "11.13.0"
+      }
+    ],
+    "component": {
+      "bom-ref": "3cx-spy@1.0.0",
+      "type": "library",
+      "name": "3cx-spy",
+      "version": "1.0.0",
+      "scope": "required",
+      "author": "example.com",
+      "description": "Interactive graph viewer for a 3CX phone system's call flow",
+      "purl": "pkg:npm/3cx-spy@1.0.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://electron-vite.org"
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "bom-ref": "@electron-toolkit/preload@3.0.2",
+      "type": "library",
+      "name": "@electron-toolkit/preload",
+      "version": "3.0.2",
+      "scope": "required",
+      "author": "Alex Wei<https://github.com/alex8088>",
+      "description": "Toolkit for electron preload scripts.",
+      "purl": "pkg:npm/%40electron-toolkit/preload@3.0.2",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/@electron-toolkit/preload/-/preload-3.0.2.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/alex8088/electron-toolkit.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/alex8088/electron-toolkit/tree/master/packages/preload#readme"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/alex8088/electron-toolkit/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "4d658f4e85ddf2a3d17d25f0cdfe4a561a5731f38d694b91019247b0ab612a0651ffe2ea5f5759552482950f0e4c011dbaf2c675e7258c2b284f68d2b217e852"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "@electron-toolkit/utils@4.0.0",
+      "type": "library",
+      "name": "@electron-toolkit/utils",
+      "version": "4.0.0",
+      "scope": "required",
+      "author": "Alex Wei<https://github.com/alex8088>",
+      "description": "Utils for Electron main process.",
+      "purl": "pkg:npm/%40electron-toolkit/utils@4.0.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/@electron-toolkit/utils/-/utils-4.0.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/alex8088/electron-toolkit.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/alex8088/electron-toolkit/tree/master/packages/utils#readme"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/alex8088/electron-toolkit/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "a974a7b7013396e4b32a5e33e7214d0649e63c68cf6b7cc5844e26a7dfa1d1c828918e68ae701e3fe0894030612ac2f54b9f1a3907dcc240f73702d90a5fbae2"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "cose-base@2.2.0",
+      "type": "library",
+      "name": "cose-base",
+      "version": "2.2.0",
+      "scope": "required",
+      "description": "Core module for compound spring embedder based layout styles",
+      "purl": "pkg:npm/cose-base@2.2.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/cose-base/-/cose-base-2.2.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/iVis-at-Bilkent/cose-base.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/iVis-at-Bilkent/cose-base#readme"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/iVis-at-Bilkent/cose-base/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "03396072c09b50cca69000ce26d426df03bd4b796d3df60e143e74df791e427f4d27321bb67663f9474125eec362697ff1375bb47256de3e7c48e9ca85663fe6"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "cytoscape@3.34.0",
+      "type": "library",
+      "name": "cytoscape",
+      "version": "3.34.0",
+      "scope": "required",
+      "description": "Graph theory (a.k.a. network) library for analysis and visualisation",
+      "purl": "pkg:npm/cytoscape@3.34.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/cytoscape/-/cytoscape-3.34.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/cytoscape/cytoscape.js.git"
+        },
+        {
+          "type": "website",
+          "url": "http://js.cytoscape.org"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/cytoscape/cytoscape.js/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "eb6acd4ab8a85f0f77ba588a141c23ba4790c9e5b01f63ea0eb4da737d6bd8feb8eb8bb7014bd3934c52e0b56f4f6e7583b220905ba7ac8e3c6446468f2c123a"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "cytoscape-dagre@4.0.0",
+      "type": "library",
+      "name": "cytoscape-dagre",
+      "version": "4.0.0",
+      "scope": "required",
+      "author": "Max Franz",
+      "description": "The Dagre layout for DAGs and trees for Cytoscape.js",
+      "purl": "pkg:npm/cytoscape-dagre@4.0.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/cytoscape-dagre/-/cytoscape-dagre-4.0.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/cytoscape/cytoscape.js-dagre.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/cytoscape/cytoscape.js-dagre"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/cytoscape/cytoscape.js-dagre/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "c2c0e08b5847a567ec950c5efc677fc4209e8366140ebcf0ba584739223b7cc7e597dd8515563601685246e94b88e55cc83138cf3d2b45dffed53053c3e7b0e5"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "cytoscape-fcose@2.2.0",
+      "type": "library",
+      "name": "cytoscape-fcose",
+      "version": "2.2.0",
+      "scope": "required",
+      "author": "iVis-at-Bilkent",
+      "description": "The fCoSE layout for Cytoscape.js by Bilkent with fast compound node placement",
+      "purl": "pkg:npm/cytoscape-fcose@2.2.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/cytoscape-fcose/-/cytoscape-fcose-2.2.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/iVis-at-Bilkent/cytoscape.js-fcose.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/iVis-at-Bilkent/cytoscape.js-fcose"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/iVis-at-Bilkent/cytoscape.js-fcose/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "922d7f56e4481c50b3c5636bb2c84760fb3a2fb4ef2eedc32fe4f220612c45cbd51119b1a246dfe46764ee61716674dd886b6703871f4a68d924cbe2a92b99ad"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "dagre@0.8.5",
+      "type": "library",
+      "name": "dagre",
+      "version": "0.8.5",
+      "scope": "required",
+      "author": "Chris Pettitt <cpettitt@gmail.com>",
+      "description": "Graph layout for JavaScript",
+      "purl": "pkg:npm/dagre@0.8.5",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/dagre/-/dagre-0.8.5.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/dagrejs/dagre.git"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "fda4ea9a746d6bbc7b3020a913193b1d02f63b8a30093da1f0d4ffffd235390f6fb76f4f6b4073480911e65c0551c43be3dd72562ff709753d8d0e68d0c9f64b"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "electron-updater@6.8.9",
+      "type": "library",
+      "name": "electron-updater",
+      "version": "6.8.9",
+      "scope": "required",
+      "author": "Vladimir Krivosheev",
+      "description": "Cross platform updater for electron applications",
+      "purl": "pkg:npm/electron-updater@6.8.9",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/electron-updater/-/electron-updater-6.8.9.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/electron-userland/electron-builder.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/electron-userland/electron-builder"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "66157133d88638d52964623517174c4602635055e2ec060655ae4fc0a94ed6d575ff8cc3c5099f2a95ce1d5ced2ab77a2fdacb7058c446f8b531fdafc724e48a"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "fs-extra@10.1.0",
+      "type": "library",
+      "name": "fs-extra",
+      "version": "10.1.0",
+      "scope": "required",
+      "author": "JP Richardson <jprichardson@gmail.com>",
+      "description": "fs-extra contains methods that aren't included in the vanilla Node.js fs package. Such as recursive mkdir, copy, and remove.",
+      "purl": "pkg:npm/fs-extra@10.1.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/fs-extra/-/fs-extra-10.1.0.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/jprichardson/node-fs-extra"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/jprichardson/node-fs-extra"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "a115c0a6ae78113463e1e3221731a71d61b2fb3a39adab9d8eec4dd1bf07eecfd1536a16d16becc7d3b400244dfe446af44f15bbf45eb24181e68de38be1731d"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "jsonfile@6.2.1",
+      "type": "library",
+      "name": "jsonfile",
+      "version": "6.2.1",
+      "scope": "required",
+      "author": "JP Richardson <jprichardson@gmail.com>",
+      "description": "Easily read/write JSON files.",
+      "purl": "pkg:npm/jsonfile@6.2.1",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/jsonfile/-/jsonfile-6.2.1.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git@github.com:jprichardson/node-jsonfile.git"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "cf039374bdeb150fe545d0679ed295397ea4e5c289c047351dd8a54fbd41584bbb278d605c8076311a7ebf176e3d2c1924f581c44cefe321f5c182c91941d7e1"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "semver@7.7.4",
+      "type": "library",
+      "name": "semver",
+      "version": "7.7.4",
+      "scope": "required",
+      "author": "GitHub Inc.",
+      "description": "The semantic version parser used by npm.",
+      "purl": "pkg:npm/semver@7.7.4",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/semver/-/semver-7.7.4.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/npm/node-semver.git"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "bc5282d8812d427561a53efc875629f30cf0adff0233e33328c1c62597c1b738593727111675ec1e4e84e53c4892432c80d4bb99d5f700607bc7640cd9d8b894"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "ISC"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "universalify@2.0.1",
+      "type": "library",
+      "name": "universalify",
+      "version": "2.0.1",
+      "scope": "required",
+      "author": "Ryan Zimmerman <opensrc@ryanzim.com>",
+      "description": "Make a callback- or promise-based function support both promises and callbacks.",
+      "purl": "pkg:npm/universalify@2.0.1",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/universalify/-/universalify-2.0.1.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/RyanZim/universalify.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/RyanZim/universalify#readme"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "829b4735082120d9dcfef4c6224d12385185357c3b255ae5454b42a2725196f6b0e83b97d303b925e928f6c5ab301861f8fb18019ee85c088e9dffd42a88328b"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "graphlib@2.1.8",
+      "type": "library",
+      "name": "graphlib",
+      "version": "2.1.8",
+      "scope": "required",
+      "author": "Chris Pettitt <cpettitt@gmail.com>",
+      "description": "A directed and undirected multi-graph library",
+      "purl": "pkg:npm/graphlib@2.1.8",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/graphlib/-/graphlib-2.1.8.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/dagrejs/graphlib.git"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "8dc2cb7e4a68546987eff227302ff5848bce3d2521dfca09b4686face146ce2a04d4367ed185b5e918263898478ae593bc688943d675224e3726f9113d1bc4f8"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "layout-base@2.0.1",
+      "type": "library",
+      "name": "layout-base",
+      "version": "2.0.1",
+      "scope": "required",
+      "description": "Basic layout model and some utilities for Cytoscape.js layout extensions",
+      "purl": "pkg:npm/layout-base@2.0.1",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/layout-base/-/layout-base-2.0.1.tgz"
+        },
+        {
+          "type": "vcs",
+          "url": "git+https://github.com/iVis-at-Bilkent/layout-base.git"
+        },
+        {
+          "type": "website",
+          "url": "https://github.com/iVis-at-Bilkent/layout-base#readme"
+        },
+        {
+          "type": "issue-tracker",
+          "url": "https://github.com/iVis-at-Bilkent/layout-base/issues"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "769decf76fae348d61588a4f187de32b693113694c8dd5ddafe0c7f329d91e977a3d4947eb1e9c6ee5e7a0c9a236e9b39ea68d3b7d71bbd7bbf45d2eb99d0916"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "lodash.escaperegexp@4.1.2",
+      "type": "library",
+      "name": "lodash.escaperegexp",
+      "version": "4.1.2",
+      "scope": "required",
+      "author": "John-David Dalton <john.david.dalton@gmail.com> (http://allyoucanleet.com/)",
+      "description": "The lodash method `_.escapeRegExp` exported as a module.",
+      "purl": "pkg:npm/lodash.escaperegexp@4.1.2",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/lodash.escaperegexp/-/lodash.escaperegexp-4.1.2.tgz"
+        },
+        {
+          "type": "website",
+          "url": "https://lodash.com/"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "4ccf5806fc82f38671137ae07de7f151689028b8a5b2d0fa93b3d31adeb07dbb5717c8b12092ce2f7558c95ff3f9988f2ec57102c280155c1695679bd98f18cb"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "lodash.isequal@4.5.0",
+      "type": "library",
+      "name": "lodash.isequal",
+      "version": "4.5.0",
+      "scope": "required",
+      "author": "John-David Dalton <john.david.dalton@gmail.com> (http://allyoucanleet.com/)",
+      "description": "The Lodash method `_.isEqual` exported as a module.",
+      "purl": "pkg:npm/lodash.isequal@4.5.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/lodash.isequal/-/lodash.isequal-4.5.0.tgz"
+        },
+        {
+          "type": "website",
+          "url": "https://lodash.com/"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "a43a3796ef0985f8ea96ce8690c8296a1b05f640b26b2860ca48f22cc3454ca5aba5574042d6320789ae00c5a8cc10788a0fddb56026b0cc4b108f30bb3f8361"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "bom-ref": "tiny-typed-emitter@2.1.0",
+      "type": "library",
+      "name": "tiny-typed-emitter",
+      "version": "2.1.0",
+      "scope": "required",
+      "author": "Zurab Benashvili <zura.benashvili@gmail.com>",
+      "description": "Fully type-checked EventEmitter",
+      "purl": "pkg:npm/tiny-typed-emitter@2.1.0",
+      "properties": [],
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://registry.npmjs.org/tiny-typed-emitter/-/tiny-typed-emitter-2.1.0.tgz"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "a95b6f3317976d57a3d1c4162aa5524801e629910702fc5d17c1c4501156b6cf21fb1128e66fe51223da92ec99dc19c2063383f22db893334e88e2cb82c4b184"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "3cx-spy@1.0.0",
+      "dependsOn": [
+        "@electron-toolkit/preload@3.0.2",
+        "@electron-toolkit/utils@4.0.0",
+        "cytoscape@3.34.0",
+        "cytoscape-dagre@4.0.0",
+        "cytoscape-fcose@2.2.0",
+        "dagre@0.8.5",
+        "electron-updater@6.8.9"
+      ]
+    },
+    {
+      "ref": "@electron-toolkit/preload@3.0.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "@electron-toolkit/utils@4.0.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "cose-base@2.2.0",
+      "dependsOn": [
+        "layout-base@2.0.1"
+      ]
+    },
+    {
+      "ref": "cytoscape@3.34.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "cytoscape-dagre@4.0.0",
+      "dependsOn": [
+        "cytoscape@3.34.0"
+      ]
+    },
+    {
+      "ref": "cytoscape-fcose@2.2.0",
+      "dependsOn": [
+        "cytoscape@3.34.0",
+        "cose-base@2.2.0"
+      ]
+    },
+    {
+      "ref": "dagre@0.8.5",
+      "dependsOn": [
+        "graphlib@2.1.8"
+      ]
+    },
+    {
+      "ref": "electron-updater@6.8.9",
+      "dependsOn": [
+        "fs-extra@10.1.0",
+        "lodash.escaperegexp@4.1.2",
+        "lodash.isequal@4.5.0",
+        "semver@7.7.4",
+        "tiny-typed-emitter@2.1.0"
+      ]
+    },
+    {
+      "ref": "fs-extra@10.1.0",
+      "dependsOn": [
+        "jsonfile@6.2.1",
+        "universalify@2.0.1"
+      ]
+    },
+    {
+      "ref": "jsonfile@6.2.1",
+      "dependsOn": [
+        "universalify@2.0.1"
+      ]
+    },
+    {
+      "ref": "semver@7.7.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "universalify@2.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "graphlib@2.1.8",
+      "dependsOn": []
+    },
+    {
+      "ref": "layout-base@2.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "lodash.escaperegexp@4.1.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "lodash.isequal@4.5.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "tiny-typed-emitter@2.1.0",
+      "dependsOn": []
+    }
+  ]
+}

@@ -1,3 +1,5 @@
-provider: generic
-url: https://example.com/auto-updates
+provider: github
+owner: FlameAqua
+repo: 3cx-spy
+private: true
 updaterCacheDirName: 3cx-spy-updater

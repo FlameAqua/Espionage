@@ -5,13 +5,20 @@ import cytoscape from 'cytoscape'
 import type { Core, ElementDefinition, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
 import fcose from 'cytoscape-fcose'
-import { NODE_KIND_META, type GraphNode, type NodeKind, type TopologyGraph } from './model'
+import {
+  NODE_KIND_META,
+  departmentColor,
+  departmentLabel,
+  type GraphNode,
+  type NodeKind,
+  type TopologyGraph
+} from './model'
 
 cytoscape.use(dagre)
 cytoscape.use(fcose)
 
 export type ThemeName = 'light' | 'dark'
-export type LayoutName = 'flow' | 'force' | 'breadthfirst' | 'compact'
+export type LayoutName = 'flow' | 'force' | 'breadthfirst' | 'compact' | 'department'
 
 const EDGE_COLOR: Record<string, string> = {
   route: '#64748b',
@@ -47,6 +54,9 @@ export class GraphView {
   private visibleKinds: Set<NodeKind>
   private focusId: string | null = null
   private hideUnconnected = false
+  private deptFilter: string | null = null
+  private deptParentsActive = false
+  private boxEl!: HTMLElement
 
   constructor(
     container: HTMLElement,
@@ -69,7 +79,9 @@ export class GraphView {
       userZoomingEnabled: false,
       // Drag a node to move it, drag the background to pan, scroll to zoom.
       // The padlock / Space-pan toggle node grabbability at runtime.
-      boxSelectionEnabled: false
+      // Selection powers right-drag box-select + grouped node move.
+      boxSelectionEnabled: true,
+      selectionType: 'single'
     })
 
     // Manual wheel zoom around the cursor: ~3x the previous feel, and holding
@@ -102,7 +114,9 @@ export class GraphView {
     let lastTapId = ''
     let lastTapAt = 0
     this.cy.on('tap', 'node', (evt) => {
-      const node = (evt.target as NodeSingular).data('model') as GraphNode
+      const node = (evt.target as NodeSingular).data('model') as GraphNode | undefined
+      if (!node) return // department container box — ignore taps on it
+      this.cy.nodes().unselect() // a plain tap clears any right-drag group selection
       const now = Date.now()
       const isDouble = node.id === lastTapId && now - lastTapAt < 350
       lastTapId = node.id
@@ -113,18 +127,19 @@ export class GraphView {
     this.cy.on('tap', (evt) => {
       if (evt.target === this.cy) {
         this.cy.elements().removeClass('faded selected')
+        this.cy.nodes().unselect()
         this.cb.onBackgroundTap()
       }
     })
     this.cy.on('cxttap', 'node', (evt) => {
+      const node = (evt.target as NodeSingular).data('model') as GraphNode | undefined
+      if (!node) return
       const oe = evt.originalEvent as MouseEvent
-      this.cb.onNodeContext(
-        (evt.target as NodeSingular).data('model') as GraphNode,
-        oe?.clientX ?? 0,
-        oe?.clientY ?? 0
-      )
+      this.cb.onNodeContext(node, oe?.clientX ?? 0, oe?.clientY ?? 0)
     })
     this.cy.on('zoom', () => this.cb.onZoomChange(this.cy.zoom()))
+
+    this.setupBoxSelect(container)
 
     this.applyVisibility()
     requestAnimationFrame(() => {
@@ -135,11 +150,117 @@ export class GraphView {
     })
   }
 
+  /** Hold the right mouse button and drag on empty space to rubber-band a group
+   *  of nodes; grabbing any one of them then moves the whole group together
+   *  (Cytoscape's built-in grouped-drag on selected nodes). */
+  private setupBoxSelect(container: HTMLElement): void {
+    const box = document.createElement('div')
+    Object.assign(box.style, {
+      position: 'absolute',
+      display: 'none',
+      border: '1px dashed #0ea5e9',
+      background: 'rgba(14,165,233,0.12)',
+      pointerEvents: 'none',
+      zIndex: '5'
+    } as CSSStyleDeclaration)
+    container.appendChild(box)
+    this.boxEl = box
+
+    let startR: { x: number; y: number } | null = null
+    let startM: { x: number; y: number } | null = null
+
+    this.cy.on('cxttapstart', (evt) => {
+      if (evt.target !== this.cy) return // only when starting on empty background
+      startR = { x: evt.renderedPosition.x, y: evt.renderedPosition.y }
+      startM = { x: evt.position.x, y: evt.position.y }
+      Object.assign(box.style, {
+        display: 'block',
+        left: `${startR.x}px`,
+        top: `${startR.y}px`,
+        width: '0px',
+        height: '0px'
+      })
+    })
+    this.cy.on('cxtdrag', (evt) => {
+      if (!startR) return
+      const rp = evt.renderedPosition
+      Object.assign(box.style, {
+        left: `${Math.min(startR.x, rp.x)}px`,
+        top: `${Math.min(startR.y, rp.y)}px`,
+        width: `${Math.abs(rp.x - startR.x)}px`,
+        height: `${Math.abs(rp.y - startR.y)}px`
+      })
+    })
+    this.cy.on('cxttapend', (evt) => {
+      if (!startR || !startM) return
+      const s = startR
+      const sm = startM
+      startR = null
+      startM = null
+      box.style.display = 'none'
+      const rp = evt.renderedPosition
+      if (Math.hypot(rp.x - s.x, rp.y - s.y) < 8) return // a click, not a drag
+      const em = evt.position
+      const x1 = Math.min(sm.x, em.x)
+      const x2 = Math.max(sm.x, em.x)
+      const y1 = Math.min(sm.y, em.y)
+      const y2 = Math.max(sm.y, em.y)
+      this.cy.elements().removeClass('faded selected')
+      this.cy.nodes().unselect()
+      this.cy
+        .nodes()
+        .filter((n) => {
+          if (!n.data('model') || n.hasClass('hidden')) return false
+          const p = n.position()
+          return p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2
+        })
+        .select()
+    })
+  }
+
   // --- Layout -------------------------------------------------------------
 
   setLayout(name: LayoutName): void {
     this.layoutName = name
+    if (name === 'department') this.enterDepartmentMode()
+    else this.exitDepartmentMode()
     this.runLayout()
+  }
+
+  /** Wrap nodes in coloured compound "department" boxes, one per bucket
+   *  present in the graph (see GraphNode.deptGroup). */
+  private enterDepartmentMode(): void {
+    if (this.deptParentsActive) return
+    this.deptParentsActive = true
+    const buckets = new Map<string, string>() // bucket -> colour
+    this.cy.nodes().forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      if (model?.deptGroup) buckets.set(model.deptGroup, departmentColor(model.deptGroup))
+    })
+    if (!buckets.size) return
+    const parents: ElementDefinition[] = []
+    buckets.forEach((color, bucket) => {
+      parents.push({
+        data: { id: `dept:${bucket}`, label: departmentLabel(bucket), deptColor: color },
+        classes: 'dept-parent'
+      })
+    })
+    this.cy.add(parents)
+    this.cy.nodes().forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      if (model?.deptGroup) n.move({ parent: `dept:${model.deptGroup}` })
+    })
+  }
+
+  /** Un-parent every node and remove the department boxes (children must be
+   *  moved out first — removing a parent removes its descendants too). */
+  private exitDepartmentMode(): void {
+    if (!this.deptParentsActive) return
+    this.deptParentsActive = false
+    this.cy.nodes().forEach((n) => {
+      if (n.data('model')) n.move({ parent: null })
+    })
+    this.cy.nodes('.dept-parent').remove()
   }
 
   getLayout(): LayoutName {
@@ -184,6 +305,24 @@ export class GraphView {
           nodeRepulsion: () => 14000,
           idealEdgeLength: () => 110,
           gravity: 0.2,
+          packComponents: true,
+          ...base
+        } as cytoscape.LayoutOptions
+      case 'department':
+        // fcose is compound-aware: each department becomes a tidy packed box.
+        // randomize:false starts from the current (deterministic, dagre-based
+        // Flow) positions instead of reseeding random noise every run, so
+        // repeat layouts settle into the same arrangement instead of a new
+        // one each time.
+        return {
+          name: 'fcose',
+          quality: 'proof',
+          randomize: false,
+          nodeSeparation: 90,
+          nodeRepulsion: () => 9000,
+          idealEdgeLength: () => 90,
+          gravity: 0.3,
+          nestingFactor: 0.12,
           packComponents: true,
           ...base
         } as cytoscape.LayoutOptions
@@ -321,6 +460,7 @@ export class GraphView {
     this.cy.stop() // cancel any in-flight centring from the preceding tap
     if (layout) this.layoutName = layout
     this.focusId = id
+    this.deptFilter = null // mutually exclusive with the department filter
     this.applyVisibility()
     this.highlightNeighbourhood(this.cy.getElementById(id) as NodeSingular)
     requestAnimationFrame(() => this.runLayout(true))
@@ -330,6 +470,7 @@ export class GraphView {
     this.cy.stop()
     if (layout) this.layoutName = layout
     this.focusId = null
+    this.deptFilter = null
     this.cy.elements().removeClass('faded selected')
     this.applyVisibility()
     requestAnimationFrame(() => this.runLayout(true))
@@ -337,6 +478,21 @@ export class GraphView {
 
   isFocused(): boolean {
     return this.focusId !== null
+  }
+
+  /** Filter the view to one department bucket's nodes plus any node with an
+   *  edge into that bucket (so cross-department links stay visible). Pass
+   *  null to clear. Mutually exclusive with node-focus mode. */
+  setDepartmentFilter(bucket: string | null): void {
+    this.focusId = null
+    this.deptFilter = bucket
+    this.cy.elements().removeClass('faded selected')
+    this.applyVisibility()
+    requestAnimationFrame(() => this.runLayout(true))
+  }
+
+  getDepartmentFilter(): string | null {
+    return this.deptFilter
   }
 
   /** Whether a node exists and is currently on-screen (not filtered out). */
@@ -359,23 +515,56 @@ export class GraphView {
     requestAnimationFrame(() => this.runLayout(true))
   }
 
-  /** Recompute element visibility from the kind filter and any active focus.
-   *  When focused, a node shows if it's in the neighbourhood AND its category is
-   *  enabled (the focused node itself always stays visible). */
+  /** Recompute element visibility from the kind filter and any active focus or
+   *  department filter. When focused, a node shows if it's in the neighbourhood
+   *  AND its category is enabled (the focused node itself always stays
+   *  visible). When department-filtered, a node shows if it's a member of that
+   *  bucket, or has a direct edge into it (so cross-department links stay
+   *  visible), AND its category is enabled. */
   private applyVisibility(): void {
     const focusSet = this.focusId ? this.cy.getElementById(this.focusId).closedNeighborhood() : null
     const focusIds = focusSet ? new Set(focusSet.map((e) => e.id())) : null
+
+    let deptIds: Set<string> | null = null
+    if (this.deptFilter) {
+      const members = this.cy.nodes().filter((n) => {
+        const model = n.data('model') as GraphNode | undefined
+        return !!model && model.deptGroup === this.deptFilter
+      })
+      deptIds = new Set(members.closedNeighborhood().map((e) => e.id()))
+      // Also walk backward — who routes INTO a member — several hops deep, so
+      // the whole entry chain (e.g. Inbound Rule -> shared main IVR -> this
+      // department's own IVR/queue -> member) stays visible even when the
+      // immediate hop is a gateway shared with other departments. Following
+      // only "who points at me" (never "where else do you point") means it
+      // never leaks into a shared node's other branches.
+      let frontier = members
+      for (let hop = 0; hop < 6 && !frontier.empty(); hop++) {
+        const ancestors = frontier.incomers('node')
+        const fresh = ancestors.filter((n) => !deptIds!.has(n.id()))
+        if (fresh.empty()) break
+        fresh.forEach((n) => {
+          deptIds!.add(n.id())
+        })
+        frontier = fresh
+      }
+    }
+
     this.cy.batch(() => {
       this.cy.nodes().forEach((n) => {
-        const byKind = this.visibleKinds.has((n.data('model') as GraphNode).kind)
-        const visible = focusIds
-          ? n.id() === this.focusId || (focusIds.has(n.id()) && byKind)
-          : byKind
+        const model = n.data('model') as GraphNode | undefined
+        if (!model) return // department container — visibility handled below
+        const byKind = this.visibleKinds.has(model.kind)
+        let visible: boolean
+        if (focusIds) visible = n.id() === this.focusId || (focusIds.has(n.id()) && byKind)
+        else if (deptIds) visible = deptIds.has(n.id()) && byKind
+        else visible = byKind
         n.toggleClass('hidden', !visible)
       })
       // Optionally drop nodes with no edge to another currently-visible node.
       if (this.hideUnconnected && !focusIds) {
         this.cy.nodes(':visible').forEach((n) => {
+          if (!n.data('model')) return
           const connected = n
             .openNeighborhood('node')
             .some((other) => !(other as NodeSingular).hasClass('hidden'))
@@ -386,6 +575,13 @@ export class GraphView {
         const visible = !e.source().hasClass('hidden') && !e.target().hasClass('hidden')
         e.toggleClass('hidden', !visible)
       })
+      // Department boxes: hide any box left with no visible member.
+      if (this.deptParentsActive) {
+        this.cy.nodes('.dept-parent').forEach((p) => {
+          const anyVisible = p.children().some((c) => !(c as NodeSingular).hasClass('hidden'))
+          p.toggleClass('hidden', !anyVisible)
+        })
+      }
     })
   }
 
@@ -399,9 +595,14 @@ export class GraphView {
       this.cy.elements().removeClass('faded selected')
       return
     }
-    this.cy.elements().addClass('faded').removeClass('selected')
+    this.cy.elements().removeClass('selected')
+    // Never fade the department boxes — a compound parent's opacity multiplies
+    // its children's, so fading a box would dim every node inside it and no
+    // amount of un-fading a single child could override it.
+    this.cy.elements().not('.dept-parent').addClass('faded')
     this.cy.nodes().forEach((n) => {
-      if ((n.data('model') as GraphNode).kind === kind) n.removeClass('faded')
+      const model = n.data('model') as GraphNode | undefined
+      if (model?.kind === kind) n.removeClass('faded')
     })
   }
 
@@ -410,7 +611,10 @@ export class GraphView {
   search(term: string): GraphNode[] {
     const t = term.trim().toLowerCase()
     if (!t) return []
-    const models = this.cy.nodes().map((n) => n.data('model') as GraphNode)
+    const models = this.cy
+      .nodes()
+      .map((n) => n.data('model') as GraphNode | undefined)
+      .filter((m): m is GraphNode => !!m)
     const named = models.filter(
       (m) => m.label.toLowerCase().includes(t) || (m.number ?? '').includes(t)
     )
@@ -425,7 +629,9 @@ export class GraphView {
 
   private highlightNeighbourhood(node: NodeSingular): void {
     const hood = node.closedNeighborhood()
-    this.cy.elements().addClass('faded').removeClass('selected')
+    this.cy.elements().removeClass('selected')
+    // Exclude the department boxes — see highlightKind for why.
+    this.cy.elements().not('.dept-parent').addClass('faded')
     hood.removeClass('faded')
     node.addClass('selected')
   }
@@ -433,6 +639,7 @@ export class GraphView {
   destroy(): void {
     this.resizeObserver.disconnect()
     this.container.removeEventListener('wheel', this.onWheel)
+    this.boxEl?.remove()
     this.cy.destroy()
   }
 }
@@ -510,10 +717,46 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
       selector: 'node.selected',
       style: { 'border-width': 4, 'border-color': '#0ea5e9', 'border-opacity': 1 }
     },
+    // Cytoscape's own selected state (right-drag box selection / group move).
+    {
+      selector: 'node:selected',
+      style: {
+        'border-width': 3,
+        'border-color': '#f59e0b',
+        'border-opacity': 1,
+        'overlay-color': '#f59e0b',
+        'overlay-opacity': 0.15,
+        'overlay-padding': 2
+      }
+    },
     { selector: '.hidden', style: { display: 'none' } },
     // While panning (padlock / Space) elements pass pointer events through to
     // the core so a drag starting on a node/edge pans instead of grabbing it.
-    { selector: '.pan-through', style: { events: 'no' } }
+    { selector: '.pan-through', style: { events: 'no' } },
+    // Department (Department layout) compound container boxes.
+    {
+      selector: 'node.dept-parent',
+      style: {
+        shape: 'round-rectangle',
+        'background-color': 'data(deptColor)',
+        'background-opacity': dark ? 0.1 : 0.06,
+        'border-width': 2,
+        'border-style': 'dashed',
+        'border-color': 'data(deptColor)',
+        'border-opacity': 0.9,
+        label: 'data(label)',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': -6,
+        'font-size': 13,
+        'font-weight': 700,
+        color: 'data(deptColor)',
+        padding: '34px',
+        'min-width': '120px',
+        'min-height': '80px',
+        'compound-sizing-wrt-labels': 'include'
+      }
+    }
   ]
 
   for (const [kind, meta] of Object.entries(NODE_KIND_META)) {

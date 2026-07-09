@@ -27,6 +27,22 @@ export interface EntitySet<T = Record<string, unknown>> {
   error?: string
 }
 
+/** Auto-update lifecycle events, forwarded from the main process (electron-updater)
+ *  to the renderer's update toast over the `updates:status` channel. */
+export type UpdateStatus =
+  | { kind: 'checking' }
+  | { kind: 'available'; version: string }
+  | { kind: 'not-available'; version: string }
+  | {
+      kind: 'progress'
+      percent: number
+      transferred: number
+      total: number
+      bytesPerSecond: number
+    }
+  | { kind: 'downloaded'; version: string }
+  | { kind: 'error'; message: string }
+
 /** Every collection the topology graph is built from. Each may be empty/errored. */
 export interface Topology {
   fetchedAt: string

@@ -1,5 +1,6 @@
 // The connection screen: collects the 3CX URL + credentials and reports back.
 import type { ConnectRequest } from '../../../shared/types'
+import { logoSvg } from './logo'
 
 const LS_KEY = '3cx-spy.connection'
 
@@ -18,7 +19,10 @@ export function renderLogin(
     <div class="min-h-screen flex items-center justify-center bg-slate-900 text-slate-100">
       <form id="login" class="w-[380px] bg-slate-800 rounded-xl shadow-2xl p-7 space-y-4">
         <div class="text-center">
-          <h1 class="text-2xl font-bold tracking-tight">Espionage</h1>
+          <div class="flex items-center justify-center gap-2.5">
+            <span class="shrink-0">${logoSvg(40)}</span>
+            <h1 class="text-2xl font-bold tracking-tight">Espionage</h1>
+          </div>
           <p class="text-xs text-slate-400 mt-1">Connect to a 3CX system to map its call flow.</p>
         </div>
         <label class="block text-xs font-medium text-slate-300">3CX URL

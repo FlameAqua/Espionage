@@ -7,7 +7,13 @@
 // as an "unresolved" node and recorded as a warning so it's visible, not lost.
 
 import type { Topology } from '../../../shared/types'
-import type { GraphEdge, GraphNode, NodeKind, TopologyGraph } from './model'
+import {
+  SHARED_DEPARTMENT,
+  type GraphEdge,
+  type GraphNode,
+  type NodeKind,
+  type TopologyGraph
+} from './model'
 
 type Obj = Record<string, unknown>
 
@@ -380,6 +386,7 @@ export function buildTopology(topo: Topology): TopologyGraph {
     }
   }
   for (const raw of topo.inboundRules.value as Obj[]) {
+    if (isTrunkDefaultRule(raw)) continue
     const id = str(pick(raw, 'Id'))
     // Show the dialled number (DID) on the rule itself — DIDs aren't their own
     // nodes; the Inbound Rule is what routing hangs off.
@@ -409,6 +416,7 @@ export function buildTopology(topo: Topology): TopologyGraph {
 
   // --- Pass 3: routing edges (tolerant destination scan).
   for (const raw of topo.inboundRules.value as Obj[]) {
+    if (isTrunkDefaultRule(raw)) continue
     const id = str(pick(raw, 'Id'))
     const self = `inboundRule:${id || displayName(raw)}`
     collectRoutes(b, self, raw, `inbound rule "${displayName(raw) || id}"`)
@@ -433,7 +441,69 @@ export function buildTopology(topo: Topology): TopologyGraph {
     collectDnForwards(b, self, raw, `ring group "${displayName(raw) || number}"`)
   }
 
+  // Group nodes into department "buckets" for the Department layout. Needs all
+  // edges to exist first, so this runs last.
+  computeDeptGroups(b)
+
   return b.build()
+}
+
+/** Assign each node to a department bucket for the Department layout: its own
+ *  department if it has exactly one, SHARED_DEPARTMENT if it has several, or —
+ *  for entities that don't carry department data themselves (queues, IVRs,
+ *  ring groups, inbound rules, trunks, bridges, endpoints) — a bucket inferred
+ *  by propagation from connected neighbours that all agree on one department.
+ *  Nodes touching several departments, or with no department signal reaching
+ *  them at all, get no bucket and simply float free of any box. */
+function computeDeptGroups(b: Builder): void {
+  for (const n of b.nodes) {
+    if (!n.departments?.length) continue
+    n.deptGroup = n.departments.length === 1 ? n.departments[0] : SHARED_DEPARTMENT
+  }
+
+  const adjacency = new Map<string, string[]>()
+  const link = (a: string, other: string): void => {
+    const list = adjacency.get(a)
+    if (list) list.push(other)
+    else adjacency.set(a, [other])
+  }
+  for (const e of b.edges) {
+    link(e.source, e.target)
+    link(e.target, e.source)
+  }
+
+  const inferable = new Set<NodeKind>([
+    'queue',
+    'ringGroup',
+    'ivr',
+    'inboundRule',
+    'trunk',
+    'bridge',
+    'endpoint'
+  ])
+  // A few passes let a department propagate across short chains (e.g. Inbound
+  // Rule -> IVR -> Queue -> Users), converging once nothing changes.
+  for (let pass = 0; pass < 4; pass++) {
+    let changed = false
+    for (const n of b.nodes) {
+      if (n.deptGroup || !inferable.has(n.kind)) continue
+      const neighbourDepts = new Set<string>()
+      for (const otherId of adjacency.get(n.id) ?? []) {
+        const other = b.getById(otherId)
+        if (other?.deptGroup && other.deptGroup !== SHARED_DEPARTMENT) {
+          neighbourDepts.add(other.deptGroup)
+        }
+      }
+      if (neighbourDepts.size === 1) {
+        n.deptGroup = [...neighbourDepts][0]
+        changed = true
+      } else if (neighbourDepts.size > 1) {
+        n.deptGroup = SHARED_DEPARTMENT
+        changed = true
+      }
+    }
+    if (!changed) break
+  }
 }
 
 /** Handle 3CX's split "<Prefix>ForwardDN" (target number) + "<Prefix>ForwardType"
@@ -480,6 +550,14 @@ function linkRuleTrunk(b: Builder, ruleId: string, rule: Obj): void {
   if (trunkId) trunk = b.getById(`trunk:${trunkId}`)
   if (!trunk && trunkNumber) trunk = b.getByNumber(trunkNumber)
   if (trunk) b.addEdge(trunk.id, ruleId, 'trunk', 'inbound')
+}
+
+/** 3CX creates a blank-named `ForwardAll` "rule" per trunk to route unmatched
+ *  inbound calls — it's configured on the trunk's own page and never appears as
+ *  a row in the portal's Inbound Rules list, so we skip it as noise. Real rules
+ *  match on DID/CallerID (BasedOnDID etc.). */
+function isTrunkDefaultRule(rule: Obj): boolean {
+  return /^forwardall$/i.test(str(pick(rule, 'Condition')))
 }
 
 /** The dialled number(s) an inbound rule matches, shown on the rule node.

@@ -1,0 +1,56 @@
+name: Release
+
+# Tag-driven releases. The version comes entirely from the git tag — there is no
+# manual `npm version` / package.json bump. Cutting a release is just:
+#
+#     git tag v1.0.0-beta.2 && git push origin v1.0.0-beta.2
+#
+# This workflow derives the version from the tag, injects it at build time via
+# electron-builder's extraMetadata.version, builds the installers, and publishes
+# them (plus latest.yml) to this repo's GitHub Releases.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Lets the auto-provided GITHUB_TOKEN upload release assets to THIS repo — no
+# personal publish token needed.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build & publish installers
+        shell: bash
+        env:
+          # Publishing to this repo's Releases uses the automatic Actions token.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only PAT embedded into the app so installed clients can read
+          # updates from the private repo. Add it under
+          # Settings → Secrets and variables → Actions → UPDATE_READ_TOKEN.
+          MAIN_VITE_UPDATE_TOKEN: ${{ secrets.UPDATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Strip the leading "v": v1.0.0-beta.2 -> 1.0.0-beta.2
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Anything with a pre-release suffix (-beta.N, -rc.N) ships as a GitHub
+          # pre-release; a bare x.y.z ships as a normal release.
+          if [[ "$VERSION" == *-* ]]; then RELEASE_TYPE=prerelease; else RELEASE_TYPE=release; fi
+          echo "Releasing $VERSION as $RELEASE_TYPE"
+
+          npm run build
+          npx electron-builder --win --publish always \
+            -c.extraMetadata.version="$VERSION" \
+            -c.publish.releaseType="$RELEASE_TYPE"

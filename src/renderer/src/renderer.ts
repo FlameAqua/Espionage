@@ -5,6 +5,7 @@ import './index.css'
 import type { ConnectRequest, Topology } from '../../shared/types'
 import { renderLogin } from './ui/login'
 import { renderApp } from './ui/app'
+import { initUpdates } from './ui/updates'
 
 const root = document.getElementById('root')!
 
@@ -106,5 +107,9 @@ async function start(): Promise<void> {
   }
   showLogin()
 }
+
+// Listen for auto-update events (toast lives on document.body, so it survives
+// the login <-> app re-renders below).
+initUpdates()
 
 void start()

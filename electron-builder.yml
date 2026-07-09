@@ -39,5 +39,12 @@ appImage:
   artifactName: ${name}-${version}.${ext}
 npmRebuild: false
 publish:
-  provider: generic
-  url: https://example.com/auto-updates
+  provider: github
+  # Must match OWNER/REPO in src/main/updater.ts.
+  owner: FlameAqua
+  repo: 3cx-spy
+  private: true
+  # Default channel. The release workflow overrides this per-tag
+  # (-c.publish.releaseType): tags with a -beta/-rc suffix publish as
+  # pre-releases, a bare vX.Y.Z publishes as a normal release.
+  releaseType: prerelease
