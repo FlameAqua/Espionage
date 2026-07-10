@@ -4,7 +4,7 @@
 import './index.css'
 import type { ConnectRequest, Topology } from '../../shared/types'
 import { renderLogin } from './ui/login'
-import { renderApp } from './ui/app'
+import { renderApp, type ViewState, type AppCallbacks } from './ui/app'
 import { initUpdates } from './ui/updates'
 
 const root = document.getElementById('root')!
@@ -71,10 +71,23 @@ function showLogin(): void {
   )
 }
 
-async function loadAndShow(): Promise<void> {
+/** Callbacks for a live (connected) session. */
+function liveCallbacks(): AppCallbacks {
+  return {
+    onReload: () => void loadAndShow(true), // hard refresh → full rebuild
+    onDisconnect: () => void disconnect(),
+    onOpenSnapshot: () => void openSnapshot(),
+    onRefresh: (state) => softRefresh(state) // soft refresh → keep view
+  }
+}
+
+async function loadAndShow(reauth = false): Promise<void> {
   const stop = showLoading()
   let topology: Topology
   try {
+    // On a hard refresh, re-authenticate first so a stale/expired token can't
+    // silently return old data — the refetch then reflects the latest config.
+    if (reauth) await window.api.threecx.refresh()
     topology = await window.api.threecx.fetchTopology()
   } catch (err) {
     stop()
@@ -82,26 +95,35 @@ async function loadAndShow(): Promise<void> {
     return
   }
   stop()
-  renderApp(
-    root,
-    topology,
-    {
-      onReload: () => void loadAndShow(),
-      onDisconnect: () => void disconnect(),
-      onOpenSnapshot: () => void openSnapshot()
-    },
-    focusFromHash()
-  )
+  renderApp(root, topology, liveCallbacks(), focusFromHash())
 }
 
-/** Render a loaded snapshot offline (no live 3CX session). Reload just re-renders
- *  the same data; disconnect returns to the login screen. */
-function showSnapshot(topology: Topology): void {
-  renderApp(root, topology, {
+/** Soft refresh: refetch in the background (no full-screen loader) and rebuild
+ *  while restoring the captured view. On failure the current view is untouched. */
+async function softRefresh(state: ViewState): Promise<void> {
+  try {
+    await window.api.threecx.refresh()
+    const topology = await window.api.threecx.fetchTopology()
+    renderApp(root, topology, liveCallbacks(), undefined, state)
+  } catch (err) {
+    notify(`Refresh failed: ${(err as Error).message}`, true)
+  }
+}
+
+/** Render a loaded snapshot offline (no live 3CX session). */
+function snapshotCallbacks(topology: Topology): AppCallbacks {
+  return {
     onReload: () => showSnapshot(topology),
     onDisconnect: () => showLogin(),
-    onOpenSnapshot: () => void openSnapshot()
-  })
+    onOpenSnapshot: () => void openSnapshot(),
+    // No live server to refetch from — just re-render, preserving the view.
+    onRefresh: async (state) =>
+      renderApp(root, topology, snapshotCallbacks(topology), undefined, state)
+  }
+}
+
+function showSnapshot(topology: Topology): void {
+  renderApp(root, topology, snapshotCallbacks(topology))
 }
 
 async function openSnapshot(): Promise<void> {

@@ -106,6 +106,87 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
   if (back && ctx.canGoBack) back.addEventListener('click', ctx.onBack)
 }
 
+export interface EdgeDetail {
+  sourceId: string
+  targetId: string
+  kind: string
+  labels: string[]
+}
+
+/** Render a tapped link/edge into the same details panel used for nodes. */
+export function renderEdgeDetails(container: HTMLElement, info: EdgeDetail, ctx: Ctx): void {
+  const nodeById = new Map(ctx.graph.nodes.map((n) => [n.id, n]))
+  const isSelf = info.sourceId === info.targetId
+  const chip = (id: string): string => {
+    const n = nodeById.get(id)
+    if (!n) return `<span class="text-slate-500">${esc(id)}</span>`
+    const meta = NODE_KIND_META[n.kind]
+    return `<button data-nav="${esc(id)}" class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-left">
+      <span class="w-2 h-2 rounded-full shrink-0" style="background:${meta.color}"></span>
+      <span class="text-slate-700 dark:text-slate-200">${esc(n.label)}${n.number ? ` <span class="text-slate-400 font-mono">${esc(n.number)}</span>` : ''}</span>
+    </button>`
+  }
+  const arrowTarget = isSelf
+    ? `<span class="text-slate-400">↺ loops back</span>`
+    : `<span class="text-slate-400 text-lg">→</span>${chip(info.targetId)}`
+  const rels = info.labels.length
+    ? `<ul class="space-y-1">${info.labels
+        .map(
+          (l) =>
+            `<li class="flex items-start gap-2"><span class="text-slate-400">•</span><span class="text-slate-700 dark:text-slate-200 break-words">${esc(l)}</span></li>`
+        )
+        .join('')}</ul>`
+    : `<p class="text-slate-400">Direct link (no extra detail).</p>`
+
+  container.innerHTML = `
+    <div class="flex flex-col h-full">
+      <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
+        <div class="flex items-center justify-between mb-1.5">
+          <button id="back" class="px-2 py-0.5 rounded text-xs ${ctx.canGoBack ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800' : 'text-slate-300 dark:text-slate-700 cursor-default'}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>
+          <button id="hide" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
+        </div>
+        <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white bg-slate-500">${isSelf ? 'Loop-back' : 'Link'}</span>
+        <h2 class="mt-1.5 text-base font-semibold text-slate-800 dark:text-slate-100 leading-tight">${esc(edgeKindLabel(info.kind))}</h2>
+      </div>
+      <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
+        <div class="flex items-center gap-2 flex-wrap">${chip(info.sourceId)}${arrowTarget}</div>
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${info.labels.length > 1 ? `Routes (${info.labels.length})` : 'Route'}</h3>
+          ${rels}
+        </div>
+      </div>
+    </div>`
+
+  container.querySelectorAll<HTMLElement>('[data-nav]').forEach((el) => {
+    el.addEventListener('click', () => ctx.onNavigate(el.dataset.nav!))
+  })
+  container.querySelector('#hide')?.addEventListener('click', ctx.onHide)
+  const back = container.querySelector<HTMLButtonElement>('#back')
+  if (back && ctx.canGoBack) back.addEventListener('click', ctx.onBack)
+}
+
+/** Readable name for an edge kind, shown in the link details header. */
+function edgeKindLabel(kind: string): string {
+  switch (kind) {
+    case 'route':
+      return 'Route'
+    case 'overflow':
+      return 'Overflow / no-answer'
+    case 'afterhours':
+      return 'After-hours route'
+    case 'agent':
+      return 'Queue agent'
+    case 'manager':
+      return 'Queue manager'
+    case 'member':
+      return 'Group member'
+    case 'trunk':
+      return 'Trunk'
+    default:
+      return 'Link'
+  }
+}
+
 function relSection(
   title: string,
   edges: GraphEdge[],

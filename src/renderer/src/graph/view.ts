@@ -30,6 +30,14 @@ const EDGE_COLOR: Record<string, string> = {
   afterhours: '#0891b2'
 }
 
+export interface EdgeTapInfo {
+  sourceId: string
+  targetId: string
+  kind: string
+  /** Every individual relationship collapsed into this edge (e.g. "key 1"). */
+  labels: string[]
+}
+
 interface ViewCallbacks {
   /** A node was tapped on the canvas (user-initiated selection). */
   onNodeTap: (node: GraphNode) => void
@@ -41,6 +49,8 @@ interface ViewCallbacks {
   onNodeContext: (node: GraphNode, x: number, y: number) => void
   /** A node was double-clicked. */
   onNodeDoubleTap: (node: GraphNode) => void
+  /** A link/edge was tapped. */
+  onEdgeTap: (info: EdgeTapInfo) => void
 }
 
 export class GraphView {
@@ -137,6 +147,15 @@ export class GraphView {
       if (!node) return
       const oe = evt.originalEvent as MouseEvent
       this.cb.onNodeContext(node, oe?.clientX ?? 0, oe?.clientY ?? 0)
+    })
+    this.cy.on('tap', 'edge', (evt) => {
+      const e = evt.target
+      this.cb.onEdgeTap({
+        sourceId: String(e.data('source')),
+        targetId: String(e.data('target')),
+        kind: String(e.data('kind')),
+        labels: (e.data('labels') as string[]) ?? []
+      })
     })
     this.cy.on('zoom', () => this.cb.onZoomChange(this.cy.zoom()))
 
@@ -425,6 +444,22 @@ export class GraphView {
     this.cy.resize()
   }
 
+  /** The currently focused node id (null when showing the whole graph) — used to
+   *  restore focus across a soft refresh. */
+  getFocusId(): string | null {
+    return this.focusId
+  }
+
+  getPan(): { x: number; y: number } {
+    const p = this.cy.pan()
+    return { x: p.x, y: p.y }
+  }
+
+  /** Restore an exact camera position (soft refresh, unfocused case). */
+  applyViewport(zoom: number, pan: { x: number; y: number }): void {
+    this.cy.viewport({ zoom, pan })
+  }
+
   /** Lock/unlock node dragging (padlock + Space-pan). When locked, nodes ignore
    *  pointer events (`pan-through`) so a drag starting on a node pans the view
    *  instead of grabbing the node. */
@@ -613,24 +648,33 @@ export class GraphView {
     })
   }
 
-  /** Highlight the whole set of nodes reachable downstream from `id` (following
-   *  edge direction) and return the terminal destinations a call can end at —
-   *  the leaves of the reachable sub-flow. */
-  traceDownstream(id: string): GraphNode[] {
+  /** Highlight the full call corridor through `id`: everything that can reach it
+   *  (upstream) and everything it can reach (downstream). Returns the entry
+   *  points a call can arrive from (upstream roots) and the final destinations it
+   *  can end at (downstream leaves). */
+  traceFlow(id: string): { sources: GraphNode[]; terminals: GraphNode[] } {
     const start = this.cy.getElementById(id)
-    if (start.empty() || !start.data('model')) return []
-    const hood = start.successors().union(start)
+    if (start.empty() || !start.data('model')) return { sources: [], terminals: [] }
+    const succ = start.successors()
+    const pred = start.predecessors()
     this.cy.elements().removeClass('selected')
     this.cy.elements().not('.dept-parent').addClass('faded')
-    hood.removeClass('faded')
+    succ.union(pred).union(start).removeClass('faded')
     start.addClass('selected')
+
     const terminals: GraphNode[] = []
-    hood.nodes().forEach((n) => {
+    succ.nodes().forEach((n) => {
       const model = n.data('model') as GraphNode | undefined
-      // A terminal is a real node with no onward edge (end of the call path).
-      if (model && n.id() !== id && n.outgoers('edge').empty()) terminals.push(model)
+      // Downstream leaf: a real node with no onward edge (end of the call path).
+      if (model && n.outgoers('edge').empty()) terminals.push(model)
     })
-    return terminals
+    const sources: GraphNode[] = []
+    pred.nodes().forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      // Upstream root: nothing feeds into it, so a call originates there.
+      if (model && n.incomers('edge').empty()) sources.push(model)
+    })
+    return { sources, terminals }
   }
 
   /** Search by name/number, then append nodes whose category matches the term
@@ -713,13 +757,26 @@ function toElements(graph: TopologyGraph): ElementDefinition[] {
   const ids = new Set(graph.nodes.map((n) => n.id))
   for (const e of graph.edges) {
     if (!ids.has(e.source) || !ids.has(e.target)) continue
-    const label = e.labels.length > 1 ? `${e.labels.length} routes` : (e.labels[0] ?? '')
     els.push({
-      data: { id: e.id, source: e.source, target: e.target, label, kind: e.kind },
+      data: {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        label: compactEdgeLabel(e.labels),
+        kind: e.kind,
+        labels: e.labels
+      },
       classes: e.kind
     })
   }
   return els
+}
+
+/** Keep the on-canvas edge label short (a single relationship's label, or an
+ *  "N routes" count) so it doesn't overflow onto nodes — the full breakdown is
+ *  a click away in the details panel. */
+function compactEdgeLabel(labels: string[]): string {
+  return labels.length > 1 ? `${labels.length} routes` : (labels[0] ?? '')
 }
 
 function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {

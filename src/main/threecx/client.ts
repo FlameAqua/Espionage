@@ -10,11 +10,15 @@ import https from 'https'
 import http from 'http'
 import { URL } from 'url'
 import type { ConnectRequest, EntitySet, Topology } from '../../shared/types'
+import { redactSecrets } from '../../shared/redact'
 
 interface Session {
   baseUrl: string
   token: string
   allowInsecure: boolean
+  /** Credentials kept in main-process memory only (never written to disk) so a
+   *  Reload can re-authenticate for a fresh token instead of reusing a stale one. */
+  req: ConnectRequest
 }
 
 let session: Session | null = null
@@ -72,7 +76,9 @@ function normaliseBase(base: string): string {
   return base.trim().replace(/\/+$/, '')
 }
 
-export async function connect(req: ConnectRequest): Promise<void> {
+/** POST the credentials and return a fresh access token. Shared by connect
+ *  (first login) and refresh (re-auth on Reload). */
+async function authenticate(req: ConnectRequest): Promise<{ baseUrl: string; token: string }> {
   const baseUrl = normaliseBase(req.baseUrl)
   if (!baseUrl) throw new Error('A 3CX URL is required.')
 
@@ -111,8 +117,20 @@ export async function connect(req: ConnectRequest): Promise<void> {
     throw new Error('Login response was not valid JSON — is this a 3CX web client URL?')
   }
   if (!token) throw new Error('Login succeeded but no access token was returned.')
+  return { baseUrl, token }
+}
 
-  session = { baseUrl, token, allowInsecure: req.allowInsecure }
+export async function connect(req: ConnectRequest): Promise<void> {
+  const { baseUrl, token } = await authenticate(req)
+  session = { baseUrl, token, allowInsecure: req.allowInsecure, req }
+}
+
+/** Re-authenticate the active session for a fresh token (used by Reload so the
+ *  refetch reflects the latest 3CX config even after the old token expired). */
+export async function refresh(): Promise<void> {
+  if (!session) throw new Error('Not connected.')
+  const { token } = await authenticate(session.req)
+  session.token = token
 }
 
 export function disconnect(): void {
@@ -190,7 +208,9 @@ export async function fetchTopology(): Promise<Topology> {
     fetchSet('/xapi/v1/Users?$expand=Groups'),
     fetchSet('/xapi/v1/Queues?$expand=Agents,Managers'),
     fetchSet('/xapi/v1/RingGroups?$expand=Members'),
-    fetchSet('/xapi/v1/Receptionists'),
+    // Forwards carries the IVR's digit-menu destinations (key 1 → …), which
+    // aren't returned unless expanded.
+    fetchSet('/xapi/v1/Receptionists?$expand=Forwards'),
     fetchSet('/xapi/v1/InboundRules'),
     fetchSet('/xapi/v1/OutboundRules'),
     fetchSet('/xapi/v1/DidNumbers'),
@@ -200,27 +220,29 @@ export async function fetchTopology(): Promise<Topology> {
 
   // Several endpoints reject $expand on some 3CX builds; retry bare on failure.
   const retried = await Promise.all(
-    [queues, ringGroups, groups, users].map(async (set) => {
+    [queues, ringGroups, groups, users, receptionists].map(async (set) => {
       if (!set.error) return set
       const bare = set.path.split('?')[0]
       return fetchSet(bare)
     })
   )
-  const [queues2, ringGroups2, groups2, users2] = retried
+  const [queues2, ringGroups2, groups2, users2, receptionists2] = retried
 
-  return {
+  // Redact credentials before the data ever leaves the main process — the
+  // renderer and any saved snapshot then never contain SIP passwords / PINs.
+  return redactSecrets<Topology>({
     fetchedAt: new Date().toISOString(),
     baseUrl: session.baseUrl,
     users: users2,
     queues: queues2,
     ringGroups: ringGroups2,
-    receptionists,
+    receptionists: receptionists2,
     inboundRules,
     outboundRules,
     didNumbers,
     trunks,
     groups: groups2
-  }
+  })
 }
 
 function truncate(s: string, n = 200): string {

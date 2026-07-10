@@ -88,9 +88,16 @@ class Builder {
   }
 
   /** Collapse every relationship between the same source→target into one edge,
-   *  accumulating the individual labels. Fewer elements = faster layout. */
-  addEdge(source: string, target: string, kind: GraphEdge['kind'], label?: string): void {
-    if (source === target) return
+   *  accumulating the individual labels. Fewer elements = faster layout.
+   *  `allowSelf` permits a deliberate self-loop (e.g. an IVR "repeat prompt"). */
+  addEdge(
+    source: string,
+    target: string,
+    kind: GraphEdge['kind'],
+    label?: string,
+    allowSelf = false
+  ): void {
+    if (source === target && !allowSelf) return
     const id = `${source}->${target}`
     let edge = this.edgeByPair.get(id)
     if (!edge) {
@@ -167,9 +174,17 @@ function asDestRef(
       return inner
     }
   }
-  const number = str(pick(v, 'Number', 'Extension', 'DialNumber'))
-  const id = str(pick(v, 'Id', 'PeerId', 'DestinationId'))
-  const type = str(pick(v, 'Type', 'To', 'PeerType', 'DestinationType'))
+  // 3CX "forward record" shape (IVR digit menu, blind transfers, …): the
+  // destination DN lives in ForwardDN, and the entry's own `Id` is a
+  // record id in a different namespace — treating it as a destination id
+  // resolves to an unrelated entity that merely shares that number (e.g. an
+  // IVR key 1 → ForwardDN 8002 with record Id 107 wrongly matching queue Id
+  // 107). So read ForwardDN for the number and drop the record Id.
+  const forwardDN = str(pick(v, 'ForwardDN'))
+  const isForwardRecord = forwardDN !== '' || v['ForwardType'] !== undefined
+  const number = str(pick(v, 'Number', 'Extension', 'DialNumber')) || forwardDN
+  const id = isForwardRecord ? '' : str(pick(v, 'Id', 'PeerId', 'DestinationId'))
+  const type = str(pick(v, 'Type', 'To', 'PeerType', 'DestinationType', 'ForwardType'))
   const external = str(pick(v, 'External', 'ExternalNumber'))
   if (number || external || (id && type)) {
     return {
@@ -208,7 +223,8 @@ function routeFromValue(
       const ref = asDestRef(el) ?? firstNestedDest(el)
       if (ref) {
         const target = b.resolveTarget(ref, contextLabel)
-        if (target) b.addEdge(sourceId, target.id, 'route', input ? `key ${input}` : prettyKey(key))
+        const base = input ? `key ${input}` : prettyKey(key)
+        if (target) b.addEdge(sourceId, target.id, 'route', isVoicemail(el) ? `${base}: voicemail` : base)
       }
     }
     return
@@ -217,7 +233,10 @@ function routeFromValue(
     const ref = asDestRef(value)
     if (ref) {
       const target = b.resolveTarget(ref, contextLabel)
-      if (target) b.addEdge(sourceId, target.id, routeKind(key), prettyKey(key))
+      if (target) {
+        const base = prettyKey(key)
+        b.addEdge(sourceId, target.id, routeKind(key), isVoicemail(value) ? `${base}: voicemail` : base)
+      }
     } else {
       // Nested wrapper (e.g. OfficeRoute: { Forward: {...} }) — scan one level in.
       for (const [k2, v2] of Object.entries(value)) {
@@ -234,6 +253,16 @@ function firstNestedDest(o: Obj): ReturnType<typeof asDestRef> {
     if (ref) return ref
   }
   return null
+}
+
+/** Whether a destination-shaped object routes to voicemail — checked on the
+ *  object itself and its immediate Route/Peer/Destination wrapper, since 3CX
+ *  flags it via a "VoiceMail" To/Type (e.g. OutOfOfficeRoute.Route.To). */
+function isVoicemail(o: Obj): boolean {
+  const vm = (x: unknown): boolean =>
+    isObj(x) &&
+    /voicemail/i.test(str(pick(x, 'To', 'Type', 'DestinationType', 'PeerType', 'ForwardType')))
+  return vm(o) || vm(o['Route']) || vm(o['Peer']) || vm(o['Destination'])
 }
 
 /** Compute the 3CX management-console deep-link path for each node. Inbound
@@ -520,15 +549,53 @@ function computeDeptGroups(b: Builder): void {
 /** Handle 3CX's split "<Prefix>ForwardDN" (target number) + "<Prefix>ForwardType"
  *  (destination type) pairs, e.g. Timeout / InvalidKey / digit-key IVR options. */
 function collectDnForwards(b: Builder, sourceId: string, entity: Obj, context: string): void {
-  for (const [key, val] of Object.entries(entity)) {
-    const m = /^(.*)ForwardDN$/.exec(key)
-    if (!m) continue
-    const number = str(val)
+  // Gather each "<Prefix>Forward…" group (Timeout, InvalidKey, NoAnswer, Busy …)
+  // from its ForwardDN (destination number) + ForwardType (what happens).
+  const prefixes = new Set<string>()
+  for (const key of Object.keys(entity)) {
+    const m = /^(.*)Forward(?:DN|Type)$/.exec(key)
+    if (m) prefixes.add(m[1])
+  }
+  for (const prefix of prefixes) {
+    const type = str(entity[`${prefix}ForwardType`])
+    const number = str(entity[`${prefix}ForwardDN`])
+    const label = forwardLabel(prefix)
+    // "Repeat prompt" replays the menu — draw it as a loop-back on the node.
+    if (/repeat/i.test(type)) {
+      b.addEdge(sourceId, sourceId, routeKind(prefix), `${label}: repeat`, true)
+      continue
+    }
+    // Terminal outcomes with no onward node.
+    if (/^(?:endcall|hangup|none|disconnect|proceedwithnoexceptions)$/i.test(type)) continue
     if (!number) continue
-    const type = str(entity[`${m[1]}ForwardType`])
-    if (/endcall|hangup|voicemail|none/i.test(type)) continue
-    const target = b.resolveTarget({ number, type: type || undefined }, context)
-    if (target) b.addEdge(sourceId, target.id, routeKind(m[1]), prettyKey(m[1]) || 'forward')
+    // Voicemail still targets the extension's DN, but we flag it in the label so
+    // the link reads "… : voicemail" rather than implying a normal call.
+    const voicemail = /voicemail/i.test(type)
+    const target = b.resolveTarget(
+      { number, type: voicemail ? 'Extension' : type || undefined },
+      context
+    )
+    if (target) {
+      b.addEdge(sourceId, target.id, routeKind(prefix), voicemail ? `${label}: voicemail` : label)
+    }
+  }
+}
+
+/** Human label for a "<Prefix>Forward…" branch. */
+function forwardLabel(prefix: string): string {
+  switch (prefix.toLowerCase()) {
+    case '':
+      return 'forward'
+    case 'timeout':
+      return 'timeout'
+    case 'invalidkey':
+      return 'invalid key'
+    case 'noanswer':
+      return 'no answer'
+    case 'busy':
+      return 'busy'
+    default:
+      return prettyKey(prefix)
   }
 }
 

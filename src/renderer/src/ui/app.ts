@@ -4,7 +4,7 @@
 
 import type { Topology } from '../../../shared/types'
 import { buildTopology } from '../graph/build'
-import { GraphView, type LayoutName, type ThemeName } from '../graph/view'
+import { GraphView, type EdgeTapInfo, type LayoutName, type ThemeName } from '../graph/view'
 import {
   NODE_KIND_META,
   SHARED_DEPARTMENT,
@@ -13,16 +13,32 @@ import {
   type GraphNode,
   type NodeKind
 } from '../graph/model'
-import { renderDetails } from './details'
+import { renderDetails, renderEdgeDetails } from './details'
 import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
 import { auditTopology, groupFindings } from '../graph/audit'
 
-interface AppCallbacks {
+export interface AppCallbacks {
+  /** Hard refresh: re-fetch and rebuild from scratch (back to the full view). */
   onReload: () => void
   onDisconnect: () => void
   onOpenSnapshot: () => void
+  /** Soft refresh: re-fetch, then rebuild preserving the captured view state. */
+  onRefresh: (state: ViewState) => Promise<void>
+}
+
+/** A snapshot of the user-facing view, restored after a soft refresh so the
+ *  refetch doesn't throw away focus / layout / filters / camera. */
+export interface ViewState {
+  layout: LayoutName
+  visibleKinds: NodeKind[]
+  focusId?: string
+  deptFilter?: string
+  selectedId?: string
+  history?: string[]
+  zoom?: number
+  pan?: { x: number; y: number }
 }
 
 interface DidRow {
@@ -55,7 +71,8 @@ export function renderApp(
   root: HTMLElement,
   topology: Topology,
   cb: AppCallbacks,
-  initialFocusId?: string
+  initialFocusId?: string,
+  restore?: ViewState
 ): void {
   cleanup.forEach((fn) => fn())
   cleanup = []
@@ -105,6 +122,7 @@ export function renderApp(
         <div class="ml-auto flex items-center gap-1.5 text-sm">
           ${errors.length ? `<button id="warn" class="px-2 py-1 rounded bg-amber-500/90 hover:bg-amber-500 text-white text-xs">${errors.length}⚠</button>` : ''}
           ${graph.warnings.length ? `<button id="unresolved" class="px-2 py-1 rounded bg-red-600/90 hover:bg-red-600 text-white text-xs">${graph.warnings.length} unresolved</button>` : ''}
+          <button id="refresh" class="${btn} w-7" title="Refresh — update from 3CX, keeping your current view" aria-label="Refresh"><span id="refreshIcon" class="inline-block">↻</span></button>
           <button id="help" class="${btn} w-7" title="Help" aria-label="Help">?</button>
           <div class="relative">
             <button id="menuBtn" class="${btn}" title="Menu" aria-label="Menu">☰</button>
@@ -253,6 +271,21 @@ export function renderApp(
     }
   }
 
+  // Tapping a link shows its info in the same details panel as nodes.
+  const showEdgeDetails = (info: EdgeTapInfo): void => {
+    current = null
+    egoMap?.destroy()
+    egoMap = null
+    if (detailsHidden) toggleDetails(true)
+    renderEdgeDetails(detailsEl, info, {
+      graph,
+      canGoBack: history.length > 1,
+      onNavigate: (id) => navigate(id, true),
+      onBack: goBack,
+      onHide: () => toggleDetails(false)
+    })
+  }
+
   // Reveal a node: details + camera. If it's currently filtered out of view
   // (e.g. going Back to a node outside the active focus), re-focus on it so it's
   // always visible instead of centring on empty space.
@@ -397,7 +430,8 @@ export function renderApp(
       zoomSlider.value = String(zoomToSlider(z, view.getMinZoom(), view.getMaxZoom()))
     },
     onNodeContext: (node, x, y) => showCtx(node, x, y),
-    onNodeDoubleTap: (node) => enterFocus(node.id)
+    onNodeDoubleTap: (node) => enterFocus(node.id),
+    onEdgeTap: (info) => showEdgeDetails(info)
   })
   showDetails(null)
   renderBreadcrumb()
@@ -543,10 +577,63 @@ export function renderApp(
   cleanup.push(() => window.removeEventListener('keydown', onKeyDown))
   cleanup.push(() => window.removeEventListener('keyup', onKeyUp))
 
-  // Open-in-new-window deep link: focus the requested node once wired up.
-  if (initialFocusId && graph.nodes.some((n) => n.id === initialFocusId)) {
+  // Capture the user-facing view so a soft refresh can restore it after refetch.
+  const captureState = (): ViewState => ({
+    layout: layoutSel.value as LayoutName,
+    visibleKinds: [...visible],
+    focusId: view.getFocusId() ?? undefined,
+    deptFilter: activeDept ?? undefined,
+    selectedId: current?.id,
+    history: [...history],
+    zoom: view.getZoom(),
+    pan: view.getPan()
+  })
+
+  const applyRestore = (s: ViewState): void => {
+    // Visible kinds (+ sync the legend checkboxes).
+    visible.clear()
+    for (const k of s.visibleKinds) if (presentKinds.includes(k)) visible.add(k)
+    root.querySelectorAll<HTMLInputElement>('#legend input[data-kind]').forEach((c) => {
+      c.checked = visible.has(c.dataset.kind as NodeKind)
+    })
+    // Layout.
+    if (['flow', 'compact', 'force', 'department'].includes(s.layout)) layoutSel.value = s.layout
+    view.setLayout(layoutSel.value as LayoutName)
+    // Breadcrumb history (drop ids that no longer exist after the refresh).
+    history.length = 0
+    if (s.history) history.push(...s.history.filter((id) => graph.nodes.some((n) => n.id === id)))
+    // Camera: restore focus, else department filter, else the exact viewport.
+    const focusOk = !!s.focusId && graph.nodes.some((n) => n.id === s.focusId)
+    const deptOk = !!s.deptFilter && deptList.some(([b]) => b === s.deptFilter)
+    if (focusOk) enterFocus(s.focusId!)
+    else if (deptOk) setDept(s.deptFilter!)
+    else if (s.zoom != null && s.pan)
+      requestAnimationFrame(() => view.applyViewport(s.zoom!, s.pan!))
+    // Re-open the details panel on the previously-selected node (focus already
+    // opens its own details).
+    const sel = s.selectedId ? graph.nodes.find((n) => n.id === s.selectedId) : undefined
+    if (sel && !focusOk) showDetails(sel)
+    renderBreadcrumb()
+  }
+
+  // Restore a prior view (soft refresh), else honour an open-in-new-window link.
+  if (restore) applyRestore(restore)
+  else if (initialFocusId && graph.nodes.some((n) => n.id === initialFocusId)) {
     enterFocus(initialFocusId)
   }
+
+  // Toolbar soft refresh: capture state, refetch, rebuild preserving the view.
+  const refreshBtn = root.querySelector<HTMLButtonElement>('#refresh')!
+  const refreshIcon = root.querySelector<HTMLElement>('#refreshIcon')!
+  refreshBtn.addEventListener('click', async () => {
+    refreshBtn.disabled = true
+    refreshIcon.classList.add('animate-spin')
+    await cb.onRefresh(captureState())
+    // On success the app was re-rendered (this button is now detached, so these
+    // are no-ops); on failure it's still on screen, so clear the spinner.
+    refreshBtn.disabled = false
+    refreshIcon.classList.remove('animate-spin')
+  })
 
   const zoomSlider = root.querySelector<HTMLInputElement>('#zoom')!
   zoomSlider.addEventListener('input', () => {
@@ -594,7 +681,7 @@ export function renderApp(
     menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
     menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
     menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
-    menuEl.append(item('↻', 'Reload', cb.onReload))
+    menuEl.append(item('🔄', 'Hard refresh', cb.onReload))
     menuEl.append(item('⬆', 'Check for updates', () => checkForUpdates()))
     menuEl.append(item('⏏', 'Disconnect', cb.onDisconnect))
   }
@@ -756,16 +843,26 @@ export function renderApp(
 
   // --- Trace-a-call -------------------------------------------------------
   const showTracePanel = (node: GraphNode): void => {
-    const terminals = view.traceDownstream(node.id)
-    const body = terminals.length
-      ? `<p class="text-slate-500 dark:text-slate-400 mb-1.5">A call entering <span class="font-medium text-slate-700 dark:text-slate-200">${esc(node.label)}</span> can end at ${terminals.length} destination${terminals.length === 1 ? '' : 's'} (highlighted on the graph):</p>
-         <ul class="space-y-0.5 text-slate-600 dark:text-slate-300">${terminals
-           .map(
-             (t) =>
-               `<li data-nav="${esc(t.id)}" class="flex items-center gap-2 px-1.5 py-0.5 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"><span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META[t.kind].color}"></span><span class="flex-1 truncate">${esc(t.label)}${t.number ? ` <span class="text-slate-400 font-mono">${esc(t.number)}</span>` : ''}</span></li>`
-           )
-           .join('')}</ul>`
-      : `<p class="text-slate-500 dark:text-slate-400">No downstream destinations — this node doesn't route anywhere (or only loops back).</p>`
+    const { sources, terminals } = view.traceFlow(node.id)
+    const nodeList = (nodes: GraphNode[], empty: string): string =>
+      nodes.length
+        ? `<ul class="space-y-0.5 text-slate-600 dark:text-slate-300">${nodes
+            .map(
+              (n) =>
+                `<li data-nav="${esc(n.id)}" class="flex items-center gap-2 px-1.5 py-0.5 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"><span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META[n.kind].color}"></span><span class="flex-1 truncate">${esc(n.label)}${n.number ? ` <span class="text-slate-400 font-mono">${esc(n.number)}</span>` : ''}</span></li>`
+            )
+            .join('')}</ul>`
+        : `<p class="text-slate-400">${esc(empty)}</p>`
+    const body = `
+      <p class="text-slate-500 dark:text-slate-400 mb-2">Everything highlighted is on a call path through <span class="font-medium text-slate-700 dark:text-slate-200">${esc(node.label)}</span>.</p>
+      <div class="mb-3">
+        <h4 class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Can be reached from <span class="text-slate-400">(${sources.length})</span></h4>
+        ${nodeList(sources, 'Nothing routes in — this is an entry point.')}
+      </div>
+      <div>
+        <h4 class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Can route to <span class="text-slate-400">(${terminals.length})</span></h4>
+        ${nodeList(terminals, "Doesn't route anywhere (or only loops back).")}
+      </div>`
     panelShell(`Call trace — ${node.label}`, body)
     wireNav()
   }

@@ -75,6 +75,21 @@ export function auditTopology(graph: TopologyGraph): AuditFinding[] {
     }
   }
 
+  // 3) Queues / ring groups / IVRs that nothing routes into — no DID, inbound
+  //    rule, IVR key or forward reaches them, so they're unreachable through the
+  //    mapped call flow (even if they have agents).
+  for (const n of graph.nodes) {
+    if (n.kind !== 'queue' && n.kind !== 'ringGroup' && n.kind !== 'ivr') continue
+    if (!inKinds.has(n.id)) {
+      findings.push({
+        category: 'Queues / groups / IVRs nothing routes to',
+        label: label(n),
+        nodeId: n.id,
+        severity: 'warn'
+      })
+    }
+  }
+
   // 3) Unregistered trunks / bridges — a provider link or PBX bridge that's down.
   for (const n of graph.nodes) {
     if (n.kind !== 'trunk' && n.kind !== 'bridge') continue

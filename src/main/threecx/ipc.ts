@@ -17,6 +17,11 @@ export function registerThreecxIpc(): void {
     return client.fetchTopology()
   })
 
+  ipcMain.handle('threecx:refresh', async (): Promise<void> => {
+    // Rejects on failure so the renderer's reload path can surface the error.
+    await client.refresh()
+  })
+
   ipcMain.handle('threecx:disconnect', async (): Promise<void> => {
     client.disconnect()
   })

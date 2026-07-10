@@ -4,6 +4,7 @@ import { promises as fs } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import type { Topology, EntitySet } from '../shared/types'
+import { redactSecrets } from '../shared/redact'
 import { registerThreecxIpc } from './threecx/ipc'
 import { initUpdater } from './updater'
 
@@ -75,7 +76,8 @@ function normalizeTopology(raw: unknown): Topology | null {
   const o = raw as Record<string, unknown>
   // A real snapshot has a base URL and/or user data; reject unrelated JSON.
   if (!o.baseUrl && !o.users) return null
-  return {
+  // Redact on load too, so a pre-redaction snapshot can't resurface secrets.
+  return redactSecrets<Topology>({
     fetchedAt: String(o.fetchedAt ?? ''),
     baseUrl: String(o.baseUrl ?? ''),
     users: asEntitySet(o.users),
@@ -87,7 +89,7 @@ function normalizeTopology(raw: unknown): Topology | null {
     didNumbers: asEntitySet(o.didNumbers),
     trunks: asEntitySet(o.trunks),
     groups: asEntitySet(o.groups)
-  }
+  })
 }
 
 function registerAppIpc(): void {

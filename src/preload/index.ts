@@ -11,6 +11,7 @@ const api = {
     connect: (req: ConnectRequest): Promise<ConnectResult> =>
       ipcRenderer.invoke('threecx:connect', req),
     fetchTopology: (): Promise<Topology> => ipcRenderer.invoke('threecx:fetchTopology'),
+    refresh: (): Promise<void> => ipcRenderer.invoke('threecx:refresh'),
     disconnect: (): Promise<void> => ipcRenderer.invoke('threecx:disconnect'),
     isConnected: (): Promise<boolean> => ipcRenderer.invoke('threecx:isConnected')
   },
