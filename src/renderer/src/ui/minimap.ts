@@ -87,7 +87,17 @@ export class Minimap {
     this.mini.elements().remove()
     this.mini.add(els)
     this.mini.resize()
-    if (!this.mini.nodes().empty()) this.mini.fit(undefined, 6)
+    if (!this.mini.nodes().empty()) {
+      this.mini.fit(undefined, 8)
+      // Node/edge sizes are in model units, so on a large graph the fit shrinks
+      // them to sub-pixel dots. Size them off the resulting zoom so they render
+      // at a fixed, visible on-screen diameter no matter how big the system is.
+      const z = this.mini.zoom() || 1
+      this.mini.batch(() => {
+        this.mini.nodes().style({ width: 7 / z, height: 7 / z })
+        this.mini.edges().style({ width: 1 / z })
+      })
+    }
     this.updateRect()
   }
 

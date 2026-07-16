@@ -36,7 +36,7 @@ export interface GraphNode {
 }
 
 export type EdgeKind =
-  'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk' | 'afterhours'
+  'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk' | 'afterhours' | 'forward'
 
 export interface GraphEdge {
   id: string
@@ -82,7 +82,7 @@ export function departmentColor(bucket: string): string {
 }
 
 export function departmentLabel(bucket: string): string {
-  return bucket === SHARED_DEPARTMENT ? 'Shared' : bucket
+  return bucket === SHARED_DEPARTMENT ? 'Multiple Departments' : bucket
 }
 
 export const NODE_KIND_META: Record<NodeKind, { label: string; color: string }> = {

@@ -205,7 +205,7 @@ export async function fetchTopology(): Promise<Topology> {
     trunks,
     groups
   ] = await Promise.all([
-    fetchSet('/xapi/v1/Users?$expand=Groups'),
+    fetchSet('/xapi/v1/Users?$expand=Groups,ForwardingProfiles'),
     fetchSet('/xapi/v1/Queues?$expand=Agents,Managers'),
     fetchSet('/xapi/v1/RingGroups?$expand=Members'),
     // Forwards carries the IVR's digit-menu destinations (key 1 → …), which
@@ -222,8 +222,13 @@ export async function fetchTopology(): Promise<Topology> {
   const retried = await Promise.all(
     [queues, ringGroups, groups, users, receptionists].map(async (set) => {
       if (!set.error) return set
-      const bare = set.path.split('?')[0]
-      return fetchSet(bare)
+      // Users carry two expands; if the combined request is rejected, keep the
+      // known-good Groups expand (departments depend on it) before going bare.
+      if (set.path.startsWith('/xapi/v1/Users')) {
+        const withGroups = await fetchSet('/xapi/v1/Users?$expand=Groups')
+        if (!withGroups.error) return withGroups
+      }
+      return fetchSet(set.path.split('?')[0])
     })
   )
   const [queues2, ringGroups2, groups2, users2, receptionists2] = retried

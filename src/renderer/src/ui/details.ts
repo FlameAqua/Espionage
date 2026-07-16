@@ -84,7 +84,7 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
       <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
         <div id="egomap" class="h-44 w-full rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50"></div>
         ${info}
-        ${depts ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${node.deptGroup === SHARED_DEPARTMENT ? 'Shared across departments' : 'Departments'}</h3>${depts}</div>` : ''}
+        ${depts ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${node.deptGroup === SHARED_DEPARTMENT ? 'Multiple departments' : 'Departments'}</h3>${depts}</div>` : ''}
         ${facts}
         <details class="group">
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">View more info</summary>
@@ -174,6 +174,8 @@ function edgeKindLabel(kind: string): string {
       return 'Overflow / no-answer'
     case 'afterhours':
       return 'After-hours route'
+    case 'forward':
+      return 'Call forwarding'
     case 'agent':
       return 'Queue agent'
     case 'manager':
@@ -236,15 +238,22 @@ function keyFacts(node: GraphNode): string {
     }
   }
   switch (node.kind) {
-    case 'user':
-      add('Email', 'Email', 'EmailAddress')
-      add('Enabled', 'Enabled')
+    case 'user': {
       add('Registered', 'IsRegistered')
-      add('Department', 'Department')
+      const qs = String(r['QueueStatus'] ?? '')
+      if (qs) rows.push(['Logged in', /out/i.test(qs) ? 'No' : /in/i.test(qs) ? 'Yes' : qs])
+      add('Enabled', 'Enabled')
+      add('Presence', 'CurrentProfileName')
+      add('Email', 'Email', 'EmailAddress')
+      add('Mobile', 'Mobile')
       break
+    }
     case 'queue':
       add('Strategy', 'PollingStrategy', 'Strategy')
       add('Ring timeout', 'RingTimeout', 'PollingTime')
+      break
+    case 'ringGroup':
+      add('Strategy', 'RingStrategy')
       break
     case 'trunk':
       add('Provider', 'ProviderName', 'AuthID')
@@ -259,13 +268,38 @@ function keyFacts(node: GraphNode): string {
       add('Condition', 'Condition')
       break
   }
+  // Queues / ring groups: list the member extensions inline.
+  if (node.kind === 'queue' || node.kind === 'ringGroup') {
+    const members = memberList(r, 'Agents', 'Members')
+    if (members) rows.push([node.kind === 'ringGroup' ? 'Members' : 'Agents', members])
+    const managers = memberList(r, 'Managers')
+    if (managers) rows.push(['Managers', managers])
+  }
   if (!rows.length) return ''
   return `<div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">${rows
     .map(
       ([k, v]) =>
-        `<div class="text-slate-400">${esc(k)}</div><div class="text-slate-700 dark:text-slate-200 font-medium">${esc(v)}</div>`
+        `<div class="text-slate-400">${esc(k)}</div><div class="text-slate-700 dark:text-slate-200 font-medium break-words">${esc(typeof v === 'boolean' ? (v ? 'Yes' : 'No') : v)}</div>`
     )
     .join('')}</div>`
+}
+
+/** Comma-separated list of member display names from an Agents/Members/Managers
+ *  array (each `{ Number, Name }`). */
+function memberList(r: Record<string, unknown>, ...keys: string[]): string {
+  const out: string[] = []
+  for (const key of keys) {
+    const arr = r[key]
+    if (!Array.isArray(arr)) continue
+    for (const m of arr) {
+      if (!m || typeof m !== 'object') continue
+      const o = m as Record<string, unknown>
+      const num = String(o.Number ?? '').trim()
+      const name = String(o.Name ?? o.MemberName ?? '').trim()
+      if (num || name) out.push(num || name)
+    }
+  }
+  return out.join(', ')
 }
 
 /** Flatten the raw entity's own scalar (and simple-array) fields for the

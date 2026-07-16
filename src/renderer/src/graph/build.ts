@@ -224,7 +224,8 @@ function routeFromValue(
       if (ref) {
         const target = b.resolveTarget(ref, contextLabel)
         const base = input ? `key ${input}` : prettyKey(key)
-        if (target) b.addEdge(sourceId, target.id, 'route', isVoicemail(el) ? `${base}: voicemail` : base)
+        if (target)
+          b.addEdge(sourceId, target.id, 'route', isVoicemail(el) ? `${base}: voicemail` : base)
       }
     }
     return
@@ -235,7 +236,12 @@ function routeFromValue(
       const target = b.resolveTarget(ref, contextLabel)
       if (target) {
         const base = prettyKey(key)
-        b.addEdge(sourceId, target.id, routeKind(key), isVoicemail(value) ? `${base}: voicemail` : base)
+        b.addEdge(
+          sourceId,
+          target.id,
+          routeKind(key),
+          isVoicemail(value) ? `${base}: voicemail` : base
+        )
       }
     } else {
       // Nested wrapper (e.g. OfficeRoute: { Forward: {...} }) — scan one level in.
@@ -474,6 +480,12 @@ export function buildTopology(topo: Topology): TopologyGraph {
     collectRoutes(b, self, raw, `ring group "${displayName(raw) || number}"`)
     collectDnForwards(b, self, raw, `ring group "${displayName(raw) || number}"`)
   }
+  // Extensions: their call-forwarding rules (per status profile) become outgoing
+  // links so "when Away → 4412 / Out of office → IVR 8019" is visible.
+  for (const raw of topo.users.value as Obj[]) {
+    const number = str(pick(raw, 'Number', 'Extension'))
+    if (number) collectForwardingProfiles(b, `user:${number}`, number, raw)
+  }
 
   // Group nodes into department "buckets" for the Department layout. Needs all
   // edges to exist first, so this runs last.
@@ -636,6 +648,72 @@ function linkRuleTrunk(b: Builder, ruleId: string, rule: Obj): void {
  *  match on DID/CallerID (BasedOnDID etc.). */
 function isTrunkDefaultRule(rule: Obj): boolean {
   return /^forwardall$/i.test(str(pick(rule, 'Condition')))
+}
+
+/** Draw an extension's call-forwarding rules (per status profile) as outgoing
+ *  edges. Each profile carries either an AwayRoute (forwards ALL calls to one
+ *  Internal/External destination) or an AvailableRoute (per-condition: No Answer
+ *  / Busy / Not Registered × Internal/External). We label each edge by the
+ *  profile (+ condition) and skip "None" and the extension's own voicemail. */
+function collectForwardingProfiles(
+  b: Builder,
+  sourceId: string,
+  selfNumber: string,
+  entity: Obj
+): void {
+  const profiles = entity['ForwardingProfiles']
+  if (!Array.isArray(profiles)) return
+  const context = `extension ${selfNumber} forwarding`
+  for (const p of profiles) {
+    if (!isObj(p)) continue
+    const name = str(pick(p, 'CustomName')) || str(pick(p, 'Name')) || 'forward'
+    const away = p['AwayRoute']
+    if (isObj(away)) {
+      // AllHours Internal/External usually mirror each other — the edge collapse
+      // dedupes them into one link with one label.
+      forwardEdge(b, sourceId, selfNumber, away['Internal'], name, context)
+      forwardEdge(b, sourceId, selfNumber, away['External'], name, context)
+    }
+    const avail = p['AvailableRoute']
+    if (isObj(avail)) {
+      const conds: [string, string][] = [
+        ['NoAnswerInternal', 'no answer'],
+        ['NoAnswerExternal', 'no answer'],
+        ['BusyInternal', 'busy'],
+        ['BusyExternal', 'busy'],
+        ['NotRegisteredInternal', 'not registered'],
+        ['NotRegisteredExternal', 'not registered']
+      ]
+      for (const [key, cond] of conds) {
+        forwardEdge(b, sourceId, selfNumber, avail[key], `${name}: ${cond}`, context)
+      }
+    }
+  }
+}
+
+/** Resolve one forwarding destination and add a "forward" edge, unless it's a
+ *  no-op (To: None) or the extension's own voicemail (the default fallback). */
+function forwardEdge(
+  b: Builder,
+  sourceId: string,
+  selfNumber: string,
+  dest: unknown,
+  label: string,
+  context: string
+): void {
+  if (!isObj(dest)) return
+  const to = str(pick(dest, 'To'))
+  if (!to || /^none$/i.test(to)) return
+  const number = str(pick(dest, 'Number'))
+  const external = str(pick(dest, 'External'))
+  const voicemail = /voicemail/i.test(to)
+  if (voicemail && number === selfNumber) return // own mailbox — not a routing link
+  const target = b.resolveTarget(
+    { number: number || undefined, type: to || undefined, external: external || undefined },
+    context
+  )
+  if (!target) return
+  b.addEdge(sourceId, target.id, 'forward', voicemail ? `${label}: voicemail` : label)
 }
 
 /** A human name for an inbound rule. 3CX often leaves rules unnamed, so fall

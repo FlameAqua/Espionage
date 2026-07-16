@@ -27,7 +27,8 @@ const EDGE_COLOR: Record<string, string> = {
   manager: '#6366f1',
   member: '#14b8a6',
   trunk: '#a855f7',
-  afterhours: '#0891b2'
+  afterhours: '#0891b2',
+  forward: '#ec4899'
 }
 
 export interface EdgeTapInfo {
