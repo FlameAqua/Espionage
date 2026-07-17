@@ -7,8 +7,10 @@ import dagre from 'cytoscape-dagre'
 import fcose from 'cytoscape-fcose'
 import {
   NODE_KIND_META,
+  PRESENCE_META,
   departmentColor,
   departmentLabel,
+  presenceOf,
   type GraphNode,
   type NodeKind,
   type TopologyGraph
@@ -39,6 +41,13 @@ export interface EdgeTapInfo {
   labels: string[]
 }
 
+/** One node's position change from a drag, for the undo/redo timeline. */
+export interface NodeMove {
+  id: string
+  from: { x: number; y: number }
+  to: { x: number; y: number }
+}
+
 interface ViewCallbacks {
   /** A node was tapped on the canvas (user-initiated selection). */
   onNodeTap: (node: GraphNode) => void
@@ -52,6 +61,11 @@ interface ViewCallbacks {
   onNodeDoubleTap: (node: GraphNode) => void
   /** A link/edge was tapped. */
   onEdgeTap: (info: EdgeTapInfo) => void
+  /** One or more nodes finished being dragged to a new position. */
+  onNodesMoved: (moves: NodeMove[]) => void
+  /** The empty background was right-clicked (not a box-select drag); coords are
+   *  viewport (client) pixels. */
+  onBackgroundContext: (x: number, y: number) => void
 }
 
 export class GraphView {
@@ -160,6 +174,35 @@ export class GraphView {
     })
     this.cy.on('zoom', () => this.cb.onZoomChange(this.cy.zoom()))
 
+    // Node-move tracking for undo/redo: snapshot positions when a grab starts
+    // (the grabbed node plus any co-selected nodes that move together), then diff
+    // on release and report the ones that actually moved.
+    let grabStart = new Map<string, { x: number; y: number }>()
+    this.cy.on('grab', 'node', (evt) => {
+      grabStart = new Map()
+      const grabbed = evt.target as NodeSingular
+      const moving = grabbed.selected() ? this.cy.nodes(':selected') : grabbed
+      moving.forEach((n) => {
+        if (n.data('model')) {
+          const p = n.position()
+          grabStart.set(n.id(), { x: p.x, y: p.y })
+        }
+      })
+    })
+    this.cy.on('free', 'node', () => {
+      if (!grabStart.size) return
+      const moves: NodeMove[] = []
+      grabStart.forEach((from, id) => {
+        const n = this.cy.getElementById(id)
+        if (n.empty()) return
+        const to = n.position()
+        if (Math.abs(to.x - from.x) > 0.5 || Math.abs(to.y - from.y) > 0.5)
+          moves.push({ id, from, to: { x: to.x, y: to.y } })
+      })
+      grabStart = new Map()
+      if (moves.length) this.cb.onNodesMoved(moves)
+    })
+
     this.setupBoxSelect(container)
 
     this.applyVisibility()
@@ -220,7 +263,13 @@ export class GraphView {
       startM = null
       box.style.display = 'none'
       const rp = evt.renderedPosition
-      if (Math.hypot(rp.x - s.x, rp.y - s.y) < 8) return // a click, not a drag
+      if (Math.hypot(rp.x - s.x, rp.y - s.y) < 8) {
+        // A right-click on empty space, not a box-select drag: surface the
+        // background context menu (undo/redo).
+        const oe = evt.originalEvent as MouseEvent | undefined
+        this.cb.onBackgroundContext(oe?.clientX ?? 0, oe?.clientY ?? 0)
+        return
+      }
       const em = evt.position
       const x1 = Math.min(sm.x, em.x)
       const x2 = Math.max(sm.x, em.x)
@@ -461,9 +510,9 @@ export class GraphView {
     this.cy.viewport({ zoom, pan })
   }
 
-  /** Lock/unlock node dragging (padlock + Space-pan). When locked, nodes ignore
-   *  pointer events (`pan-through`) so a drag starting on a node pans the view
-   *  instead of grabbing the node. */
+  /** Full pass-through mode for Space-pan: elements ignore pointer events
+   *  (`pan-through`) so a drag starting anywhere — even on a node — pans the view.
+   *  Used only while Space is held. */
   setNodesGrabbable(grabbable: boolean): void {
     if (grabbable) {
       this.cy.nodes().grabify()
@@ -473,6 +522,17 @@ export class GraphView {
       this.cy.elements().addClass('pan-through')
     }
     this.cy.autoungrabify(!grabbable)
+  }
+
+  /** Padlock lock: nodes (and department boxes) can't be dragged, but stay fully
+   *  clickable / selectable — so a drag to pan never accidentally moves a node,
+   *  while taps, right-clicks and edge clicks all still work. */
+  setDraggable(draggable: boolean): void {
+    // Never leave elements event-blocked here — locked nodes must stay clickable.
+    this.cy.elements().removeClass('pan-through')
+    if (draggable) this.cy.nodes().grabify()
+    else this.cy.nodes().ungrabify()
+    this.cy.autoungrabify(!draggable)
   }
 
   /** Underlying Cytoscape core — used by the overview minimap (read-only). */
@@ -486,6 +546,17 @@ export class GraphView {
   }
 
   // --- Selection / focus --------------------------------------------------
+
+  /** Move nodes to their recorded `from` or `to` positions (undo / redo of a
+   *  drag), animating so the change is legible, then keep them where they land. */
+  applyPositions(moves: NodeMove[], which: 'from' | 'to'): void {
+    this.cy.stop()
+    for (const m of moves) {
+      const n = this.cy.getElementById(m.id)
+      if (n.empty()) continue
+      n.animate({ position: which === 'from' ? m.from : m.to }, { duration: 250 })
+    }
+  }
 
   /** Highlight + smoothly pan to a node without firing a selection callback. */
   centerOn(id: string): void {
@@ -738,6 +809,11 @@ function toElements(graph: TopologyGraph): ElementDefinition[] {
     const classes: string[] = [n.kind]
     if (n.kind === 'user' && rawIsFalse(n.raw, 'Enabled', 'IsEnabled'))
       classes.push('status-disabled')
+    // Live presence dot (green/orange/red/grey) on user extensions.
+    if (n.kind === 'user') {
+      const p = presenceOf(n.raw)
+      if (p) classes.push(`presence-${p}`)
+    }
     if (
       (n.kind === 'trunk' || n.kind === 'bridge') &&
       rawIsFalse(n.raw, 'IsRegistered', 'Registered')
@@ -778,6 +854,13 @@ function toElements(graph: TopologyGraph): ElementDefinition[] {
  *  a click away in the details panel. */
 function compactEdgeLabel(labels: string[]): string {
   return labels.length > 1 ? `${labels.length} routes` : (labels[0] ?? '')
+}
+
+/** A small filled circle with a contrasting ring, as a data-URI SVG, used as the
+ *  presence badge background-image on user nodes. */
+function presenceDot(fill: string, ring: string): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="5" fill="${fill}" stroke="${ring}" stroke-width="1.5"/></svg>`
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
 }
 
 function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
@@ -902,6 +985,24 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
     // default business-hours path.
     { selector: 'edge.afterhours', style: { 'line-style': 'dashed', 'line-dash-pattern': [6, 3] } }
   )
+
+  // --- Presence badges (user extensions) ------------------------------------
+  // A small coloured dot in the node's top-right corner, drawn as a data-URI SVG
+  // background image so it doesn't disturb the label or node shape.
+  for (const [presence, meta] of Object.entries(PRESENCE_META)) {
+    style.push({
+      selector: `node.presence-${presence}`,
+      style: {
+        'background-image': presenceDot(meta.color, dark ? '#0f172a' : '#ffffff'),
+        'background-width': '12px',
+        'background-height': '12px',
+        'background-position-x': '99%',
+        'background-position-y': '8%',
+        'background-clip': 'none',
+        'background-image-opacity': 1
+      }
+    })
+  }
 
   // --- Interaction states (LAST so they always win) -------------------------
   style.push(

@@ -115,13 +115,15 @@ export function auditTopology(graph: TopologyGraph): AuditFinding[] {
     }
   }
 
-  // 5) Extensions nothing routes to — not a member of any queue / ring group and
-  //    not an IVR / forward destination. They exist but aren't wired into any
-  //    mapped call flow (still directly diallable by extension). Info-level.
+  // 5) Fully orphaned extensions: nothing routes to them at all. No incoming edge
+  //    of any kind means no DID / inbound rule / IVR / forward points at them AND
+  //    they're not an agent or member of any queue or ring group (membership is
+  //    modelled as an incoming agent/member edge). They exist but are wired into
+  //    nothing — only reachable by dialling the extension directly. Info-level.
   for (const n of byKind('user')) {
     if (!inKinds.has(n.id)) {
       findings.push({
-        category: 'Extensions not in any call flow',
+        category: 'Extensions with no DID, not in any queue, and unreferenced',
         label: label(n),
         nodeId: n.id,
         severity: 'info'

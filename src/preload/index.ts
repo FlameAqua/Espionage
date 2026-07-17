@@ -1,6 +1,16 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
-import type { ConnectRequest, ConnectResult, Topology, UpdateStatus } from '../shared/types'
+import type {
+  CallReport,
+  ConnectRequest,
+  ConnectResult,
+  GenerateReportResult,
+  OpenReportResult,
+  SaveReportResult,
+  SavedReportInfo,
+  Topology,
+  UpdateStatus
+} from '../shared/types'
 
 type SaveSnapshotResult = { canceled?: boolean; path?: string; error?: string }
 type OpenSnapshotResult = { canceled?: boolean; topology?: Topology; error?: string }
@@ -22,6 +32,18 @@ const api = {
     saveSnapshot: (topology: Topology): Promise<SaveSnapshotResult> =>
       ipcRenderer.invoke('app:saveSnapshot', topology),
     openSnapshot: (): Promise<OpenSnapshotResult> => ipcRenderer.invoke('app:openSnapshot')
+  },
+  report: {
+    /** Generate a historical call-activity report for a period, saving it to the
+     *  managed reports directory. */
+    generate: (fromISO: string, toISO: string): Promise<GenerateReportResult> =>
+      ipcRenderer.invoke('report:generate', fromISO, toISO),
+    /** Live snapshot of currently active calls. */
+    live: (): Promise<GenerateReportResult> => ipcRenderer.invoke('report:live'),
+    save: (report: CallReport): Promise<SaveReportResult> =>
+      ipcRenderer.invoke('report:save', report),
+    open: (): Promise<OpenReportResult> => ipcRenderer.invoke('report:open'),
+    list: (): Promise<SavedReportInfo[]> => ipcRenderer.invoke('report:list')
   },
   updates: {
     /** Manually trigger an update check (burger menu → "Check for updates"). */

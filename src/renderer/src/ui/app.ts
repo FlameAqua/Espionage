@@ -4,7 +4,13 @@
 
 import type { Topology } from '../../../shared/types'
 import { buildTopology } from '../graph/build'
-import { GraphView, type EdgeTapInfo, type LayoutName, type ThemeName } from '../graph/view'
+import {
+  GraphView,
+  type EdgeTapInfo,
+  type LayoutName,
+  type NodeMove,
+  type ThemeName
+} from '../graph/view'
 import {
   NODE_KIND_META,
   SHARED_DEPARTMENT,
@@ -18,6 +24,8 @@ import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
 import { auditTopology, groupFindings } from '../graph/audit'
+import { UndoManager } from './history'
+import { openReport, showLiveReport, showReportSetup } from './report'
 
 export interface AppCallbacks {
   /** Hard refresh: re-fetch and rebuild from scratch (back to the full view). */
@@ -39,6 +47,7 @@ export interface ViewState {
   history?: string[]
   zoom?: number
   pan?: { x: number; y: number }
+  locked?: boolean
 }
 
 interface DidRow {
@@ -80,6 +89,21 @@ export function renderApp(
   const graph = buildTopology(topology)
   const counts = countKinds(graph.nodes.map((n) => n.kind))
   const presentKinds = (Object.keys(NODE_KIND_META) as NodeKind[]).filter((k) => counts[k])
+  // Core 3CX categories always shown in the legend — even at zero, greyed out —
+  // so an absent category (e.g. no queues) is explicit rather than just missing.
+  const ALWAYS_SHOW_KINDS: NodeKind[] = [
+    'user',
+    'queue',
+    'ringGroup',
+    'ivr',
+    'inboundRule',
+    'trunk',
+    'group'
+  ]
+  // Everything to list: core categories + any synthetic kind that's actually present.
+  const displayKinds = (Object.keys(NODE_KIND_META) as NodeKind[]).filter(
+    (k) => ALWAYS_SHOW_KINDS.includes(k) || counts[k]
+  )
   // Trunks are noisy for day-to-day call-flow reading, so hide them by default.
   const DEFAULT_OFF: NodeKind[] = ['trunk']
   const visible = new Set<NodeKind>(presentKinds.filter((k) => !DEFAULT_OFF.includes(k)))
@@ -141,9 +165,23 @@ export function renderApp(
             <div id="catBody">
             <p class="text-[10px] text-slate-400 mb-1.5">Checkbox shows/hides · click a name to highlight it</p>
             <ul id="legend" class="space-y-0.5">
-              ${presentKinds
-                .map(
-                  (k) => `
+              ${displayKinds
+                .map((k) => {
+                  const empty = !counts[k]
+                  // Empty core categories render greyed + disabled so it's explicit
+                  // there are none, rather than the row simply being absent.
+                  if (empty) {
+                    return `
+                <li class="flex items-center gap-2 text-xs opacity-50" title="No ${esc(NODE_KIND_META[k].label.toLowerCase())} on this system">
+                  <input type="checkbox" disabled class="accent-sky-500" />
+                  <span class="flex-1 flex items-center gap-2 px-1 py-0.5">
+                    <span class="w-3 h-3 rounded" style="background:${NODE_KIND_META[k].color}"></span>
+                    <span class="flex-1">${esc(NODE_KIND_META[k].label)}</span>
+                    <span class="text-slate-400">0</span>
+                  </span>
+                </li>`
+                  }
+                  return `
                 <li class="flex items-center gap-2 text-xs">
                   <input type="checkbox" data-kind="${k}" ${visible.has(k) ? 'checked' : ''} class="accent-sky-500" />
                   <button data-hl="${k}" class="flex-1 flex items-center gap-2 text-left rounded px-1 py-0.5 hover:bg-slate-100 dark:hover:bg-slate-800">
@@ -152,7 +190,7 @@ export function renderApp(
                     <span class="text-slate-400">${counts[k]}</span>
                   </button>
                 </li>`
-                )
+                })
                 .join('')}
             </ul>
             </div>
@@ -201,7 +239,7 @@ export function renderApp(
             </div>
             <div class="flex items-center gap-1">
               <button id="fit" class="${btn} flex-1" title="Fit to screen">⤢ Fit</button>
-              <button id="lock" class="${btn} flex-1" title="Lock nodes — pan freely without moving them (or hold Space)">🔓 Lock</button>
+              <button id="lock" class="${btn} flex-1" title="Lock — stops nodes being dragged (they stay clickable). Unlock to reposition, or hold Space to pan through.">🔓 Lock</button>
             </div>
           </div>
         </aside>
@@ -236,6 +274,9 @@ export function renderApp(
             ${helpRow(mouseSvg('wheel'), 'Scroll', 'zoom (Ctrl = faster)')}
             ${helpRow(dragSvg(), 'Drag', 'pan / move node')}
             ${helpRow(keyCap('space'), 'Space / 🔒', 'pan through nodes')}
+            ${helpRow(keyCap('⌃Z'), 'Ctrl+Z', 'undo move / jump back')}
+            ${helpRow(keyCap('⌃Y'), 'Ctrl+Y', 'redo')}
+            ${helpRow(mouseSvg('right'), 'Right-click bg', 'undo / redo menu')}
           </div>
         </div>
       </div>
@@ -253,6 +294,21 @@ export function renderApp(
   const history: string[] = []
   let current: GraphNode | null = null
   let egoMap: EgoMap | null = null
+  // Unified undo/redo timeline for node moves + navigation jumps.
+  const undo = new UndoManager()
+  // The last node viewed before clicking "All" — kept so we can hop straight
+  // back to it even though the breadcrumb history was cleared.
+  let lastNodeBeforeAll: string | null = null
+
+  // Number → display name, used to label reports. Covers every numbered node
+  // (extensions, queues, IVRs, ring groups, rules…), with real user extensions
+  // winning any collision so a person's name is preferred.
+  const extNames = new Map<string, string>()
+  for (const n of graph.nodes) {
+    if (!n.number) continue
+    if (n.kind === 'user' || !extNames.has(n.number)) extNames.set(n.number, n.label)
+  }
+  const nameFor = (ext: string): string | undefined => extNames.get(ext)
 
   const showDetails = (node: GraphNode | null): void => {
     current = node
@@ -309,6 +365,7 @@ export function renderApp(
   // the target isn't visible, handled by showNode).
   const navigate = (id: string, push: boolean): void => {
     if (!graph.nodes.some((n) => n.id === id)) return
+    undo.push({ type: 'nav', from: current?.id ?? null, to: id })
     if (push && history[history.length - 1] !== id) history.push(id)
     showNode(id)
   }
@@ -323,8 +380,37 @@ export function renderApp(
   // currently-selected layout (Flow by default), ending centred on the node.
   const enterFocus = (id: string): void => {
     if (!graph.nodes.some((n) => n.id === id)) return
+    undo.push({ type: 'nav', from: current?.id ?? null, to: id })
     if (history[history.length - 1] !== id) history.push(id)
     showNode(id, { focus: true })
+  }
+
+  // Apply an undo/redo entry: reverse a node move, or hop to a node (null = the
+  // "All" whole-graph view). Recording is suppressed while applying.
+  const goTo = (id: string | null): void =>
+    undo.run(() => {
+      if (id === null) {
+        history.length = 0
+        view.clearFocus()
+        clearDeptUI()
+        showDetails(null)
+        renderBreadcrumb()
+      } else if (graph.nodes.some((n) => n.id === id)) {
+        if (history[history.length - 1] !== id) history.push(id)
+        showNode(id)
+      }
+    })
+  const doUndo = (): void => {
+    const entry = undo.undo()
+    if (!entry) return
+    if (entry.type === 'move') view.applyPositions(entry.moves, 'from')
+    else goTo(entry.from)
+  }
+  const doRedo = (): void => {
+    const entry = undo.redo()
+    if (!entry) return
+    if (entry.type === 'move') view.applyPositions(entry.moves, 'to')
+    else goTo(entry.to)
   }
 
   // Breadcrumb: All › (…) › up to the 4 most recent nodes, current last.
@@ -341,16 +427,31 @@ export function renderApp(
         `<button data-crumb="${i}" class="${isCurrent ? 'font-semibold text-sky-600 dark:text-sky-400' : 'hover:underline'}">${esc(label)}</button>`
       )
     }
-    breadcrumbEl.innerHTML = parts.join(sep)
+    let html = parts.join(sep)
+    // In the "All" view, offer a one-click hop back to the last node we left.
+    if (!history.length && lastNodeBeforeAll) {
+      const n = graph.nodes.find((x) => x.id === lastNodeBeforeAll)
+      if (n)
+        html += `<button data-crumb="return" class="ml-2 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-200" title="Back to last node">↩ ${esc(n.number ?? n.label)}</button>`
+    }
+    breadcrumbEl.innerHTML = html
     breadcrumbEl.querySelectorAll<HTMLElement>('[data-crumb]').forEach((b) => {
       b.addEventListener('click', () => {
         const v = b.dataset.crumb!
         if (v === 'all') {
+          // Silently remember where we were so we can return quickly.
+          const prev = history[history.length - 1] ?? current?.id ?? null
+          if (prev) {
+            lastNodeBeforeAll = prev
+            undo.push({ type: 'nav', from: prev, to: null })
+          }
           history.length = 0
           view.clearFocus()
           clearDeptUI()
           showDetails(null)
           renderBreadcrumb()
+        } else if (v === 'return' && lastNodeBeforeAll) {
+          navigate(lastNodeBeforeAll, true)
         } else {
           const i = Number(v)
           history.length = i + 1
@@ -409,11 +510,49 @@ export function renderApp(
       ctxEl.append(item('📞', `Copy ext ${node.number}`, () => window.api.app.copy(node.number!)))
     const rawId = node.raw['Id']
     if (rawId != null) ctxEl.append(item('🆔', 'Copy ID', () => window.api.app.copy(String(rawId))))
-    // Clamp to the viewport using the menu's real size once it's laid out.
+    // Undo / redo, always available from the menu (disabled when the stack is empty).
+    ctxEl.append(divider())
+    if (undo.canUndo()) ctxEl.append(item('↩', 'Undo', doUndo))
+    else ctxEl.append(disabledItem('↩', 'Undo'))
+    if (undo.canRedo()) ctxEl.append(item('↪', 'Redo', doRedo))
+    else ctxEl.append(disabledItem('↪', 'Redo'))
+    placeCtx(x, y)
+  }
+
+  // A greyed, non-interactive context-menu row (for unavailable undo/redo).
+  const disabledItem = (icon: string, label: string): HTMLElement => {
+    const d = document.createElement('div')
+    d.className =
+      'w-full text-left flex items-center gap-2 px-2.5 py-1 text-slate-300 dark:text-slate-600 whitespace-nowrap'
+    d.innerHTML = `<span class="w-4 text-center shrink-0">${icon}</span><span>${esc(label)}</span>`
+    return d
+  }
+  const placeCtx = (x: number, y: number): void => {
     ctxEl.classList.remove('hidden')
     const rect = ctxEl.getBoundingClientRect()
     ctxEl.style.left = `${Math.min(x, window.innerWidth - rect.width - 8)}px`
     ctxEl.style.top = `${Math.min(y, window.innerHeight - rect.height - 8)}px`
+  }
+
+  // Right-click on empty canvas: a compact Undo / Redo menu.
+  const showBgCtx = (x: number, y: number): void => {
+    const item = (icon: string, label: string, fn: () => void): HTMLElement => {
+      const b = document.createElement('button')
+      b.className =
+        'w-full text-left flex items-center gap-2 px-2.5 py-1 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap'
+      b.innerHTML = `<span class="w-4 text-center shrink-0">${icon}</span><span>${esc(label)}</span>`
+      b.addEventListener('click', () => {
+        hideCtx()
+        fn()
+      })
+      return b
+    }
+    ctxEl.innerHTML = ''
+    if (undo.canUndo()) ctxEl.append(item('↩', 'Undo', doUndo))
+    else ctxEl.append(disabledItem('↩', 'Undo'))
+    if (undo.canRedo()) ctxEl.append(item('↪', 'Redo', doRedo))
+    else ctxEl.append(disabledItem('↪', 'Redo'))
+    placeCtx(x, y)
   }
   const onDocClick = (): void => hideCtx()
   document.addEventListener('click', onDocClick)
@@ -431,7 +570,9 @@ export function renderApp(
     },
     onNodeContext: (node, x, y) => showCtx(node, x, y),
     onNodeDoubleTap: (node) => enterFocus(node.id),
-    onEdgeTap: (info) => showEdgeDetails(info)
+    onEdgeTap: (info) => showEdgeDetails(info),
+    onNodesMoved: (moves: NodeMove[]) => undo.push({ type: 'move', moves }),
+    onBackgroundContext: (x, y) => showBgCtx(x, y)
   })
   showDetails(null)
   renderBreadcrumb()
@@ -547,23 +688,43 @@ export function renderApp(
 
   // --- Node lock (padlock + Space-to-pan) ---------------------------------
   const lockBtn = root.querySelector<HTMLButtonElement>('#lock')!
-  let locked = false
+  // Locked by default so panning never accidentally drags nodes; unlock via the
+  // padlock button (or hold Space) to reposition nodes.
+  let locked = true
   let spaceHeld = false
   const applyLock = (): void => {
-    const effective = locked || spaceHeld
-    view.setNodesGrabbable(!effective)
-    lockBtn.textContent = effective ? '🔒 Locked' : '🔓 Lock'
+    if (spaceHeld) {
+      // Hold Space: fully pass pointer events through so a drag anywhere pans.
+      view.setNodesGrabbable(false)
+    } else {
+      // Padlock lock: not draggable, but nodes/edges/departments stay clickable.
+      view.setDraggable(!locked)
+    }
+    lockBtn.textContent = locked || spaceHeld ? '🔒 Locked' : '🔓 Lock'
     lockBtn.classList.toggle('bg-sky-700', locked)
   }
   lockBtn.addEventListener('click', () => {
     locked = !locked
     applyLock()
   })
+  applyLock()
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.code === 'Space' && !isTyping(e.target) && !spaceHeld) {
       e.preventDefault()
       spaceHeld = true
       applyLock()
+      return
+    }
+    // Undo / redo. Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes.
+    if ((e.ctrlKey || e.metaKey) && !isTyping(e.target)) {
+      const key = e.key.toLowerCase()
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        doUndo()
+      } else if (key === 'y' || (key === 'z' && e.shiftKey)) {
+        e.preventDefault()
+        doRedo()
+      }
     }
   }
   const onKeyUp = (e: KeyboardEvent): void => {
@@ -586,10 +747,15 @@ export function renderApp(
     selectedId: current?.id,
     history: [...history],
     zoom: view.getZoom(),
-    pan: view.getPan()
+    pan: view.getPan(),
+    locked
   })
 
   const applyRestore = (s: ViewState): void => {
+    if (s.locked !== undefined) {
+      locked = s.locked
+      applyLock()
+    }
     // Visible kinds (+ sync the legend checkboxes).
     visible.clear()
     for (const k of s.visibleKinds) if (presentKinds.includes(k)) visible.add(k)
@@ -668,7 +834,31 @@ export function renderApp(
       })
       return b
     }
+    // A labelled section header separating groups of related actions.
+    const section = (label: string): HTMLElement => {
+      const d = document.createElement('div')
+      d.className =
+        'px-3 pt-2 pb-0.5 mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400 border-t border-slate-200 dark:border-slate-700 first:mt-0 first:border-t-0'
+      d.textContent = label
+      return d
+    }
     menuEl.innerHTML = ''
+    // Analyse — read-only insight tools.
+    menuEl.append(section('Analyse'))
+    menuEl.append(item('🩺', 'Health check', showAuditPanel))
+    menuEl.append(item('🗂', 'DID table', showDidTable))
+    // Reports — call-activity reporting.
+    menuEl.append(section('Reports'))
+    menuEl.append(item('📊', 'Generate report', () => showReportSetup(nameFor)))
+    menuEl.append(item('📡', 'Live report', () => void showLiveReport(nameFor)))
+    menuEl.append(item('📈', 'Open report', () => void openReport(nameFor)))
+    // Export & snapshots — get data out / back in.
+    menuEl.append(section('Export & snapshots'))
+    menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
+    menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
+    menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
+    // View — appearance.
+    menuEl.append(section('View'))
     menuEl.append(
       item(
         theme === 'dark' ? '☀' : '🌙',
@@ -676,11 +866,8 @@ export function renderApp(
         toggleTheme
       )
     )
-    menuEl.append(item('🩺', 'Health check', showAuditPanel))
-    menuEl.append(item('🗂', 'DID table', showDidTable))
-    menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
-    menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
-    menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
+    // Session — connection lifecycle.
+    menuEl.append(section('Session'))
     menuEl.append(item('🔄', 'Hard refresh', cb.onReload))
     menuEl.append(item('⬆', 'Check for updates', () => checkForUpdates()))
     menuEl.append(item('⏏', 'Disconnect', cb.onDisconnect))
@@ -712,13 +899,21 @@ export function renderApp(
   // --- Search dropdown ----------------------------------------------------
   const searchEl = root.querySelector<HTMLInputElement>('#search')!
   const resultsEl = root.querySelector<HTMLElement>('#results')!
+  // Latest results, so Enter can jump straight to the top match.
+  let searchMatches: GraphNode[] = []
+  const pickSearch = (id: string): void => {
+    navigate(id, true)
+    resultsEl.classList.add('hidden')
+    searchEl.value = ''
+    searchMatches = []
+  }
   searchEl.addEventListener('input', () => {
-    const matches = view.search(searchEl.value).slice(0, 12)
-    if (!matches.length) {
+    searchMatches = view.search(searchEl.value).slice(0, 12)
+    if (!searchMatches.length) {
       resultsEl.classList.add('hidden')
       return
     }
-    resultsEl.innerHTML = matches
+    resultsEl.innerHTML = searchMatches
       .map(
         (m: GraphNode) => `
         <button data-id="${esc(m.id)}" class="w-full text-left flex items-center gap-2 px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm">
@@ -730,12 +925,15 @@ export function renderApp(
       .join('')
     resultsEl.classList.remove('hidden')
     resultsEl.querySelectorAll<HTMLElement>('[data-id]').forEach((b) => {
-      b.addEventListener('click', () => {
-        navigate(b.dataset.id!, true)
-        resultsEl.classList.add('hidden')
-        searchEl.value = ''
-      })
+      b.addEventListener('click', () => pickSearch(b.dataset.id!))
     })
+  })
+  // Enter selects the top result (unless there are none).
+  searchEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && searchMatches.length) {
+      e.preventDefault()
+      pickSearch(searchMatches[0].id)
+    }
   })
   searchEl.addEventListener('blur', () => setTimeout(() => resultsEl.classList.add('hidden'), 150))
 

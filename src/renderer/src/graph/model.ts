@@ -85,6 +85,52 @@ export function departmentLabel(bucket: string): string {
   return bucket === SHARED_DEPARTMENT ? 'Multiple Departments' : bucket
 }
 
+/** Live presence of a user extension, derived from its raw 3CX fields. Mirrors
+ *  the colour language of the 3CX v20 web client so it reads at a glance:
+ *  green available, orange away/other, red DND, grey not registered. */
+export type Presence = 'available' | 'away' | 'dnd' | 'offline' | null
+
+export const PRESENCE_META: Record<Exclude<Presence, null>, { label: string; color: string }> = {
+  available: { label: 'Available', color: '#22c55e' },
+  away: { label: 'Away', color: '#f59e0b' },
+  dnd: { label: 'Do Not Disturb', color: '#ef4444' },
+  offline: { label: 'Not registered', color: '#94a3b8' }
+}
+
+/** True only when a raw flag is explicitly false — an absent field is "unknown"
+ *  and must not be treated as a definite state. */
+function flagIsFalse(raw: Record<string, unknown>, ...keys: string[]): boolean {
+  for (const k of keys) {
+    const v = raw[k]
+    if (v === false || v === 'false' || v === 0) return true
+    if (v === true || v === 'true' || v === 1) return false
+  }
+  return false
+}
+
+/** Classify a user extension's live presence from its raw entity, or null when
+ *  there's no signal to show a badge. Not-registered wins over any profile
+ *  because the extension can't take a call regardless of its status profile. */
+export function presenceOf(raw: Record<string, unknown>): Presence {
+  if (flagIsFalse(raw, 'IsRegistered', 'Registered')) return 'offline'
+  const profile = String(raw['CurrentProfileName'] ?? '').trim()
+  if (!profile) return null
+  if (/dnd|do not disturb/i.test(profile)) return 'dnd'
+  if (/available/i.test(profile)) return 'available'
+  // Away, Lunch, Business Trip, Out of office, custom profiles…
+  return 'away'
+}
+
+/** Whether a user is logged in to their queues (global 3CX QueueStatus), or null
+ *  when the field is absent. */
+export function queueLoggedIn(raw: Record<string, unknown>): boolean | null {
+  const qs = String(raw['QueueStatus'] ?? '').trim()
+  if (!qs) return null
+  if (/out/i.test(qs)) return false
+  if (/in/i.test(qs)) return true
+  return null
+}
+
 export const NODE_KIND_META: Record<NodeKind, { label: string; color: string }> = {
   trunk: { label: 'Trunk', color: '#a855f7' },
   did: { label: 'DID', color: '#ec4899' },

@@ -3,10 +3,23 @@ import { join } from 'path'
 import { promises as fs } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import type { Topology, EntitySet } from '../shared/types'
+import type { CallReport, Topology, EntitySet } from '../shared/types'
 import { redactSecrets } from '../shared/redact'
 import { registerThreecxIpc } from './threecx/ipc'
+import { fetchActiveCalls, fetchCallReport } from './threecx/client'
 import { initUpdater } from './updater'
+
+/** App-managed directory where generated reports are stored. Created on startup
+ *  if it doesn't already exist. */
+function reportsDir(): string {
+  return join(app.getPath('userData'), 'reports')
+}
+
+async function ensureReportsDir(): Promise<string> {
+  const dir = reportsDir()
+  await fs.mkdir(dir, { recursive: true })
+  return dir
+}
 
 /** Create a window. `hash` (e.g. "#focus=user:1001") opens it on a node. */
 function createWindow(hash = ''): void {
@@ -92,6 +105,23 @@ function normalizeTopology(raw: unknown): Topology | null {
   })
 }
 
+/** Validate parsed JSON is a saved call report (guards Open report against
+ *  unrelated / hand-edited files). */
+function normalizeReport(raw: unknown): CallReport | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  if (o.kind !== 'call-report' || !Array.isArray(o.entries)) return null
+  return redactSecrets<CallReport>(o as unknown as CallReport)
+}
+
+/** Safe filename fragment from a base URL / label. */
+function safeName(s: string): string {
+  return s
+    .replace(/^https?:\/\//, '')
+    .replace(/[^\w.-]/g, '_')
+    .slice(0, 60)
+}
+
 function registerAppIpc(): void {
   ipcMain.handle('app:openWindow', (_evt, hash: string) => createWindow(hash))
   ipcMain.handle('app:copy', (_evt, text: string) => clipboard.writeText(text))
@@ -145,6 +175,109 @@ function registerAppIpc(): void {
       return { error: `Could not read snapshot: ${(err as Error).message}` }
     }
   })
+
+  // --- Call-activity reports ------------------------------------------------
+
+  // Generate a historical report for a period, saving it into the managed
+  // reports directory so it can be reopened later.
+  ipcMain.handle('report:generate', async (_evt, fromISO: string, toISO: string) => {
+    try {
+      const report = await fetchCallReport(fromISO, toISO)
+      const dir = await ensureReportsDir()
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const path = join(dir, `report-${safeName(report.baseUrl)}-${stamp}.json`)
+      await fs.writeFile(path, JSON.stringify(report, null, 2), 'utf8')
+      return { report, path }
+    } catch (err) {
+      return { error: (err as Error).message }
+    }
+  })
+
+  // Live snapshot of active calls (not auto-persisted).
+  ipcMain.handle('report:live', async () => {
+    try {
+      return { report: await fetchActiveCalls() }
+    } catch (err) {
+      return { error: (err as Error).message }
+    }
+  })
+
+  // Save a report to a user-chosen file (defaulting to the reports directory).
+  ipcMain.handle('report:save', async (evt, report: CallReport) => {
+    const win = BrowserWindow.fromWebContents(evt.sender)
+    const dir = await ensureReportsDir()
+    const stamp = (report?.generatedAt ?? new Date().toISOString()).replace(/[:.]/g, '-')
+    const opts = {
+      title: 'Save report',
+      defaultPath: join(
+        dir,
+        `report-${safeName(String(report?.baseUrl ?? 'system'))}-${stamp}.json`
+      ),
+      filters: [{ name: 'Espionage report', extensions: ['json'] }]
+    }
+    const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))
+    if (result.canceled || !result.filePath) return { canceled: true }
+    try {
+      await fs.writeFile(result.filePath, JSON.stringify(report, null, 2), 'utf8')
+      return { path: result.filePath }
+    } catch (err) {
+      return { error: `Could not save report: ${(err as Error).message}` }
+    }
+  })
+
+  // Open a previously-saved report.
+  ipcMain.handle('report:open', async (evt) => {
+    const win = BrowserWindow.fromWebContents(evt.sender)
+    const dir = await ensureReportsDir()
+    const opts = {
+      title: 'Open report',
+      defaultPath: dir,
+      properties: ['openFile' as const],
+      filters: [{ name: 'Espionage report', extensions: ['json'] }]
+    }
+    const result = await (win ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts))
+    if (result.canceled || !result.filePaths[0]) return { canceled: true }
+    const filePath = result.filePaths[0]
+    try {
+      const stat = await fs.stat(filePath)
+      if (stat.size > 100 * 1024 * 1024) return { error: 'Report file is too large (over 100 MB).' }
+      const report = normalizeReport(JSON.parse(await fs.readFile(filePath, 'utf8')))
+      if (!report) return { error: 'That file is not a valid Espionage report.' }
+      return { report }
+    } catch (err) {
+      return { error: `Could not read report: ${(err as Error).message}` }
+    }
+  })
+
+  // List saved reports in the managed directory (newest first).
+  ipcMain.handle('report:list', async () => {
+    try {
+      const dir = await ensureReportsDir()
+      const files = (await fs.readdir(dir)).filter((f) => f.endsWith('.json'))
+      const infos = await Promise.all(
+        files.map(async (name) => {
+          const path = join(dir, name)
+          try {
+            const report = normalizeReport(JSON.parse(await fs.readFile(path, 'utf8')))
+            if (!report) return null
+            return {
+              path,
+              name,
+              generatedAt: report.generatedAt,
+              live: report.live
+            }
+          } catch {
+            return null
+          }
+        })
+      )
+      return infos
+        .filter((i): i is NonNullable<typeof i> => !!i)
+        .sort((a, b) => b.generatedAt.localeCompare(a.generatedAt))
+    } catch {
+      return []
+    }
+  })
 }
 
 // This method will be called when Electron has finished
@@ -165,6 +298,9 @@ app.whenReady().then(() => {
   // 3CX API bridge + app-level helpers for the renderer.
   registerThreecxIpc()
   registerAppIpc()
+
+  // Create the managed reports directory up front (generated on install/first run).
+  void ensureReportsDir().catch(() => {})
 
   // Auto-updates: wire IPC + kick off a silent check (packaged builds only).
   initUpdater()

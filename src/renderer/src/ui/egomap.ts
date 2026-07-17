@@ -10,6 +10,7 @@ export class EgoMap {
   private cy: Core
   private container!: HTMLElement
   private onWheel!: (e: WheelEvent) => void
+  private destroyed = false
 
   constructor(
     container: HTMLElement,
@@ -74,27 +75,44 @@ export class EgoMap {
     this.container = container
 
     requestAnimationFrame(() => {
+      // A rapid re-navigation can destroy this mini-map before the deferred layout
+      // runs; bail rather than lay out a torn-down / detached graph.
+      if (this.destroyed) return
       this.cy.resize()
-      // Concentric layout throws on a lone node (empty bounding box), so only run
-      // it when the centre actually has neighbours.
-      if (this.cy.nodes().length > 1) {
-        this.cy
-          .layout({
-            name: 'concentric',
-            // @ts-ignore concentric callback
-            concentric: (n) => (n.hasClass('center') ? 2 : 1),
-            levelWidth: () => 1,
-            minNodeSpacing: 12,
-            padding: 8,
-            animate: false
-          })
-          .run()
+      const w = container.clientWidth
+      const h = container.clientHeight
+      // Concentric layout reads the container's bounding box and throws on a
+      // degenerate one (zero-size container, or a lone node). Only run it with a
+      // real size + neighbours, pass an explicit boundingBox so it never depends
+      // on the container dimensions, and guard against any residual edge case.
+      if (this.cy.nodes().length > 1 && w > 0 && h > 0) {
+        try {
+          this.cy
+            .layout({
+              name: 'concentric',
+              boundingBox: { x1: 0, y1: 0, w, h },
+              // @ts-ignore concentric callback
+              concentric: (n) => (n.hasClass('center') ? 2 : 1),
+              levelWidth: () => 1,
+              minNodeSpacing: 12,
+              padding: 8,
+              animate: false
+            })
+            .run()
+        } catch {
+          // Fall through to fit — the nodes still render, just un-arranged.
+        }
       }
-      this.cy.fit(undefined, 10)
+      try {
+        this.cy.fit(undefined, 10)
+      } catch {
+        /* ignore fit on a degenerate/empty graph */
+      }
     })
   }
 
   destroy(): void {
+    this.destroyed = true
     this.container.removeEventListener('wheel', this.onWheel)
     this.cy.destroy()
   }

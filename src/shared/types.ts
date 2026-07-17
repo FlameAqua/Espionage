@@ -43,6 +43,66 @@ export type UpdateStatus =
   | { kind: 'downloaded'; version: string }
   | { kind: 'error'; message: string }
 
+/** One normalised call-log record used by the report engine. Fields are best-effort:
+ *  3CX's call-log shape varies by version, so anything unknown is left blank. */
+export interface CallLogEntry {
+  /** ISO timestamp the call started, if known. */
+  startTime?: string
+  /** Caller (source) number/extension. */
+  from?: string
+  /** Callee (destination) number/extension. */
+  to?: string
+  /** Whether the call was answered/connected. */
+  answered?: boolean
+  /** Talk/ring duration in seconds, if known. */
+  durationSec?: number
+  /** 'Inbound' | 'Outbound' | 'Internal' when derivable. */
+  direction?: string
+  /** Original record, so the UI can surface fields we didn't normalise. */
+  raw: Record<string, unknown>
+}
+
+/** Per-extension activity rollup derived from the call log. */
+export interface ExtensionActivity {
+  extension: string
+  name?: string
+  received: number
+  answered: number
+  missed: number
+  placed: number
+  totalTalkSec: number
+  active: boolean
+}
+
+/** A generated call-activity report: either a period snapshot (call log for a
+ *  date range) or a live snapshot (currently active calls). Saved as JSON and
+ *  reopened into the interactive report panel. */
+export interface CallReport {
+  /** Marker so a loaded file can be recognised as a report, not a topology. */
+  kind: 'call-report'
+  generatedAt: string
+  baseUrl: string
+  /** true = live active-calls snapshot; false = historical period. */
+  live: boolean
+  /** Period bounds (ISO) for a historical report. */
+  from?: string
+  to?: string
+  entries: CallLogEntry[]
+  perExtension: ExtensionActivity[]
+  /** Non-fatal problem fetching the data (e.g. endpoint gated by licence). */
+  error?: string
+}
+
+export type GenerateReportResult = { report?: CallReport; path?: string; error?: string }
+export type OpenReportResult = { canceled?: boolean; report?: CallReport; error?: string }
+export type SaveReportResult = { canceled?: boolean; path?: string; error?: string }
+export interface SavedReportInfo {
+  path: string
+  name: string
+  generatedAt: string
+  live: boolean
+}
+
 /** Every collection the topology graph is built from. Each may be empty/errored. */
 export interface Topology {
   fetchedAt: string

@@ -9,7 +9,14 @@
 import https from 'https'
 import http from 'http'
 import { URL } from 'url'
-import type { ConnectRequest, EntitySet, Topology } from '../../shared/types'
+import type {
+  CallLogEntry,
+  CallReport,
+  ConnectRequest,
+  EntitySet,
+  ExtensionActivity,
+  Topology
+} from '../../shared/types'
 import { redactSecrets } from '../../shared/redact'
 
 interface Session {
@@ -247,6 +254,201 @@ export async function fetchTopology(): Promise<Topology> {
     didNumbers,
     trunks,
     groups: groups2
+  })
+}
+
+// --- Call-activity reports --------------------------------------------------
+
+type Obj = Record<string, unknown>
+const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** First non-empty value among the given keys (case-insensitive). */
+function pickField(o: Obj, ...keys: string[]): string {
+  const lower: Record<string, unknown> = {}
+  for (const k of Object.keys(o)) lower[k.toLowerCase()] = o[k]
+  for (const k of keys) {
+    const v = lower[k.toLowerCase()]
+    if (v !== undefined && v !== null && v !== '') return String(v)
+  }
+  return ''
+}
+
+/** Parse a duration expressed as seconds, or "HH:MM:SS" / "MM:SS", into seconds.
+ *  Exported for unit testing. */
+export function parseDuration(s: string): number {
+  if (!s) return 0
+  if (/^\d+$/.test(s)) return Number(s)
+  const parts = s.split(':').map((p) => Number(p))
+  if (parts.some((n) => Number.isNaN(n))) {
+    const f = Number(s)
+    return Number.isNaN(f) ? 0 : f
+  }
+  return parts.reduce((acc, n) => acc * 60 + n, 0)
+}
+
+/** Numbers that look like an internal extension (short, all-digit). Exported for tests. */
+export function isExtensionLike(s: string): boolean {
+  return /^\d{2,6}$/.test(s.trim())
+}
+
+/** Normalise one raw 3CX call-log / active-call record into a CallLogEntry.
+ *  Field names differ across 3CX versions, so every field is best-effort.
+ *  Exported for unit testing. */
+export function normalizeCallEntry(raw: Obj): CallLogEntry {
+  const from = pickField(
+    raw,
+    'SrcCallerNumber',
+    'SourceCallerId',
+    'CallerNumber',
+    'SrcDn',
+    'SourceDn',
+    'From',
+    'Caller',
+    'CallerId'
+  )
+  const to = pickField(
+    raw,
+    'DstCallerNumber',
+    'DestinationCallerId',
+    'DstDn',
+    'DestinationDn',
+    'To',
+    'Callee',
+    'Destination'
+  )
+  const start = pickField(
+    raw,
+    'StartTime',
+    'TimeStart',
+    'SegmentStartTime',
+    'EstablishedAt',
+    'Time',
+    'StartedAt'
+  )
+  const durStr = pickField(raw, 'TalkDuration', 'Duration', 'TalkingDuration', 'RingingDuration')
+  const durationSec = parseDuration(durStr)
+  const status = pickField(raw, 'Status', 'CallState', 'State', 'Result', 'Reason')
+  const answeredFlag = pickField(raw, 'Answered', 'IsAnswered')
+  // Order matters: check the NEGATIVE statuses first, because "Unanswered"
+  // contains the substring "answered" and would otherwise be read as answered.
+  let answered: boolean
+  if (/^(true|1|yes)$/i.test(answeredFlag)) answered = true
+  else if (/^(false|0|no)$/i.test(answeredFlag)) answered = false
+  else if (/unanswered|missed|no ?answer|abandon|fail|cancel|busy|declin/i.test(status))
+    answered = false
+  else if (/answered|talking|connected|established|completed|routing/i.test(status)) answered = true
+  else answered = durationSec > 0
+  const direction = pickField(raw, 'CallType', 'Direction', 'Type')
+  return {
+    startTime: start || undefined,
+    from: from || undefined,
+    to: to || undefined,
+    answered,
+    durationSec: durationSec || undefined,
+    direction: direction || undefined,
+    raw
+  }
+}
+
+/** Roll call entries up per extension so the report can answer "did ext N receive
+ *  calls / was it active". An endpoint is treated as an extension when it's a
+ *  short all-digit number appearing as a call's source or destination.
+ *  Exported for unit testing. */
+export function rollupByExtension(entries: CallLogEntry[]): ExtensionActivity[] {
+  const map = new Map<string, ExtensionActivity>()
+  const get = (ext: string): ExtensionActivity => {
+    let a = map.get(ext)
+    if (!a) {
+      a = {
+        extension: ext,
+        received: 0,
+        answered: 0,
+        missed: 0,
+        placed: 0,
+        totalTalkSec: 0,
+        active: true
+      }
+      map.set(ext, a)
+    }
+    return a
+  }
+  for (const e of entries) {
+    if (e.to && isExtensionLike(e.to)) {
+      const a = get(e.to)
+      a.received++
+      if (e.answered) a.answered++
+      else a.missed++
+      a.totalTalkSec += e.durationSec ?? 0
+    }
+    if (e.from && isExtensionLike(e.from)) {
+      const a = get(e.from)
+      a.placed++
+      a.totalTalkSec += e.durationSec ?? 0
+    }
+  }
+  return [...map.values()].sort((a, b) => b.received + b.placed - (a.received + a.placed))
+}
+
+// 3CX's historical call-log report is an OData function whose exact name/params
+// vary by version. Try each candidate in turn and use the first that returns
+// data; the {from}/{to} placeholders are ISO date-times.
+const CALL_LOG_ENDPOINTS = [
+  '/xapi/v1/ReportCallLogData/Pbx.GetCallLogData(periodFrom={from},periodTo={to},sourceType=0,sourceFilter=%27%27,destinationType=0,destinationFilter=%27%27,callsType=0,callTimeFilterType=0,callTimeFilterFrom=%270:00:0%27,callTimeFilterTo=%270:00:0%27,hidePcalls=true)',
+  '/xapi/v1/CallHistoryView?$filter=StartTime%20ge%20{from}%20and%20StartTime%20le%20{to}',
+  '/xapi/v1/ReportCallLogData?startDate={from}&endDate={to}'
+]
+
+/** Fetch a historical call-activity report for [fromISO, toISO]. Degrades to an
+ *  empty, error-tagged report when no endpoint is available (licence-gated). */
+export async function fetchCallReport(fromISO: string, toISO: string): Promise<CallReport> {
+  if (!session) throw new Error('Not connected.')
+  let rawRecords: unknown[] = []
+  let lastError = ''
+  for (const tpl of CALL_LOG_ENDPOINTS) {
+    const path = tpl
+      .replace('{from}', encodeURIComponent(fromISO))
+      .replace('{to}', encodeURIComponent(toISO))
+    try {
+      rawRecords = await getCollection(path)
+      lastError = ''
+      if (rawRecords.length) break
+    } catch (err) {
+      lastError = (err as Error).message
+    }
+  }
+  const entries = rawRecords.filter(isObj).map((r) => normalizeCallEntry(r as Obj))
+  return redactSecrets<CallReport>({
+    kind: 'call-report',
+    generatedAt: new Date().toISOString(),
+    baseUrl: session.baseUrl,
+    live: false,
+    from: fromISO,
+    to: toISO,
+    entries,
+    perExtension: rollupByExtension(entries),
+    error: entries.length ? undefined : lastError || 'No call-log data returned for this period.'
+  })
+}
+
+/** Snapshot of currently active calls for the "Live report". */
+export async function fetchActiveCalls(): Promise<CallReport> {
+  if (!session) throw new Error('Not connected.')
+  let rawRecords: unknown[] = []
+  let error = ''
+  try {
+    rawRecords = await getCollection('/xapi/v1/ActiveCalls')
+  } catch (err) {
+    error = (err as Error).message
+  }
+  const entries = rawRecords.filter(isObj).map((r) => normalizeCallEntry(r as Obj))
+  return redactSecrets<CallReport>({
+    kind: 'call-report',
+    generatedAt: new Date().toISOString(),
+    baseUrl: session.baseUrl,
+    live: true,
+    entries,
+    perExtension: rollupByExtension(entries),
+    error: error || undefined
   })
 }
 

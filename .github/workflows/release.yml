@@ -32,6 +32,16 @@ jobs:
 
       - run: npm ci
 
+      # Verify before we ever cut installers: a broken tag should fail here, not
+      # ship. `npm run build` (below) also runs the type check.
+      - name: Lint
+        shell: bash
+        run: npm run lint
+
+      - name: Unit tests
+        shell: bash
+        run: npm test
+
       # Build the installers WITHOUT electron-builder's own uploader — its
       # GitHub publisher races the release creation in CI and can drop the
       # large .exe while still exiting 0. We publish deterministically below.

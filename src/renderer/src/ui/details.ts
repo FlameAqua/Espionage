@@ -3,7 +3,10 @@
 
 import {
   NODE_KIND_META,
+  PRESENCE_META,
   SHARED_DEPARTMENT,
+  presenceOf,
+  queueLoggedIn,
   type GraphEdge,
   type GraphNode,
   type TopologyGraph
@@ -43,13 +46,32 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
 
   const sections: string[] = []
 
-  // Outgoing — where this entity routes / who it contains.
-  if (out.length) {
-    sections.push(relSection(outgoingTitle(node.kind), out, (e) => e.target, nodeById))
+  // Extensions: which queues they're an agent of, with their global login state.
+  if (node.kind === 'user') {
+    const qs = queueMembershipSection(node, inc, nodeById)
+    if (qs) sections.push(qs)
   }
-  // Incoming — who routes here / which groups this belongs to.
-  if (inc.length) {
-    sections.push(relSection(incomingTitle(node.kind), inc, (e) => e.source, nodeById))
+  // Queues / ring groups: who is in it, each with live presence + login state.
+  if (node.kind === 'queue' || node.kind === 'ringGroup') {
+    const ms = memberStatusSection(node, out, nodeById)
+    if (ms) sections.push(ms)
+  }
+
+  // Outgoing — where this entity routes / who it contains. For queues / ring
+  // groups the members are already listed (with status) above, so show only the
+  // routing edges here to avoid listing agents twice.
+  const outForRel =
+    node.kind === 'queue' || node.kind === 'ringGroup'
+      ? out.filter((e) => e.kind !== 'agent' && e.kind !== 'member')
+      : out
+  if (outForRel.length) {
+    sections.push(relSection(outgoingTitle(node.kind), outForRel, (e) => e.target, nodeById))
+  }
+  // Incoming — who routes here / which groups this belongs to. For extensions the
+  // queues they're an agent of are already in the Queues section above.
+  const incForRel = node.kind === 'user' ? inc.filter((e) => e.kind !== 'agent') : inc
+  if (incForRel.length) {
+    sections.push(relSection(incomingTitle(node.kind), incForRel, (e) => e.source, nodeById))
   }
 
   const info = node.info?.length
@@ -225,6 +247,92 @@ function relSection(
     </div>`
 }
 
+/** A small coloured presence dot (matches the on-canvas badge), or a hollow dot
+ *  when there's no presence signal. */
+function presenceDot(raw: Record<string, unknown>): string {
+  const p = presenceOf(raw)
+  const meta = p ? PRESENCE_META[p] : null
+  const color = meta?.color ?? 'transparent'
+  const border = meta ? '' : 'border border-slate-300 dark:border-slate-600'
+  const title = meta ? esc(meta.label) : 'Unknown'
+  return `<span class="w-2.5 h-2.5 rounded-full shrink-0 ${border}" style="background:${color}" title="${title}"></span>`
+}
+
+/** A "logged in" / "logged out" pill from the user's global QueueStatus, or empty
+ *  when the field is absent. */
+function loginBadge(raw: Record<string, unknown>): string {
+  const li = queueLoggedIn(raw)
+  if (li === null) return ''
+  const cls = li
+    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+    : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+  return `<span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold shrink-0 ${cls}">${li ? 'logged in' : 'logged out'}</span>`
+}
+
+/** Extensions: the queues they're an agent of (incoming `agent` edges), each with
+ *  the extension's global logged-in/out state. */
+function queueMembershipSection(
+  node: GraphNode,
+  inc: GraphEdge[],
+  nodeById: Map<string, GraphNode>
+): string {
+  const queues = inc
+    .filter((e) => e.kind === 'agent')
+    .map((e) => nodeById.get(e.source))
+    .filter((q): q is GraphNode => !!q && q.kind === 'queue')
+  if (!queues.length) return ''
+  const badge = loginBadge(node.raw)
+  const rows = queues
+    .map(
+      (q) => `
+      <li>
+        <button data-nav="${esc(q.id)}" class="w-full text-left flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
+          <span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META.queue.color}"></span>
+          <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(q.label)}${q.number ? ` <span class="text-slate-400 font-mono">${esc(q.number)}</span>` : ''}</span>
+          ${badge}
+        </button>
+      </li>`
+    )
+    .join('')
+  return `
+    <div>
+      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Queues <span class="text-slate-400">(${queues.length})</span></h3>
+      <ul class="space-y-0.5">${rows}</ul>
+    </div>`
+}
+
+/** Queues / ring groups: who is in it — each member's live presence + login. */
+function memberStatusSection(
+  node: GraphNode,
+  out: GraphEdge[],
+  nodeById: Map<string, GraphNode>
+): string {
+  const members = out
+    .filter((e) => e.kind === 'agent' || e.kind === 'member')
+    .map((e) => nodeById.get(e.target))
+    .filter((u): u is GraphNode => !!u && u.kind === 'user')
+  if (!members.length) return ''
+  const isQueue = node.kind === 'queue'
+  const rows = members
+    .map(
+      (u) => `
+      <li>
+        <button data-nav="${esc(u.id)}" class="w-full text-left flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
+          ${presenceDot(u.raw)}
+          <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(u.label)}${u.number ? ` <span class="text-slate-400 font-mono">${esc(u.number)}</span>` : ''}</span>
+          ${isQueue ? loginBadge(u.raw) : ''}
+        </button>
+      </li>`
+    )
+    .join('')
+  const title = isQueue ? 'In this queue' : 'Members'
+  return `
+    <div>
+      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${title} <span class="text-slate-400">(${members.length})</span></h3>
+      <ul class="space-y-0.5">${rows}</ul>
+    </div>`
+}
+
 function keyFacts(node: GraphNode): string {
   const r = node.raw
   const rows: [string, unknown][] = []
@@ -240,10 +348,9 @@ function keyFacts(node: GraphNode): string {
   switch (node.kind) {
     case 'user': {
       add('Registered', 'IsRegistered')
-      const qs = String(r['QueueStatus'] ?? '')
-      if (qs) rows.push(['Logged in', /out/i.test(qs) ? 'No' : /in/i.test(qs) ? 'Yes' : qs])
-      add('Enabled', 'Enabled')
-      add('Presence', 'CurrentProfileName')
+      const li = queueLoggedIn(r)
+      if (li !== null) rows.push(['Logged into queue', li ? 'Yes' : 'No'])
+      add('Current Ext Status', 'CurrentProfileName')
       add('Email', 'Email', 'EmailAddress')
       add('Mobile', 'Mobile')
       break
@@ -268,10 +375,8 @@ function keyFacts(node: GraphNode): string {
       add('Condition', 'Condition')
       break
   }
-  // Queues / ring groups: list the member extensions inline.
+  // Queues / ring groups: managers inline (members get a richer status section).
   if (node.kind === 'queue' || node.kind === 'ringGroup') {
-    const members = memberList(r, 'Agents', 'Members')
-    if (members) rows.push([node.kind === 'ringGroup' ? 'Members' : 'Agents', members])
     const managers = memberList(r, 'Managers')
     if (managers) rows.push(['Managers', managers])
   }
