@@ -18,6 +18,14 @@ import type {
   Topology
 } from '../../shared/types'
 import { redactSecrets } from '../../shared/redact'
+import {
+  classifyDirection,
+  countryFromBareNumber,
+  isExtensionLike,
+  parseInternational,
+  parseTrunkFromReason,
+  pickParties
+} from '../../shared/phone'
 
 interface Session {
   baseUrl: string
@@ -273,49 +281,67 @@ function pickField(o: Obj, ...keys: string[]): string {
   return ''
 }
 
-/** Parse a duration expressed as seconds, or "HH:MM:SS" / "MM:SS", into seconds.
- *  Exported for unit testing. */
+/** Parse a duration into seconds. Handles plain seconds ("45"), clock form
+ *  ("HH:MM:SS" / "MM:SS") and ISO-8601 durations ("PT3M43.8S", "PT14.6S",
+ *  "PT1H2M3S") — 3CX's call log uses the ISO form. Exported for unit testing. */
 export function parseDuration(s: string): number {
   if (!s) return 0
-  if (/^\d+$/.test(s)) return Number(s)
-  const parts = s.split(':').map((p) => Number(p))
+  const t = s.trim()
+  if (/^\d+(\.\d+)?$/.test(t)) return Number(t)
+  const iso = /^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i.exec(t)
+  if (iso) {
+    const [, d, h, m, sec] = iso
+    return (
+      (Number(d) || 0) * 86400 +
+      (Number(h) || 0) * 3600 +
+      (Number(m) || 0) * 60 +
+      (Number(sec) || 0)
+    )
+  }
+  const parts = t.split(':').map((p) => Number(p))
   if (parts.some((n) => Number.isNaN(n))) {
-    const f = Number(s)
+    const f = Number(t)
     return Number.isNaN(f) ? 0 : f
   }
   return parts.reduce((acc, n) => acc * 60 + n, 0)
 }
 
-/** Numbers that look like an internal extension (short, all-digit). Exported for tests. */
-export function isExtensionLike(s: string): boolean {
-  return /^\d{2,6}$/.test(s.trim())
-}
+// `isExtensionLike` now lives in shared/phone (used by the renderer too); it is
+// re-exported here so existing imports/tests keep working.
+export { isExtensionLike } from '../../shared/phone'
 
 /** Normalise one raw 3CX call-log / active-call record into a CallLogEntry.
  *  Field names differ across 3CX versions, so every field is best-effort.
  *  Exported for unit testing. */
 export function normalizeCallEntry(raw: Obj): CallLogEntry {
-  const from = pickField(
+  // 3CX splits each endpoint into a DN (the extension / trunk identity, e.g.
+  // "0202" or the "10000" line pseudo-DN) and a CallerId (the dialled phone
+  // number, e.g. "+353873962669"). We track both: the DN identifies which
+  // extension a call belongs to; the CallerId is the external party's number.
+  const srcDn = pickField(raw, 'SrcDn', 'SourceDn')
+  const dstDn = pickField(raw, 'DstDn', 'DestinationDn')
+  const srcNum = pickField(
     raw,
-    'SrcCallerNumber',
     'SourceCallerId',
+    'SrcCallerNumber',
     'CallerNumber',
-    'SrcDn',
-    'SourceDn',
+    'CallerId',
     'From',
-    'Caller',
-    'CallerId'
+    'Caller'
   )
-  const to = pickField(
+  const dstNum = pickField(
     raw,
-    'DstCallerNumber',
     'DestinationCallerId',
-    'DstDn',
-    'DestinationDn',
+    'DstCallerNumber',
     'To',
     'Callee',
     'Destination'
   )
+  // Display / back-compat identities: prefer the dialled number, fall back to DN.
+  const from = srcNum || srcDn
+  const to = dstNum || dstDn
+  // Per-call group key (shared by every routing leg of one call).
+  const callId = pickField(raw, 'MainCallHistoryId', 'CallHistoryId', 'CallId')
   const start = pickField(
     raw,
     'StartTime',
@@ -325,10 +351,17 @@ export function normalizeCallEntry(raw: Obj): CallLogEntry {
     'Time',
     'StartedAt'
   )
-  const durStr = pickField(raw, 'TalkDuration', 'Duration', 'TalkingDuration', 'RingingDuration')
+  const durStr = pickField(
+    raw,
+    'TalkDuration',
+    'TalkingDuration',
+    'Duration',
+    'RingingDuration',
+    'CallTime'
+  )
   const durationSec = parseDuration(durStr)
   const status = pickField(raw, 'Status', 'CallState', 'State', 'Result', 'Reason')
-  const answeredFlag = pickField(raw, 'Answered', 'IsAnswered')
+  const answeredFlag = pickField(raw, 'Answered', 'IsAnswered', 'CallAnswered')
   // Order matters: check the NEGATIVE statuses first, because "Unanswered"
   // contains the substring "answered" and would otherwise be read as answered.
   let answered: boolean
@@ -338,16 +371,81 @@ export function normalizeCallEntry(raw: Obj): CallLogEntry {
     answered = false
   else if (/answered|talking|connected|established|completed|routing/i.test(status)) answered = true
   else answered = durationSec > 0
-  const direction = pickField(raw, 'CallType', 'Direction', 'Type')
+
+  // Prefer 3CX's explicit Direction ("Inbound" / "Inbound Queue" / "Outbound").
+  const direction = pickField(raw, 'Direction', 'CallType', 'Type')
+  // Identify each side by its DN when present (the true extension/trunk id),
+  // otherwise by the number — so direction is inferred from identities, not from
+  // a caller-id that may be a full PSTN number.
+  const srcId = srcDn || srcNum
+  const dstId = dstDn || dstNum
+  const directionNorm = classifyDirection(srcId, dstId, direction)
+
+  // The internal extension is the DN on the relevant side; the external party is
+  // the dialled number on the other side.
+  let extension: string | undefined
+  let external: string | undefined
+  if (directionNorm === 'inbound') {
+    extension = isExtensionLike(dstId) ? dstId : undefined
+    external = srcNum || srcDn || undefined
+  } else if (directionNorm === 'outbound') {
+    extension = isExtensionLike(srcId) ? srcId : undefined
+    external = dstNum || dstDn || undefined
+  } else if (directionNorm === 'internal') {
+    extension = isExtensionLike(srcId) ? srcId : isExtensionLike(dstId) ? dstId : undefined
+    external = undefined
+  } else {
+    const p = pickParties(from, to, directionNorm)
+    extension = p.extension
+    external = p.external
+  }
+  const intl = parseInternational(external)
+  const trunk = parseTrunkFromReason(pickField(raw, 'Reason'))?.name
   return {
     startTime: start || undefined,
+    callId: callId || undefined,
     from: from || undefined,
     to: to || undefined,
     answered,
     durationSec: durationSec || undefined,
     direction: direction || undefined,
+    directionNorm,
+    extension: extension || undefined,
+    external: external || undefined,
+    intlCode: intl?.code,
+    country: intl?.country,
+    trunk: trunk || undefined,
     raw
   }
+}
+
+/** Best-guess home country (ISO2) for a set of calls. Trunk DIDs are the
+ *  strongest signal (they sit in the PBX's own country), so those win; otherwise
+ *  fall back to the most common country among international-format caller-ids.
+ *  Blank when there is no signal — the report UI then asks the user to pick one. */
+export function guessHomeCountry(entries: CallLogEntry[]): string | undefined {
+  const top = (tally: Map<string, number>): string | undefined => {
+    let best: string | undefined
+    let bestN = 0
+    for (const [iso, n] of tally) {
+      if (n > bestN) {
+        best = iso
+        bestN = n
+      }
+    }
+    return best
+  }
+
+  const trunkTally = new Map<string, number>()
+  const extTally = new Map<string, number>()
+  for (const e of entries) {
+    const trunkNum = parseTrunkFromReason(pickField(e.raw, 'Reason'))?.number
+    const trunkIso = countryFromBareNumber(trunkNum)?.iso2
+    if (trunkIso) trunkTally.set(trunkIso, (trunkTally.get(trunkIso) ?? 0) + 1)
+    const extIso = parseInternational(e.external)?.iso2
+    if (extIso) extTally.set(extIso, (extTally.get(extIso) ?? 0) + 1)
+  }
+  return top(trunkTally) ?? top(extTally)
 }
 
 /** Roll call entries up per extension so the report can answer "did ext N receive
@@ -424,6 +522,7 @@ export async function fetchCallReport(fromISO: string, toISO: string): Promise<C
     live: false,
     from: fromISO,
     to: toISO,
+    homeCountry: guessHomeCountry(entries),
     entries,
     perExtension: rollupByExtension(entries),
     error: entries.length ? undefined : lastError || 'No call-log data returned for this period.'
@@ -446,6 +545,7 @@ export async function fetchActiveCalls(): Promise<CallReport> {
     generatedAt: new Date().toISOString(),
     baseUrl: session.baseUrl,
     live: true,
+    homeCountry: guessHomeCountry(entries),
     entries,
     perExtension: rollupByExtension(entries),
     error: error || undefined

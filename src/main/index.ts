@@ -249,6 +249,54 @@ function registerAppIpc(): void {
     }
   })
 
+  // Export the current (filtered) report view as a CSV file.
+  ipcMain.handle('report:exportCsv', async (evt, defaultName: string, content: string) => {
+    const win = BrowserWindow.fromWebContents(evt.sender)
+    const dir = await ensureReportsDir()
+    const opts = {
+      title: 'Export CSV',
+      defaultPath: join(dir, safeName(defaultName) || 'report.csv'),
+      filters: [{ name: 'CSV', extensions: ['csv'] }]
+    }
+    const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))
+    if (result.canceled || !result.filePath) return { canceled: true }
+    try {
+      // Prepend a UTF-8 BOM so Excel reads accented country names correctly.
+      await fs.writeFile(result.filePath, '﻿' + content, 'utf8')
+      return { path: result.filePath }
+    } catch (err) {
+      return { error: `Could not export CSV: ${(err as Error).message}` }
+    }
+  })
+
+  // Export the current (filtered) report view as a PDF, rendered from an HTML
+  // document via a hidden window (no external PDF dependency).
+  ipcMain.handle('report:exportPdf', async (evt, defaultName: string, html: string) => {
+    const win = BrowserWindow.fromWebContents(evt.sender)
+    const dir = await ensureReportsDir()
+    const opts = {
+      title: 'Export PDF',
+      defaultPath: join(dir, safeName(defaultName) || 'report.pdf'),
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    }
+    const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))
+    if (result.canceled || !result.filePath) return { canceled: true }
+    const tmp = join(app.getPath('temp'), `espionage-report-${Date.now()}.html`)
+    const pdfWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true } })
+    try {
+      await fs.writeFile(tmp, html, 'utf8')
+      await pdfWin.loadFile(tmp)
+      const pdf = await pdfWin.webContents.printToPDF({ printBackground: true, pageSize: 'A4' })
+      await fs.writeFile(result.filePath, pdf)
+      return { path: result.filePath }
+    } catch (err) {
+      return { error: `Could not export PDF: ${(err as Error).message}` }
+    } finally {
+      pdfWin.destroy()
+      fs.unlink(tmp).catch(() => undefined)
+    }
+  })
+
   // List saved reports in the managed directory (newest first).
   ipcMain.handle('report:list', async () => {
     try {

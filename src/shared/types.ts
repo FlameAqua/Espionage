@@ -1,6 +1,8 @@
 // Types shared across the main, preload and renderer processes. Everything here
 // is plain data that crosses the IPC boundary as JSON.
 
+import type { CallDirection } from './phone'
+
 /** Credentials + endpoint the user enters on the login screen. */
 export interface ConnectRequest {
   /** Base URL of the 3CX web client, e.g. https://pbx.example.com (no path). */
@@ -48,6 +50,10 @@ export type UpdateStatus =
 export interface CallLogEntry {
   /** ISO timestamp the call started, if known. */
   startTime?: string
+  /** Groups the routing legs of one logical call (3CX returns a row per leg:
+   *  trunk → queue → IVR → extension). Used to collapse a call to a single row
+   *  in the report's "by call" view. */
+  callId?: string
   /** Caller (source) number/extension. */
   from?: string
   /** Callee (destination) number/extension. */
@@ -58,6 +64,19 @@ export interface CallLogEntry {
   durationSec?: number
   /** 'Inbound' | 'Outbound' | 'Internal' when derivable. */
   direction?: string
+  /** Normalised direction the report groups by. Home-country independent. */
+  directionNorm?: CallDirection
+  /** The internal extension the call is attributed to (source or destination). */
+  extension?: string
+  /** The other (external) party's number, when the call has one. */
+  external?: string
+  /** Dialling code of the external number when written in international form
+   *  (e.g. "44"). Absent for domestic-format or internal calls. */
+  intlCode?: string
+  /** Country name for `intlCode`, e.g. "United Kingdom". */
+  country?: string
+  /** Trunk the call used, parsed from the 3CX `Reason` string, e.g. "SIP3". */
+  trunk?: string
   /** Original record, so the UI can surface fields we didn't normalise. */
   raw: Record<string, unknown>
 }
@@ -87,6 +106,9 @@ export interface CallReport {
   /** Period bounds (ISO) for a historical report. */
   from?: string
   to?: string
+  /** Best-guess home country (ISO2) for national/international classification,
+   *  inferred from the call log. The report UI lets the user override it. */
+  homeCountry?: string
   entries: CallLogEntry[]
   perExtension: ExtensionActivity[]
   /** Non-fatal problem fetching the data (e.g. endpoint gated by licence). */

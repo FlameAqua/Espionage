@@ -42,6 +42,12 @@ const api = {
     live: (): Promise<GenerateReportResult> => ipcRenderer.invoke('report:live'),
     save: (report: CallReport): Promise<SaveReportResult> =>
       ipcRenderer.invoke('report:save', report),
+    /** Export the current (filtered) view as a CSV file. */
+    exportCsv: (defaultName: string, content: string): Promise<SaveReportResult> =>
+      ipcRenderer.invoke('report:exportCsv', defaultName, content),
+    /** Export the current (filtered) view as a PDF (rendered from HTML). */
+    exportPdf: (defaultName: string, html: string): Promise<SaveReportResult> =>
+      ipcRenderer.invoke('report:exportPdf', defaultName, html),
     open: (): Promise<OpenReportResult> => ipcRenderer.invoke('report:open'),
     list: (): Promise<SavedReportInfo[]> => ipcRenderer.invoke('report:list')
   },
