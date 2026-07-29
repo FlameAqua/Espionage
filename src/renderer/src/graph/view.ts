@@ -6,6 +6,7 @@ import type { Core, ElementDefinition, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
 import fcose from 'cytoscape-fcose'
 import {
+  EDGE_KIND_META,
   NODE_KIND_META,
   PRESENCE_META,
   departmentColor,
@@ -22,16 +23,9 @@ cytoscape.use(fcose)
 export type ThemeName = 'light' | 'dark'
 export type LayoutName = 'flow' | 'force' | 'breadthfirst' | 'compact' | 'department'
 
-const EDGE_COLOR: Record<string, string> = {
-  route: '#64748b',
-  overflow: '#f59e0b',
-  agent: '#3b82f6',
-  manager: '#6366f1',
-  member: '#14b8a6',
-  trunk: '#a855f7',
-  afterhours: '#0891b2',
-  forward: '#ec4899'
-}
+/** Default link opacity — links read as background structure so the nodes stay
+ *  the foreground. Adjustable in Settings (see setEdgeMuting). */
+export const DEFAULT_EDGE_OPACITY = 0.5
 
 export interface EdgeTapInfo {
   sourceId: string
@@ -39,6 +33,9 @@ export interface EdgeTapInfo {
   kind: string
   /** Every individual relationship collapsed into this edge (e.g. "key 1"). */
   labels: string[]
+  /** Set when one of the split-out per-route edges was tapped, so the details
+   *  panel can call out which single route it was. */
+  tappedLabel?: string
 }
 
 /** One node's position change from a drag, for the undo/redo timeline. */
@@ -61,6 +58,8 @@ interface ViewCallbacks {
   onNodeDoubleTap: (node: GraphNode) => void
   /** A link/edge was tapped. */
   onEdgeTap: (info: EdgeTapInfo) => void
+  /** A link was right-clicked; coords are viewport (client) pixels. */
+  onEdgeContext: (info: EdgeTapInfo & { edgeId: string }, x: number, y: number) => void
   /** One or more nodes finished being dragged to a new position. */
   onNodesMoved: (moves: NodeMove[]) => void
   /** The empty background was right-clicked (not a box-select drag); coords are
@@ -79,10 +78,23 @@ export class GraphView {
   private layoutName: LayoutName = 'flow'
   private visibleKinds: Set<NodeKind>
   private focusId: string | null = null
+  // How many hops out from the focus node stay visible. Infinity = the whole
+  // connected cluster the focus node belongs to.
+  private focusDepth = 1
   private hideUnconnected = false
   private deptFilter: string | null = null
   private deptParentsActive = false
   private boxEl!: HTMLElement
+  /** Nodes the user explicitly hid via the context menu. Wins over every filter. */
+  private manuallyHidden = new Set<string>()
+  /** Individual links hidden via the edge context menu. */
+  private hiddenEdgeIds = new Set<string>()
+  /** Whole link types hidden (context menu "Hide all" / Settings). */
+  private hiddenEdgeKinds = new Set<string>()
+  /** The collapsed edge currently exploded into its individual routes, if any. */
+  private splitEdgeId: string | null = null
+  private theme: ThemeName
+  private edgeOpacity = DEFAULT_EDGE_OPACITY
 
   constructor(
     container: HTMLElement,
@@ -94,6 +106,7 @@ export class GraphView {
     this.cb = cb
     this.container = container
     this.visibleKinds = visibleKinds
+    this.theme = theme
 
     this.cy = cytoscape({
       container,
@@ -142,6 +155,7 @@ export class GraphView {
     this.cy.on('tap', 'node', (evt) => {
       const node = (evt.target as NodeSingular).data('model') as GraphNode | undefined
       if (!node) return // department container box — ignore taps on it
+      this.collapseEdge() // leaving a link restores its compact "N routes" form
       this.cy.nodes().unselect() // a plain tap clears any right-drag group selection
       const now = Date.now()
       const isDouble = node.id === lastTapId && now - lastTapAt < 350
@@ -152,7 +166,8 @@ export class GraphView {
     })
     this.cy.on('tap', (evt) => {
       if (evt.target === this.cy) {
-        this.cy.elements().removeClass('faded selected')
+        this.collapseEdge()
+        this.cy.elements().removeClass('faded selected dim lit')
         this.cy.nodes().unselect()
         this.cb.onBackgroundTap()
       }
@@ -165,12 +180,40 @@ export class GraphView {
     })
     this.cy.on('tap', 'edge', (evt) => {
       const e = evt.target
+      // Tapping a per-route copy shouldn't re-split (it's already one route) — it
+      // just reports that single route's detail.
+      const isSplit = e.hasClass('route-split')
+      const originalId = isSplit ? String(e.id()).split('::route:')[0] : String(e.id())
+      const original = this.cy.getElementById(originalId)
+      const allLabels = (original.empty() ? e : original).data('labels') as string[] | undefined
+      if (!isSplit) this.expandEdge(e.id())
       this.cb.onEdgeTap({
         sourceId: String(e.data('source')),
         targetId: String(e.data('target')),
         kind: String(e.data('kind')),
-        labels: (e.data('labels') as string[]) ?? []
+        labels: allLabels ?? [],
+        tappedLabel: isSplit ? String(e.data('label')) : undefined
       })
+    })
+    this.cy.on('cxttap', 'edge', (evt) => {
+      const e = evt.target
+      const oe = evt.originalEvent as MouseEvent | undefined
+      // Right-clicking a per-route copy targets the link it came from, so "Hide"
+      // hides the whole link rather than one temporary stand-in.
+      const baseId = e.hasClass('route-split')
+        ? String(e.id()).split('::route:')[0]
+        : String(e.id())
+      this.cb.onEdgeContext(
+        {
+          edgeId: baseId,
+          sourceId: String(e.data('source')),
+          targetId: String(e.data('target')),
+          kind: String(e.data('kind')),
+          labels: (e.data('labels') as string[]) ?? []
+        },
+        oe?.clientX ?? 0,
+        oe?.clientY ?? 0
+      )
     })
     this.cy.on('zoom', () => this.cb.onZoomChange(this.cy.zoom()))
 
@@ -275,7 +318,7 @@ export class GraphView {
       const x2 = Math.max(sm.x, em.x)
       const y1 = Math.min(sm.y, em.y)
       const y2 = Math.max(sm.y, em.y)
-      this.cy.elements().removeClass('faded selected')
+      this.cy.elements().removeClass('faded selected dim lit')
       this.cy.nodes().unselect()
       this.cy
         .nodes()
@@ -433,7 +476,7 @@ export class GraphView {
     if (eles.empty()) return
     if (!animate) {
       if (this.focusId) {
-        this.cy.zoom(this.fitZoom(eles, 55))
+        this.cy.zoom(this.fitZoomAroundFocus(eles, 55))
         this.cy.center(this.cy.getElementById(this.focusId))
       } else {
         this.cy.fit(eles, 45)
@@ -444,12 +487,34 @@ export class GraphView {
     if (this.focusId) {
       const node = this.cy.getElementById(this.focusId)
       this.cy.animate(
-        { center: { eles: node }, zoom: this.fitZoom(eles, 55) },
+        { center: { eles: node }, zoom: this.fitZoomAroundFocus(eles, 55) },
         { duration: 400, easing: 'ease-in-out' }
       )
     } else {
       this.cy.animate({ fit: { eles, padding: 45 } }, { duration: 400, easing: 'ease-in-out' })
     }
+  }
+
+  /** Zoom that fits the visible elements while the FOCUS node stays dead centre.
+   *  Plain fit-zoom assumes the bounding box is centred, so on a lopsided
+   *  neighbourhood (the usual case — a node with everything hanging off one side)
+   *  half the revealed nodes ended up off screen. Sizing on the furthest reach
+   *  from the focus node in each direction keeps it centred AND everything in
+   *  frame. */
+  private fitZoomAroundFocus(eles: cytoscape.Collection, padding: number): number {
+    if (!this.focusId) return this.fitZoom(eles, padding)
+    const node = this.cy.getElementById(this.focusId)
+    if (node.empty()) return this.fitZoom(eles, padding)
+    const bb = eles.boundingBox({})
+    const p = node.position()
+    const halfW = Math.max(p.x - bb.x1, bb.x2 - p.x)
+    const halfH = Math.max(p.y - bb.y1, bb.y2 - p.y)
+    if (halfW <= 0 || halfH <= 0) return this.fitZoom(eles, padding)
+    const z = Math.min(
+      (this.cy.width() / 2 - padding) / halfW,
+      (this.cy.height() / 2 - padding) / halfH
+    )
+    return Math.max(this.cy.minZoom(), Math.min(this.cy.maxZoom(), z))
   }
 
   /** Zoom level that fits the given elements within the viewport. */
@@ -558,26 +623,90 @@ export class GraphView {
     }
   }
 
-  /** Highlight + smoothly pan to a node without firing a selection callback. */
+  /** Highlight + smoothly pan to a node without firing a selection callback.
+   *  Inside a focus view the reach is already the filter, so use the gentler
+   *  graded emphasis rather than hard-fading everything outside one hop. */
   centerOn(id: string): void {
     const node = this.cy.getElementById(id)
     if (node.empty()) return
-    this.highlightNeighbourhood(node as NodeSingular)
+    if (this.focusId) this.emphasizeFocus(id)
+    else this.highlightNeighbourhood(node as NodeSingular)
     this.cy.animate({ center: { eles: node } }, { duration: 300 })
   }
 
-  /** Collapse the graph to a node and its immediate neighbours, then lay out.
-   *  The layout is deferred one frame so the visibility (display:none) changes
-   *  flush first — otherwise the layout/bounding-box is computed against stale
-   *  positions and the view ends up blank or wildly zoomed. */
+  /** The set of elements kept visible when focused on `id`: the focus node grown
+   *  outward `focusDepth` hops, or its whole connected cluster when the depth is
+   *  Infinity (the slider's top notch). */
+  private focusNeighbourhoodSet(id: string): cytoscape.Collection {
+    const start = this.cy.getElementById(id)
+    if (start.empty()) return this.cy.collection()
+    if (!Number.isFinite(this.focusDepth)) return start.component()
+    let hood = start.closedNeighborhood()
+    for (let hop = 1; hop < this.focusDepth; hop++) hood = hood.closedNeighborhood()
+    return hood
+  }
+
+  /** Collapse the graph to a node and the nodes within `focusDepth` hops of it,
+   *  then lay out. The layout is deferred one frame so the visibility
+   *  (display:none) changes flush first — otherwise the layout/bounding-box is
+   *  computed against stale positions and the view ends up blank or wildly
+   *  zoomed. */
   focusNeighbourhood(id: string, layout?: LayoutName): void {
     this.cy.stop() // cancel any in-flight centring from the preceding tap
     if (layout) this.layoutName = layout
     this.focusId = id
     this.deptFilter = null // mutually exclusive with the department filter
     this.applyVisibility()
-    this.highlightNeighbourhood(this.cy.getElementById(id) as NodeSingular)
+    this.emphasizeFocus(id)
     requestAnimationFrame(() => this.runLayout(true))
+  }
+
+  /** Change how many hops out from the focus node stay visible (Infinity = the
+   *  whole connected cluster).
+   *
+   *  Runs the same layout + framing as entering focus does, so every reach step
+   *  lands on a freshly laid-out view centred on the focused node. Earlier
+   *  attempts to preserve existing positions (placing only the newly-revealed
+   *  nodes, or translating a re-layout to pin the focus node) left revealed nodes
+   *  at their whole-graph coordinates — scattered far from the focus and off
+   *  camera — so don't reintroduce that. */
+  setFocusDepth(depth: number): void {
+    this.focusDepth = depth
+    if (this.focusId == null) return
+    this.cy.stop()
+    this.applyVisibility()
+    this.emphasizeFocus(this.focusId)
+    // Deferred a frame so the display:none changes flush before the layout reads
+    // positions (otherwise re-shown nodes lay out from stale coordinates).
+    requestAnimationFrame(() => this.runLayout(true))
+  }
+
+  getFocusDepth(): number {
+    return this.focusDepth
+  }
+
+  /** Emphasise the focused node and its immediate neighbours, dimming anything
+   *  further out. Nodes outside the reach are already display:none, so this is
+   *  purely about keeping the node the user focused on visually anchored as the
+   *  reach grows (rather than every revealed node looking equally prominent). */
+  private emphasizeFocus(id: string): void {
+    this.cy.elements().removeClass('faded selected dim lit')
+    const node = this.cy.getElementById(id)
+    if (node.empty()) return
+    const nearIds = new Set(node.closedNeighborhood().map((e) => e.id()))
+    // Deliberately iterates ALL elements rather than `:visible`: this runs right
+    // after applyVisibility()'s batch, whose display changes haven't been flushed
+    // yet, so a `:visible` query still returns the PREVIOUS set — which left
+    // nodes revealed by a Focus Reach change undimmed until they were re-clicked.
+    // Classes on hidden elements are harmless, and become correct if re-revealed.
+    this.cy
+      .elements()
+      .not('.dept-parent')
+      .forEach((el) => {
+        if (!nearIds.has(el.id())) el.addClass('dim')
+        else if (el.isEdge()) el.addClass('lit')
+      })
+    node.addClass('selected')
   }
 
   clearFocus(layout?: LayoutName): void {
@@ -585,7 +714,7 @@ export class GraphView {
     if (layout) this.layoutName = layout
     this.focusId = null
     this.deptFilter = null
-    this.cy.elements().removeClass('faded selected')
+    this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
     requestAnimationFrame(() => this.runLayout(true))
   }
@@ -600,7 +729,7 @@ export class GraphView {
   setDepartmentFilter(bucket: string | null): void {
     this.focusId = null
     this.deptFilter = bucket
-    this.cy.elements().removeClass('faded selected')
+    this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
     requestAnimationFrame(() => this.runLayout(true))
   }
@@ -613,6 +742,151 @@ export class GraphView {
   isVisible(id: string): boolean {
     const n = this.cy.getElementById(id)
     return !n.empty() && !n.hasClass('hidden')
+  }
+
+  // --- Manual node hiding --------------------------------------------------
+
+  /** Hide one node (context menu → Hide). Deliberately does NOT re-run the
+   *  layout: everything else stays exactly where it is, so hiding clutter never
+   *  reshuffles the part of the graph being read. */
+  hideNode(id: string): void {
+    this.manuallyHidden.add(id)
+    this.applyVisibility()
+  }
+
+  /** Restore every manually-hidden node. */
+  unhideAll(): void {
+    if (!this.manuallyHidden.size) return
+    this.manuallyHidden.clear()
+    this.applyVisibility()
+  }
+
+  hiddenCount(): number {
+    return this.manuallyHidden.size
+  }
+
+  /** Restore specific nodes (undo of a Hide). */
+  unhideNodes(ids: string[]): void {
+    for (const id of ids) this.manuallyHidden.delete(id)
+    this.applyVisibility()
+  }
+
+  /** Every manually-hidden node id, so a "show all" can be undone. */
+  hiddenNodeIds(): string[] {
+    return [...this.manuallyHidden]
+  }
+
+  // --- Link hiding ---------------------------------------------------------
+
+  /** Hide one specific link. */
+  hideEdge(id: string): void {
+    this.collapseEdge()
+    this.hiddenEdgeIds.add(id)
+    this.applyVisibility()
+  }
+
+  unhideEdges(ids: string[]): void {
+    for (const id of ids) this.hiddenEdgeIds.delete(id)
+    this.applyVisibility()
+  }
+
+  /** Hide every link of a given type (e.g. all "manager" links). */
+  hideEdgeKind(kind: string): void {
+    this.collapseEdge()
+    this.hiddenEdgeKinds.add(kind)
+    this.applyVisibility()
+  }
+
+  /** Replace the set of hidden link types outright (Settings panel). */
+  setHiddenEdgeKinds(kinds: Iterable<string>): void {
+    this.collapseEdge()
+    this.hiddenEdgeKinds = new Set(kinds)
+    this.applyVisibility()
+  }
+
+  getHiddenEdgeKinds(): string[] {
+    return [...this.hiddenEdgeKinds]
+  }
+
+  hiddenEdgeIdList(): string[] {
+    return [...this.hiddenEdgeIds]
+  }
+
+  /** How many links are hidden right now, individually or by type. */
+  hiddenEdgeCount(): number {
+    let byKind = 0
+    if (this.hiddenEdgeKinds.size) {
+      this.cy.edges().forEach((e) => {
+        if (this.hiddenEdgeKinds.has(String(e.data('kind')))) byKind++
+      })
+    }
+    return this.hiddenEdgeIds.size + byKind
+  }
+
+  /** Restore every hidden link (individual and by type). */
+  unhideAllEdges(): void {
+    if (!this.hiddenEdgeIds.size && !this.hiddenEdgeKinds.size) return
+    this.hiddenEdgeIds.clear()
+    this.hiddenEdgeKinds.clear()
+    this.applyVisibility()
+  }
+
+  // --- Collapsed-edge expansion -------------------------------------------
+
+  /** Explode a collapsed "N routes" edge into one edge per underlying route, each
+   *  carrying its own label, and spotlight the two nodes it joins. Multiple
+   *  relationships between the same pair are merged into a single edge for layout
+   *  speed (see addEdge in build.ts), which hides exactly the detail you want when
+   *  you click the link — so it's restored temporarily on demand.
+   *
+   *  Returns true when the edge actually had several routes to split. */
+  expandEdge(edgeId: string): boolean {
+    this.collapseEdge()
+    const edge = this.cy.getElementById(edgeId)
+    if (edge.empty() || !edge.isEdge()) return false
+    const labels = (edge.data('labels') as string[]) ?? []
+    const source = String(edge.data('source'))
+    const target = String(edge.data('target'))
+    this.spotlightPair(source, target)
+    if (labels.length < 2) return false
+
+    const kind = String(edge.data('kind'))
+    this.splitEdgeId = edgeId
+    edge.addClass('hidden')
+    this.cy.add(
+      labels.map((label, i) => ({
+        group: 'edges' as const,
+        data: {
+          id: `${edgeId}::route:${i}`,
+          source,
+          target,
+          label,
+          kind,
+          labels: [label]
+        },
+        classes: `${kind} route-split`
+      }))
+    )
+    return true
+  }
+
+  /** Put the compact single edge back and drop the per-route copies. */
+  collapseEdge(): void {
+    if (!this.splitEdgeId) return
+    this.cy.edges('.route-split').remove()
+    const edge = this.cy.getElementById(this.splitEdgeId)
+    if (!edge.empty()) edge.removeClass('hidden')
+    this.splitEdgeId = null
+  }
+
+  /** Emphasise just the two ends of a link (plus the link itself). */
+  private spotlightPair(sourceId: string, targetId: string): void {
+    this.cy.elements().removeClass('faded selected dim lit')
+    this.cy.elements().not('.dept-parent').addClass('faded')
+    const a = this.cy.getElementById(sourceId)
+    const b = this.cy.getElementById(targetId)
+    a.union(b).removeClass('faded').addClass('selected')
+    a.edgesWith(b).removeClass('faded').addClass('lit')
   }
 
   setVisibleKinds(kinds: Set<NodeKind>): void {
@@ -636,7 +910,7 @@ export class GraphView {
    *  bucket, or has a direct edge into it (so cross-department links stay
    *  visible), AND its category is enabled. */
   private applyVisibility(): void {
-    const focusSet = this.focusId ? this.cy.getElementById(this.focusId).closedNeighborhood() : null
+    const focusSet = this.focusId ? this.focusNeighbourhoodSet(this.focusId) : null
     const focusIds = focusSet ? new Set(focusSet.map((e) => e.id())) : null
 
     let deptIds: Set<string> | null = null
@@ -668,6 +942,11 @@ export class GraphView {
       this.cy.nodes().forEach((n) => {
         const model = n.data('model') as GraphNode | undefined
         if (!model) return // department container — visibility handled below
+        // An explicit "Hide" beats every filter, including an active focus.
+        if (this.manuallyHidden.has(n.id())) {
+          n.addClass('hidden')
+          return
+        }
         const byKind = this.visibleKinds.has(model.kind)
         let visible: boolean
         if (focusIds) visible = n.id() === this.focusId || (focusIds.has(n.id()) && byKind)
@@ -686,8 +965,14 @@ export class GraphView {
         })
       }
       this.cy.edges().forEach((e) => {
-        const visible = !e.source().hasClass('hidden') && !e.target().hasClass('hidden')
-        e.toggleClass('hidden', !visible)
+        const endpointsVisible =
+          !e.source().hasClass('hidden') && !e.target().hasClass('hidden')
+        // A per-route copy inherits the hidden state of the edge it split from.
+        const baseId = e.hasClass('route-split') ? String(e.id()).split('::route:')[0] : e.id()
+        const suppressed =
+          this.hiddenEdgeIds.has(baseId) || this.hiddenEdgeKinds.has(String(e.data('kind')))
+        // The collapsed edge stays hidden while its per-route copies stand in.
+        e.toggleClass('hidden', !endpointsVisible || suppressed || e.id() === this.splitEdgeId)
       })
       // Department boxes: hide any box left with no visible member.
       if (this.deptParentsActive) {
@@ -700,13 +985,24 @@ export class GraphView {
   }
 
   setTheme(theme: ThemeName): void {
-    this.cy.style(buildStyle(theme))
+    this.theme = theme
+    this.cy.style(buildStyle(theme, this.edgeOpacity))
+  }
+
+  /** Link opacity, 0 (invisible) to 1 (fully opaque). */
+  setEdgeMuting(opacity: number): void {
+    this.edgeOpacity = Math.min(1, Math.max(0, opacity))
+    this.cy.style(buildStyle(this.theme, this.edgeOpacity))
+  }
+
+  getEdgeMuting(): number {
+    return this.edgeOpacity
   }
 
   /** Dim everything except nodes of the given kind (null clears the highlight). */
   highlightKind(kind: NodeKind | null): void {
     if (!kind) {
-      this.cy.elements().removeClass('faded selected')
+      this.cy.elements().removeClass('faded selected dim lit')
       return
     }
     this.cy.elements().removeClass('selected')
@@ -729,9 +1025,11 @@ export class GraphView {
     if (start.empty() || !start.data('model')) return { sources: [], terminals: [] }
     const succ = start.successors()
     const pred = start.predecessors()
-    this.cy.elements().removeClass('selected')
+    this.cy.elements().removeClass('selected dim lit')
     this.cy.elements().not('.dept-parent').addClass('faded')
-    succ.union(pred).union(start).removeClass('faded')
+    const corridor = succ.union(pred).union(start)
+    corridor.removeClass('faded')
+    corridor.edges().addClass('lit')
     start.addClass('selected')
 
     const terminals: GraphNode[] = []
@@ -772,10 +1070,11 @@ export class GraphView {
 
   private highlightNeighbourhood(node: NodeSingular): void {
     const hood = node.closedNeighborhood()
-    this.cy.elements().removeClass('selected')
+    this.cy.elements().removeClass('selected dim lit')
     // Exclude the department boxes — see highlightKind for why.
     this.cy.elements().not('.dept-parent').addClass('faded')
     hood.removeClass('faded')
+    hood.edges().addClass('lit')
     node.addClass('selected')
   }
 
@@ -863,12 +1162,42 @@ function presenceDot(fill: string, ring: string): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
 }
 
-function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
+/** Blend a colour toward the canvas background. Lets a node be drawn fully
+ *  OPAQUE while looking exactly as it did when translucent — which matters
+ *  because a see-through node body let every edge behind it show straight
+ *  through, making dense areas unreadable. Opaque bodies occlude those edges
+ *  instead, so the node reads clearly where a link crosses it. */
+function blendToBackground(hex: string, bg: string, alpha: number): string {
+  const parse = (h: string): [number, number, number] => {
+    const s = h.replace('#', '')
+    const v = s.length === 3
+      ? s
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : s
+    return [parseInt(v.slice(0, 2), 16), parseInt(v.slice(2, 4), 16), parseInt(v.slice(4, 6), 16)]
+  }
+  const [r1, g1, b1] = parse(hex)
+  const [r2, g2, b2] = parse(bg)
+  const mix = (a: number, b: number): number => Math.round(a * alpha + b * (1 - alpha))
+  const hexPair = (n: number): string => n.toString(16).padStart(2, '0')
+  return `#${hexPair(mix(r1, r2))}${hexPair(mix(g1, g2))}${hexPair(mix(b1, b2))}`
+}
+
+function buildStyle(
+  theme: ThemeName,
+  edgeOpacity: number = DEFAULT_EDGE_OPACITY
+): cytoscape.StylesheetJson {
   const dark = theme === 'dark'
   const labelColor = dark ? '#e2e8f0' : '#0f172a'
   const edgeLabelColor = dark ? '#cbd5e1' : '#475569'
   const edgeLabelBg = dark ? '#0f172a' : '#ffffff'
   const borderColor = dark ? '#e2e8f0' : '#0f172a'
+  // Must match the canvas colour behind the graph (see the <main> background in
+  // app.ts) or the blended node fills won't look like the old translucent ones.
+  const canvasBg = dark ? '#020617' : '#f1f5f9'
+  const fillAlpha = dark ? 0.32 : 0.18
 
   const style: cytoscape.StylesheetJson = [
     {
@@ -897,12 +1226,32 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
         'curve-style': 'bezier',
         'target-arrow-shape': 'triangle',
         'arrow-scale': 0.9,
+        // Muted so a thicket of links reads as background structure and the nodes
+        // stay the foreground. Nodes are opaque, so links crossing one are hidden
+        // behind it entirely. Tunable in Settings.
+        opacity: edgeOpacity,
         label: 'data(label)',
         'font-size': 8,
         color: edgeLabelColor,
         'text-background-color': edgeLabelBg,
         'text-background-opacity': 0.85,
         'text-background-padding': '1px'
+      }
+    },
+    // The individual routes a collapsed "N routes" edge splits into on click.
+    // Bundled parallel edges get fanned apart so each label is readable, and are
+    // drawn heavier since they're the thing being inspected.
+    {
+      selector: 'edge.route-split',
+      style: {
+        'curve-style': 'bezier',
+        'control-point-step-size': 46,
+        width: 2,
+        opacity: 1,
+        'font-size': 9,
+        'text-background-opacity': 0.95,
+        'text-background-padding': '2px',
+        'z-index': 20
       }
     },
     // Department (Department layout) compound container boxes.
@@ -937,26 +1286,31 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
     style.push({
       selector: `node.${kind}`,
       style: {
-        'background-color': meta.color,
-        'background-opacity': dark ? 0.32 : 0.18,
+        // Pre-blended + fully opaque: same tint as before, but edges routed
+        // behind the node are hidden by it rather than showing through.
+        'background-color': blendToBackground(meta.color, canvasBg, fillAlpha),
+        'background-opacity': 1,
         'border-color': meta.color
       }
     })
   }
-  for (const [kind, color] of Object.entries(EDGE_COLOR)) {
+  for (const [kind, meta] of Object.entries(EDGE_KIND_META)) {
     style.push({
       selector: `edge.${kind}`,
-      style: { 'line-color': color, 'target-arrow-color': color }
+      style: { 'line-color': meta.color, 'target-arrow-color': meta.color }
     })
   }
 
   // --- Status flags (after the kind colours so they win the border) ---------
   style.push(
-    // Disabled extension: dimmed fill + dashed, faint border.
+    // Disabled extension: washed-out neutral fill + dashed, faint border. Kept
+    // opaque (a blended grey rather than a low opacity) so it still occludes the
+    // edges behind it.
     {
       selector: 'node.status-disabled',
       style: {
-        'background-opacity': dark ? 0.12 : 0.08,
+        'background-color': blendToBackground('#94a3b8', canvasBg, dark ? 0.16 : 0.1),
+        'background-opacity': 1,
         'border-style': 'dashed',
         'border-opacity': 0.5
       }
@@ -1007,7 +1361,18 @@ function buildStyle(theme: ThemeName): cytoscape.StylesheetJson {
   // --- Interaction states (LAST so they always win) -------------------------
   style.push(
     { selector: 'node.faded', style: { opacity: 0.12 } },
-    { selector: 'edge.faded', style: { opacity: 0.05 } },
+    // De-emphasised links are scaled RELATIVE to the configured link opacity.
+    // Fixed values broke at low settings: with links already at 30%, a flat 0.25
+    // "faded" was indistinguishable from a normal link, so a highlighted route
+    // didn't stand out at all.
+    { selector: 'edge.faded', style: { opacity: Math.max(0.03, edgeOpacity * 0.12) } },
+    // A gentler de-emphasis than `faded`, used for the outer rings of a focus
+    // view: still readable, but the focus node's own neighbourhood leads.
+    { selector: 'node.dim', style: { opacity: 0.5 } },
+    { selector: 'edge.dim', style: { opacity: Math.max(0.06, edgeOpacity * 0.3) } },
+    // The links being highlighted are always drawn at full strength, whatever the
+    // global opacity, so the corridor under inspection reads clearly.
+    { selector: 'edge.lit', style: { opacity: 1, width: 2.2 } },
     {
       selector: 'node.selected',
       style: {

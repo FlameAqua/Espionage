@@ -11,7 +11,13 @@ export class Minimap {
   private main: Core
   private host: HTMLElement
   private rect: HTMLElement
-  private onViewport = (): void => this.updateRect()
+  /** Last applied dot diameter, so viewport events only restyle when it actually
+   *  changes (pan/zoom/render fire constantly). */
+  private lastDotPx = 0
+  private onViewport = (): void => {
+    this.applyScale()
+    this.updateRect()
+  }
   private onLayout = (): void => this.sync()
   private dragging = false
   private onWinMove = (e: MouseEvent): void => {
@@ -89,16 +95,41 @@ export class Minimap {
     this.mini.resize()
     if (!this.mini.nodes().empty()) {
       this.mini.fit(undefined, 8)
-      // Node/edge sizes are in model units, so on a large graph the fit shrinks
-      // them to sub-pixel dots. Size them off the resulting zoom so they render
-      // at a fixed, visible on-screen diameter no matter how big the system is.
-      const z = this.mini.zoom() || 1
-      this.mini.batch(() => {
-        this.mini.nodes().style({ width: 7 / z, height: 7 / z })
-        this.mini.edges().style({ width: 1 / z })
-      })
+      this.lastDotPx = 0 // force a restyle for the new element set
+      this.applyScale()
     }
     this.updateRect()
+  }
+
+  /** Size the minimap's dots and links for legibility at the current view scale.
+   *
+   *  Two things fight each other: node/edge sizes are in model units, so fitting a
+   *  large graph shrinks them to sub-pixel specks; but drawing them big enough to
+   *  see turns a few hundred nodes into an unreadable blob. So the diameter is
+   *  derived from how much of the graph is currently on screen — zoomed right out
+   *  over a whole system the dots go small and the map stays legible, and as you
+   *  zoom into a corner they grow, because far fewer of them are in play. */
+  private applyScale(): void {
+    if (this.mini.nodes().empty()) return
+    const z = this.mini.zoom() || 1
+    const bb = this.mini.elements().boundingBox({})
+    const ext = this.main.extent()
+    // Fraction of the graph's extent the main viewport currently covers (1 = all).
+    const shown = clamp(
+      Math.max((ext.x2 - ext.x1) / Math.max(1, bb.w), (ext.y2 - ext.y1) / Math.max(1, bb.h)),
+      0,
+      1
+    )
+    // Denser graphs start smaller, then everything grows as you zoom in.
+    const count = this.mini.nodes().length
+    const base = count > 400 ? 3.5 : count > 150 ? 4.5 : 6
+    const dotPx = base + (1 - shown) * 4
+    if (Math.abs(dotPx - this.lastDotPx) < 0.25) return // avoid restyling every frame
+    this.lastDotPx = dotPx
+    this.mini.batch(() => {
+      this.mini.nodes().style({ width: dotPx / z, height: dotPx / z })
+      this.mini.edges().style({ width: Math.max(0.6, dotPx / 7) / z })
+    })
   }
 
   private updateRect(): void {

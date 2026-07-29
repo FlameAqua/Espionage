@@ -29,9 +29,13 @@ const api = {
     openWindow: (hash: string): Promise<void> => ipcRenderer.invoke('app:openWindow', hash),
     copy: (text: string): Promise<void> => ipcRenderer.invoke('app:copy', text),
     openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url),
-    saveSnapshot: (topology: Topology): Promise<SaveSnapshotResult> =>
-      ipcRenderer.invoke('app:saveSnapshot', topology),
-    openSnapshot: (): Promise<OpenSnapshotResult> => ipcRenderer.invoke('app:openSnapshot')
+    /** `defaultDir` pre-selects the folder configured in Settings. */
+    saveSnapshot: (topology: Topology, defaultDir?: string): Promise<SaveSnapshotResult> =>
+      ipcRenderer.invoke('app:saveSnapshot', topology, defaultDir),
+    openSnapshot: (): Promise<OpenSnapshotResult> => ipcRenderer.invoke('app:openSnapshot'),
+    /** Directory picker, used to set the default snapshot folder. */
+    chooseFolder: (title?: string): Promise<{ canceled?: boolean; path?: string }> =>
+      ipcRenderer.invoke('app:chooseFolder', title)
   },
   report: {
     /** Generate a historical call-activity report for a period, saving it to the

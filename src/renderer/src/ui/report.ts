@@ -22,6 +22,18 @@ import {
   parseInternational,
   pickParties
 } from '../../../shared/phone'
+import { getZoneLookup, zoneForNumber } from './zones'
+import {
+  defaultReportCustomize,
+  loadReportCustomize,
+  saveReportCustomize,
+  REPORT_SECTIONS,
+  type BreakdownChart,
+  type ChartStyle,
+  type GroupBy,
+  type ReportCustomize,
+  type SectionId
+} from './report-customize'
 
 const esc = (s: unknown): string =>
   String(s ?? '').replace(
@@ -63,7 +75,10 @@ function openOverlay(
 }
 
 /** Period picker → generate a historical report, then show it. */
-export function showReportSetup(nameFor: (ext: string) => string | undefined): void {
+export function showReportSetup(
+  nameFor: (ext: string) => string | undefined,
+  deptFor: (ext: string) => string | undefined
+): void {
   const { overlay, close } = openOverlay(
     `
     <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
@@ -110,14 +125,26 @@ export function showReportSetup(nameFor: (ext: string) => string | undefined): v
   const fromEl = overlay.querySelector<HTMLInputElement>('#fromDate')!
   const toEl = overlay.querySelector<HTMLInputElement>('#toDate')!
   const iso = (d: Date): string => d.toISOString().slice(0, 10)
+  const today = iso(new Date())
+  // Keep the two pickers consistent: "To" can't precede "From", neither can be in
+  // the future. Enforced via the inputs' own min/max (so the browser blocks bad
+  // picks) and re-validated on Generate as a backstop.
+  const syncDateBounds = (): void => {
+    fromEl.max = toEl.value || today
+    toEl.min = fromEl.value || ''
+    toEl.max = today
+  }
   const setRange = (days: number): void => {
     const to = new Date()
     const from = new Date()
     from.setDate(from.getDate() - days)
     fromEl.value = iso(from)
     toEl.value = iso(to)
+    syncDateBounds()
   }
   setRange(30)
+  fromEl.addEventListener('change', syncDateBounds)
+  toEl.addEventListener('change', syncDateBounds)
   overlay.querySelectorAll<HTMLElement>('#periodPresets [data-days]').forEach((b) => {
     b.addEventListener('click', () => setRange(Number(b.dataset.days)))
   })
@@ -133,6 +160,10 @@ export function showReportSetup(nameFor: (ext: string) => string | undefined): v
       flash('Pick a from and to date.', true)
       return
     }
+    if (fromEl.value > toEl.value) {
+      flash('“To” can’t be earlier than “From”.', true)
+      return
+    }
     const genBtn = overlay.querySelector<HTMLButtonElement>('#genBtn')!
     genBtn.disabled = true
     genBtn.textContent = 'Generating…'
@@ -142,29 +173,35 @@ export function showReportSetup(nameFor: (ext: string) => string | undefined): v
       flash(res.error, true)
       return
     }
-    if (res.report) showReport(res.report, nameFor)
+    if (res.report) showReport(res.report, nameFor, deptFor)
   })
 }
 
 /** Fetch + show a live active-calls report. */
-export async function showLiveReport(nameFor: (ext: string) => string | undefined): Promise<void> {
+export async function showLiveReport(
+  nameFor: (ext: string) => string | undefined,
+  deptFor: (ext: string) => string | undefined
+): Promise<void> {
   const res = await window.api.report.live()
   if (res.error && !res.report) {
     flash(res.error, true)
     return
   }
-  if (res.report) showReport(res.report, nameFor)
+  if (res.report) showReport(res.report, nameFor, deptFor)
 }
 
 /** Open a previously-saved report from disk and show it. */
-export async function openReport(nameFor: (ext: string) => string | undefined): Promise<void> {
+export async function openReport(
+  nameFor: (ext: string) => string | undefined,
+  deptFor: (ext: string) => string | undefined
+): Promise<void> {
   const res = await window.api.report.open()
   if (res.canceled) return
   if (res.error || !res.report) {
     flash(res.error ?? 'Could not open report.', true)
     return
   }
-  showReport(res.report, nameFor)
+  showReport(res.report, nameFor, deptFor)
 }
 
 // --- Classification ---------------------------------------------------------
@@ -182,6 +219,15 @@ interface ClassifiedCall {
   external?: string
   answered: boolean
   durationSec: number
+  /** Configured call zone the external number falls in (null = no zone). */
+  zone?: string
+  /** Tariff rate (EUR/min) when the number matched a tariff row. */
+  rate?: number
+  /** Tariff destination this call matched, e.g. "IRELAND · Mobile". Shown as each
+   *  zone's makeup so a zone total can be traced back to its destinations. */
+  destLabel?: string
+  /** Department the attributed extension belongs to (for multi-tenant grouping). */
+  dept?: string
 }
 
 interface Home {
@@ -198,7 +244,12 @@ function resolveHome(iso2: string): Home {
 /** Re-derive every call from the raw entries under the chosen home country. Done
  *  in the renderer (not read from the file) so the dropdowns can reclassify live
  *  and older saved reports without the enrichment fields still work. */
-function classify(report: CallReport, home: Home): ClassifiedCall[] {
+function classify(
+  report: CallReport,
+  home: Home,
+  deptFor: (ext: string) => string | undefined
+): ClassifiedCall[] {
+  const zoneLookup = getZoneLookup()
   return report.entries.map((e) => {
     // Prefer the classification the main process stored (it sees 3CX's separate
     // DN and caller-id fields); recompute from from/to only for older reports
@@ -213,6 +264,9 @@ function classify(report: CallReport, home: Home): ClassifiedCall[] {
     const sc = classifyScope(direction, intl, home.code, home.name)
     const start = e.startTime
     const hour = start && start.length >= 13 ? Number(start.slice(11, 13)) : undefined
+    // Zone (+ tariff rate) only applies to external calls with an outside party.
+    const zr =
+      direction === 'internal' ? null : zoneForNumber(external, home.code, zoneLookup)
     return {
       callId: e.callId,
       ts: start,
@@ -225,7 +279,12 @@ function classify(report: CallReport, home: Home): ClassifiedCall[] {
       extension,
       external,
       answered: !!e.answered,
-      durationSec: e.durationSec ?? 0
+      durationSec: e.durationSec ?? 0,
+      zone: zr?.zone ?? undefined,
+      rate: zr?.rate,
+      destLabel:
+        zr && zr.country ? `${cap(zr.country.toLowerCase())} · ${zr.lineType}` : undefined,
+      dept: extension ? deptFor(extension) : undefined
     }
   })
 }
@@ -261,27 +320,34 @@ function collapseToCalls(calls: ClassifiedCall[]): ClassifiedCall[] {
 
 // --- Report view ------------------------------------------------------------
 
-type GroupBy = 'extension' | 'day' | 'country' | 'trunk' | 'direction' | 'scope' | 'hour'
-
 interface ViewState {
   home: string // ISO2, '' = not set
   detail: 'call' | 'leg' // composite call vs per routing-leg
   direction: CallDirection | 'all'
   scope: CallScope | 'all'
   country: string // 'all' or a country label
+  department: string // 'all' or a department name
   status: 'all' | 'answered' | 'missed'
-  groupBy: GroupBy
   search: string
 }
 
 /** The classified calls at the chosen granularity (composite vs per-leg). */
-function callsFor(report: CallReport, state: ViewState, home: Home): ClassifiedCall[] {
-  const all = classify(report, home)
+function callsFor(
+  report: CallReport,
+  state: ViewState,
+  home: Home,
+  deptFor: (ext: string) => string | undefined
+): ClassifiedCall[] {
+  const all = classify(report, home, deptFor)
   return state.detail === 'call' ? collapseToCalls(all) : all
 }
 
 /** Render a report into an interactive modal. */
-export function showReport(report: CallReport, nameFor: (ext: string) => string | undefined): void {
+export function showReport(
+  report: CallReport,
+  nameFor: (ext: string) => string | undefined,
+  deptFor: (ext: string) => string | undefined
+): void {
   const title = report.live
     ? 'Live report — active calls'
     : `Report — ${fmtDate(report.from)} → ${fmtDate(report.to)}`
@@ -292,10 +358,11 @@ export function showReport(report: CallReport, nameFor: (ext: string) => string 
     direction: 'all',
     scope: 'all',
     country: 'all',
+    department: 'all',
     status: 'all',
-    groupBy: report.live ? 'extension' : 'day',
     search: ''
   }
+  let customize = loadReportCustomize()
 
   const { overlay, close } = openOverlay(`
     <div class="flex items-center justify-between gap-2 px-4 py-3 border-b border-slate-200 dark:border-slate-700 shrink-0">
@@ -312,11 +379,12 @@ export function showReport(report: CallReport, nameFor: (ext: string) => string 
             <button data-export="pdf" class="block w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700">Report → PDF</button>
           </div>
         </div>
+        <button id="customizeBtn" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs">Customise ⚙</button>
         <button id="saveReport" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs">Save</button>
         <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
       </div>
     </div>
-    ${controlsBar(report, state)}
+    <div id="controlsBar">${controlsBar(report, state, deptFor)}</div>
     <div id="reportBody" class="overflow-y-auto p-4 space-y-4"></div>`)
 
   overlay
@@ -340,7 +408,7 @@ export function showReport(report: CallReport, nameFor: (ext: string) => string 
   for (const item of exportMenu.querySelectorAll<HTMLButtonElement>('[data-export]')) {
     item.addEventListener('click', () => {
       exportMenu.classList.add('hidden')
-      void runExport(item.dataset.export as ExportKind, report, state, nameFor)
+      void runExport(item.dataset.export as ExportKind, report, state, nameFor, customize, deptFor)
     })
   }
 
@@ -348,12 +416,53 @@ export function showReport(report: CallReport, nameFor: (ext: string) => string 
 
   const rerender = (): void => {
     const home = resolveHome(state.home)
-    bodyEl.innerHTML = renderBody(report, callsFor(report, state, home), state, home, nameFor)
-    wireSearch(bodyEl, report, state, nameFor, home)
+    bodyEl.innerHTML = renderBody(
+      report,
+      callsFor(report, state, home, deptFor),
+      state,
+      home,
+      nameFor,
+      customize
+    )
+    wireSearch(bodyEl, report, state, nameFor, home, deptFor)
   }
 
-  // Dropdowns re-slice the whole view. The home selector also persists so the
-  // next report opens with the same baseline.
+  overlay.querySelector('#customizeBtn')!.addEventListener('click', () => {
+    showCustomizePanel(report, customize, (next) => {
+      customize = next
+      saveReportCustomize(customize)
+      rerender()
+    })
+  })
+
+  // Breakdown-chart controls live inside the report body (recreated each
+  // rerender), so drive them by delegation on the persistent body element.
+  bodyEl.addEventListener('change', (e) => {
+    const t = e.target as HTMLElement
+    const idx = t.getAttribute?.('data-chart-idx')
+    const fieldName = t.getAttribute?.('data-chart-field')
+    if (idx == null || !fieldName) return
+    const i = Number(idx)
+    if (!customize.charts[i]) return
+    customize.charts[i] = { ...customize.charts[i], [fieldName]: (t as HTMLSelectElement).value }
+    saveReportCustomize(customize)
+    rerender()
+  })
+  bodyEl.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>('[data-chart-add],[data-chart-remove]')
+    if (!b) return
+    if (b.hasAttribute('data-chart-add')) {
+      customize.charts.push({ groupBy: report.live ? 'extension' : 'day', style: 'bar' })
+    } else {
+      customize.charts.splice(Number(b.getAttribute('data-chart-remove')), 1)
+      if (!customize.charts.length) customize.charts.push({ groupBy: 'extension', style: 'bar' })
+    }
+    saveReportCustomize(customize)
+    rerender()
+  })
+
+  // Filter dropdowns re-slice the whole view. The home selector also persists so
+  // the next report opens with the same baseline.
   for (const sel of overlay.querySelectorAll<HTMLSelectElement>('[data-control]')) {
     sel.addEventListener('change', () => {
       const key = sel.dataset.control as keyof ViewState
@@ -365,32 +474,28 @@ export function showReport(report: CallReport, nameFor: (ext: string) => string 
         state.country = 'all'
       }
       rerender()
-      if (key === 'home' || key === 'detail') refreshCountryOptions(overlay, report, state)
+      if (key === 'home' || key === 'detail') refreshFilterOptions(overlay, report, state, deptFor)
     })
   }
 
   rerender()
 }
 
-/** The sticky row of dropdowns above the report body. */
-function controlsBar(report: CallReport, state: ViewState): string {
-  const groupOpts: Array<[GroupBy, string]> = [
-    ['extension', 'Extension'],
-    ['country', 'Country'],
-    ['trunk', 'Trunk'],
-    ['direction', 'Direction'],
-    ['scope', 'National / Intl'],
-    ['hour', 'Hour of day']
-  ]
-  if (!report.live) groupOpts.splice(1, 0, ['day', 'Day'])
+/** The sticky filter controls above the report body. The chart controls now live
+ *  inline with each breakdown chart, so this is purely filters. */
+function controlsBar(
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): string {
   return `
     <div class="shrink-0 flex flex-wrap items-end gap-x-3 gap-y-2 px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 text-xs">
       ${field('Home country', countrySelect('ctlHome', state.home, true, 'home'))}
       ${field(
         'Rows',
         select('ctlDetail', 'detail', state.detail, [
-          ['call', 'By call'],
-          ['leg', 'By leg (queue/IVR)']
+          ['call', 'One row per call'],
+          ['leg', 'Individual call steps']
         ])
       )}
       ${field(
@@ -411,7 +516,8 @@ function controlsBar(report: CallReport, state: ViewState): string {
           ['internal', 'Internal']
         ])
       )}
-      ${field('Country', countryFilterSelect(report, state))}
+      ${field('Department', departmentFilterSelect(report, state, deptFor))}
+      ${field('Country', countryFilterSelect(report, state, deptFor))}
       ${field(
         'Status',
         select('ctlStatus', 'status', state.status, [
@@ -420,7 +526,6 @@ function controlsBar(report: CallReport, state: ViewState): string {
           ['missed', 'Missed']
         ])
       )}
-      ${field('Chart by', select('ctlGroup', 'groupBy', state.groupBy, groupOpts))}
     </div>`
 }
 
@@ -429,6 +534,118 @@ function field(label: string, control: string): string {
     <span class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide">${esc(label)}</span>
     ${control}
   </label>`
+}
+
+/** The report customisation panel: toggle / reorder sections, pick each chart's
+ *  style, and choose whether the PDF export bundles every chart. Edits a working
+ *  copy; Apply hands it back. */
+function showCustomizePanel(
+  report: CallReport,
+  current: ReportCustomize,
+  onApply: (next: ReportCustomize) => void
+): void {
+  let working: ReportCustomize = JSON.parse(JSON.stringify(current))
+  const metaById = new Map(REPORT_SECTIONS.map((m) => [m.id, m]))
+
+  const { overlay, close } = openOverlay(
+    `
+    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700 shrink-0">
+      <div>
+        <h2 class="font-semibold text-slate-800 dark:text-slate-100">Customise report</h2>
+        <p class="text-[11px] text-slate-400">Show / hide sections, reorder them, and choose chart styles.</p>
+      </div>
+      <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
+    </div>
+    <div id="czBody" class="overflow-y-auto p-4 space-y-1.5"></div>
+    <div class="shrink-0 flex items-center justify-between gap-3 px-4 py-3 border-t border-slate-200 dark:border-slate-700">
+      <div class="flex flex-col gap-1.5">
+        <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input id="czAllCharts" type="checkbox" class="accent-sky-500" ${working.includeAllChartsInPdf ? 'checked' : ''} />
+          Include all charts in exported PDF (for customers)
+        </label>
+        <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input id="czZoneCost" type="checkbox" class="accent-sky-500" ${working.showZoneCost ? 'checked' : ''} />
+          Show estimated call cost (internal — hidden from customers by default)
+        </label>
+      </div>
+      <div class="flex gap-2 shrink-0">
+        <button id="czReset" class="${btn} bg-slate-500 hover:bg-slate-400">Reset</button>
+        <button id="czApply" class="${btn} bg-emerald-600 hover:bg-emerald-500">Apply</button>
+      </div>
+    </div>`,
+    'w-[560px]'
+  )
+  overlay.querySelectorAll<HTMLElement>('[data-close]').forEach((b) => b.addEventListener('click', close))
+
+  const bodyEl = overlay.querySelector<HTMLElement>('#czBody')!
+  const allChartsEl = overlay.querySelector<HTMLInputElement>('#czAllCharts')!
+  const zoneCostEl = overlay.querySelector<HTMLInputElement>('#czZoneCost')!
+
+  const render = (): void => {
+    bodyEl.innerHTML = working.sections
+      .map((s, i) => {
+        const meta = metaById.get(s.id)
+        if (!meta) return ''
+        const naLive = meta.historicalOnly && report.live
+        const styleCtl =
+          meta.styles && meta.styles.length
+            ? `<select data-style="${s.id}" class="${selCls} py-0.5">${meta.styles
+                .map(
+                  (st) =>
+                    `<option value="${st}"${(working.styles[s.id] ?? meta.styles![0]) === st ? ' selected' : ''}>${cap(st)}</option>`
+                )
+                .join('')}</select>`
+            : ''
+        return `<div class="flex items-center gap-2 rounded border border-slate-200 dark:border-slate-700 px-2 py-1.5">
+          <input type="checkbox" data-vis="${i}" class="accent-sky-500" ${s.visible ? 'checked' : ''} ${naLive ? 'disabled' : ''} />
+          <span class="flex-1 text-sm ${naLive ? 'text-slate-400 line-through' : ''}">${esc(meta.label)}${naLive ? ' (historical only)' : ''}</span>
+          ${styleCtl}
+          <button data-up="${i}" class="w-6 h-6 rounded hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 disabled:opacity-30" ${i === 0 ? 'disabled' : ''} title="Move up">↑</button>
+          <button data-down="${i}" class="w-6 h-6 rounded hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 disabled:opacity-30" ${i === working.sections.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
+        </div>`
+      })
+      .join('')
+    wire()
+  }
+
+  const wire = (): void => {
+    for (const el of bodyEl.querySelectorAll<HTMLInputElement>('[data-vis]')) {
+      el.addEventListener('change', () => {
+        working.sections[Number(el.dataset.vis)].visible = el.checked
+      })
+    }
+    for (const el of bodyEl.querySelectorAll<HTMLSelectElement>('[data-style]')) {
+      el.addEventListener('change', () => {
+        working.styles[el.dataset.style as SectionId] = el.value as ChartStyle
+      })
+    }
+    const move = (i: number, dir: -1 | 1): void => {
+      const j = i + dir
+      if (j < 0 || j >= working.sections.length) return
+      const arr = working.sections
+      ;[arr[i], arr[j]] = [arr[j], arr[i]]
+      render()
+    }
+    for (const el of bodyEl.querySelectorAll<HTMLElement>('[data-up]'))
+      el.addEventListener('click', () => move(Number(el.dataset.up), -1))
+    for (const el of bodyEl.querySelectorAll<HTMLElement>('[data-down]'))
+      el.addEventListener('click', () => move(Number(el.dataset.down), 1))
+  }
+
+  overlay.querySelector('#czReset')!.addEventListener('click', () => {
+    working = defaultReportCustomize()
+    allChartsEl.checked = working.includeAllChartsInPdf
+    zoneCostEl.checked = working.showZoneCost
+    render()
+  })
+  overlay.querySelector('#czApply')!.addEventListener('click', () => {
+    working.includeAllChartsInPdf = allChartsEl.checked
+    working.showZoneCost = zoneCostEl.checked
+    onApply(working)
+    close()
+  })
+
+  render()
 }
 
 const selCls =
@@ -461,10 +678,14 @@ function countrySelect(id: string, value: string, includeNone: boolean, control?
 
 /** Options for the Country *filter* — only the countries present in this report
  *  under the current home country, most-frequent first. */
-function countryFilterOptions(report: CallReport, state: ViewState): string {
+function countryFilterOptions(
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): string {
   const home = resolveHome(state.home)
   const counts = new Map<string, number>()
-  for (const c of callsFor(report, state, home))
+  for (const c of callsFor(report, state, home, deptFor))
     counts.set(c.country, (counts.get(c.country) ?? 0) + 1)
   const options: Array<[string, string]> = [['all', 'All']]
   for (const [country, n] of [...counts.entries()].sort((a, b) => b[1] - a[1]))
@@ -477,15 +698,56 @@ function countryFilterOptions(report: CallReport, state: ViewState): string {
     .join('')
 }
 
-function countryFilterSelect(report: CallReport, state: ViewState): string {
-  return `<select id="ctlCountry" data-control="country" class="${selCls} max-w-[200px]">${countryFilterOptions(report, state)}</select>`
+function countryFilterSelect(
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): string {
+  return `<select id="ctlCountry" data-control="country" class="${selCls} max-w-[200px]">${countryFilterOptions(report, state, deptFor)}</select>`
 }
 
-/** After the home country changes, swap the Country dropdown's options in place
- *  (keeping the element, so its change listener survives). */
-function refreshCountryOptions(overlay: HTMLElement, report: CallReport, state: ViewState): void {
-  const sel = overlay.querySelector<HTMLSelectElement>('#ctlCountry')
-  if (sel) sel.innerHTML = countryFilterOptions(report, state)
+/** Options for the Department *filter* — the departments present in this report
+ *  (for separating multi-tenant customers), most-active first. */
+function departmentFilterOptions(
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): string {
+  const home = resolveHome(state.home)
+  const counts = new Map<string, number>()
+  for (const c of callsFor(report, state, home, deptFor))
+    if (c.dept) counts.set(c.dept, (counts.get(c.dept) ?? 0) + 1)
+  const options: Array<[string, string]> = [['all', 'All departments']]
+  for (const [dept, n] of [...counts.entries()].sort((a, b) => b[1] - a[1]))
+    options.push([dept, `${dept} (${n})`])
+  return options
+    .map(
+      ([v, l]) =>
+        `<option value="${esc(v)}"${v === state.department ? ' selected' : ''}>${esc(l)}</option>`
+    )
+    .join('')
+}
+
+function departmentFilterSelect(
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): string {
+  return `<select id="ctlDepartment" data-control="department" class="${selCls} max-w-[200px]">${departmentFilterOptions(report, state, deptFor)}</select>`
+}
+
+/** After home/granularity changes, swap the Country + Department dropdown options
+ *  in place (keeping the elements, so their change listeners survive). */
+function refreshFilterOptions(
+  overlay: HTMLElement,
+  report: CallReport,
+  state: ViewState,
+  deptFor: (ext: string) => string | undefined
+): void {
+  const country = overlay.querySelector<HTMLSelectElement>('#ctlCountry')
+  if (country) country.innerHTML = countryFilterOptions(report, state, deptFor)
+  const dept = overlay.querySelector<HTMLSelectElement>('#ctlDepartment')
+  if (dept) dept.innerHTML = departmentFilterOptions(report, state, deptFor)
 }
 
 /** Apply the active dropdown filters (everything except the free-text search). */
@@ -494,6 +756,7 @@ function applyFilters(calls: ClassifiedCall[], state: ViewState): ClassifiedCall
     if (state.direction !== 'all' && c.direction !== state.direction) return false
     if (state.scope !== 'all' && c.scope !== state.scope) return false
     if (state.country !== 'all' && c.country !== state.country) return false
+    if (state.department !== 'all' && c.dept !== state.department) return false
     if (state.status === 'answered' && !c.answered) return false
     if (state.status === 'missed' && c.answered) return false
     return true
@@ -505,18 +768,80 @@ function renderBody(
   all: ClassifiedCall[],
   state: ViewState,
   home: Home,
-  nameFor: (ext: string) => string | undefined
+  nameFor: (ext: string) => string | undefined,
+  customize: ReportCustomize
 ): string {
   const calls = applyFilters(all, state)
-  const t = totals(calls)
   const homeNote = home.iso2
     ? ''
     : `<div class="px-3 py-2 rounded bg-sky-50 text-sky-700 dark:bg-sky-900/30 dark:text-sky-200 text-xs">Pick a <strong>home country</strong> above to split calls into national vs international.</div>`
 
-  return `
-    ${report.error ? `<div class="px-3 py-2 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-xs">${esc(report.error)}</div>` : ''}
-    ${homeNote}
-    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+  const parts: string[] = [
+    report.error
+      ? `<div class="px-3 py-2 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-xs">${esc(report.error)}</div>`
+      : '',
+    homeNote
+  ]
+  for (const s of customize.sections) {
+    if (!s.visible) continue
+    parts.push(renderSection(s.id, report, calls, state, nameFor, customize))
+  }
+  return parts.join('')
+}
+
+/** A titled report section wrapper (empty string collapses the section). */
+function sectionBlock(title: string, inner: string): string {
+  return `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">${esc(title)}</h3>${inner}</div>`
+}
+
+function renderSection(
+  id: SectionId,
+  report: CallReport,
+  calls: ClassifiedCall[],
+  state: ViewState,
+  nameFor: (ext: string) => string | undefined,
+  customize: ReportCustomize
+): string {
+  switch (id) {
+    case 'summary':
+      return summaryTiles(totals(calls))
+    case 'mainChart':
+      return breakdownSection(calls, customize.charts, nameFor, report.live)
+    case 'callTime':
+      return sectionBlock(
+        'Call time — national vs international',
+        callTimeSection(totals(calls), customize.styles.callTime ?? 'donut')
+      )
+    case 'perDay':
+      return report.live
+        ? ''
+        : sectionBlock('Calls per day — inbound vs outbound', stackedDayChart(calls))
+    case 'zones':
+      return zonesSection(calls, customize.styles.zones ?? 'bar', customize.showZoneCost)
+    case 'departments':
+      return departmentsSection(calls)
+    case 'countries':
+      return sectionBlock('Top countries', countryTable(calls))
+    case 'trunks':
+      return calls.some((c) => c.trunk) ? sectionBlock('By trunk', trunkTable(calls)) : ''
+    case 'extensions':
+      return `
+    <div>
+      <div class="flex items-center justify-between mb-1.5 gap-2">
+        <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Per-extension activity</h3>
+        <input id="extFilter" type="text" value="${esc(state.search)}" placeholder="Find extension…" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs w-48" />
+      </div>
+      <div id="extTableWrap" class="overflow-x-auto">${extTable(perExtension(calls, report.perExtension, state.search, nameFor), nameFor)}</div>
+    </div>`
+    default:
+      return ''
+  }
+}
+
+function summaryTiles(t: Totals): string {
+  return sectionBlock(
+    'General statistics',
+    `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
       ${tile('Calls', String(t.calls))}
       ${tile('Answered', String(t.answered))}
       ${tile('Missed', String(t.missed))}
@@ -527,32 +852,214 @@ function renderBody(
       ${tile('International', String(t.international))}
       ${tile('Active exts', String(t.activeExts))}
       ${tile('Talk time', fmtDuration(t.talkSec))}
-    </div>
-    <div>
-      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Breakdown by ${esc(groupLabel(state.groupBy))}</h3>
-      ${mainChart(calls, state.groupBy, nameFor)}
-    </div>
-    ${
-      !report.live
-        ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Calls per day — inbound vs outbound</h3>${stackedDayChart(calls)}</div>`
-        : ''
-    }
-    <div>
-      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Top countries</h3>
-      ${countryTable(calls)}
-    </div>
-    ${
-      calls.some((c) => c.trunk)
-        ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">By trunk</h3>${trunkTable(calls)}</div>`
-        : ''
-    }
-    <div>
-      <div class="flex items-center justify-between mb-1.5 gap-2">
-        <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Per-extension activity</h3>
-        <input id="extFilter" type="text" value="${esc(state.search)}" placeholder="Find extension…" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs w-48" />
-      </div>
-      <div id="extTableWrap" class="overflow-x-auto">${extTable(perExtension(calls, report.perExtension, state.search, nameFor), nameFor)}</div>
     </div>`
+  )
+}
+
+/** The breakdown section: a user-managed list of charts, each with its own
+ *  group-by + style dropdowns inline to the right, plus an "add chart" button.
+ *  The controls are wired by delegation in showReport (data-chart-* attributes). */
+function breakdownSection(
+  calls: ClassifiedCall[],
+  charts: BreakdownChart[],
+  nameFor: (ext: string) => string | undefined,
+  live: boolean
+): string {
+  const groupOpts: Array<[GroupBy, string]> = [
+    ['extension', 'Extension'],
+    ...(live ? [] : ([['day', 'Day']] as Array<[GroupBy, string]>)),
+    ['department', 'Department'],
+    ['country', 'Country'],
+    ['trunk', 'Trunk'],
+    ['direction', 'Direction'],
+    ['scope', 'National / Intl'],
+    ['hour', 'Hour of day']
+  ]
+  const styleOpts: Array<[ChartStyle, string]> = [
+    ['bar', 'Bars'],
+    ['pie', 'Pie'],
+    ['donut', 'Donut']
+  ]
+  const opt = <T extends string>(pairs: Array<[T, string]>, selected: T): string =>
+    pairs
+      .map(([v, l]) => `<option value="${v}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`)
+      .join('')
+  const cards = charts
+    .map((c, i) => {
+      // 'day' is meaningless in a live snapshot — fall back to extension.
+      const gb: GroupBy = live && c.groupBy === 'day' ? 'extension' : c.groupBy
+      const gSel = `<select data-chart-idx="${i}" data-chart-field="groupBy" class="${selCls} py-0.5">${opt(groupOpts, gb)}</select>`
+      const sSel = `<select data-chart-idx="${i}" data-chart-field="style" class="${selCls} py-0.5">${opt(styleOpts, c.style)}</select>`
+      const remove =
+        charts.length > 1
+          ? `<button data-chart-remove="${i}" class="w-6 h-6 rounded hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400" title="Remove chart">✕</button>`
+          : ''
+      return `<div class="rounded-lg border border-slate-200 dark:border-slate-700 p-2.5">
+        <div class="flex items-center gap-2 mb-2 flex-wrap">
+          <h4 class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide flex-1 min-w-[8rem]">Breakdown by ${esc(groupLabel(gb))}</h4>
+          <span class="text-[10px] text-slate-400 uppercase tracking-wide">Chart by</span>${gSel}${sSel}${remove}
+        </div>
+        ${mainChart(calls, gb, nameFor, c.style)}
+      </div>`
+    })
+    .join('')
+  const add = `<button data-chart-add class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-xs text-slate-600 dark:text-slate-200">+ Add breakdown chart</button>`
+  return sectionBlock('Breakdown charts', `<div class="space-y-3">${cards}</div><div class="mt-2">${add}</div>`)
+}
+
+/** Per-department rollup — for multi-tenant systems where each customer is a
+ *  department. */
+function departmentsSection(calls: ClassifiedCall[]): string {
+  const rows = groupAgg(
+    calls.filter((c) => c.dept),
+    (c) => c.dept as string
+  )
+  if (!rows.length)
+    return sectionBlock('By department', emptyNote('No department data for these calls.'))
+  const body = rows
+    .map(
+      (r) => `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+        <td class="py-1 pr-2 truncate max-w-[220px]">${esc(r.key)}</td>
+        <td class="py-1 pr-2 text-right tabular-nums">${r.calls}</td>
+        <td class="py-1 pr-2 text-right tabular-nums">${r.inbound}</td>
+        <td class="py-1 pr-2 text-right tabular-nums">${r.outbound}</td>
+        <td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(r.talkSec)}</td>
+      </tr>`
+    )
+    .join('')
+  const table = `<table class="w-full text-[11px]">
+    <thead><tr class="text-left text-slate-400">
+      <th class="pr-2 font-medium">Department</th>
+      <th class="pr-2 font-medium text-right">Calls</th>
+      <th class="pr-2 font-medium text-right">In</th>
+      <th class="pr-2 font-medium text-right">Out</th>
+      <th class="pr-2 font-medium text-right">Talk</th>
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table>`
+  return sectionBlock('By department', table)
+}
+
+/** National vs international (vs internal) split — by call count AND talk time,
+ *  the latter being the headline the report previously lacked. */
+function callTimeSection(t: Totals, style: ChartStyle): string {
+  const segs: Segment[] = [
+    {
+      label: 'National',
+      value: t.nationalSec,
+      color: '#10b981',
+      display: fmtDuration(t.nationalSec)
+    },
+    {
+      label: 'International',
+      value: t.internationalSec,
+      color: '#8b5cf6',
+      display: fmtDuration(t.internationalSec)
+    },
+    {
+      label: 'Internal',
+      value: t.internalSec,
+      color: '#94a3b8',
+      display: fmtDuration(t.internalSec)
+    }
+  ]
+  const tiles = `<div class="grid grid-cols-3 gap-2 mb-3">
+      ${tile('National time', fmtDuration(t.nationalSec))}
+      ${tile('International time', fmtDuration(t.internationalSec))}
+      ${tile('Internal time', fmtDuration(t.internalSec))}
+    </div>`
+  const chart = shareChart(segs, style)
+  return tiles + chart
+}
+
+interface ZoneAgg {
+  zone: string
+  calls: number
+  talkSec: number
+  cost: number
+  hasRate: boolean
+  /** Call count per matched tariff destination, so the row can show its makeup. */
+  dests: Map<string, number>
+}
+
+/** Aggregate external calls by their configured zone (+ an "Unzoned" catch-all),
+ *  with talk time and an estimated tariff cost. */
+function zoneAggregate(calls: ClassifiedCall[]): ZoneAgg[] {
+  const map = new Map<string, ZoneAgg>()
+  for (const c of calls) {
+    if (c.direction === 'internal') continue
+    const zone = c.zone ?? 'Unzoned'
+    let r = map.get(zone)
+    if (!r) {
+      r = { zone, calls: 0, talkSec: 0, cost: 0, hasRate: false, dests: new Map() }
+      map.set(zone, r)
+    }
+    r.calls++
+    r.talkSec += c.durationSec
+    const dest = c.destLabel ?? 'Unmatched number'
+    r.dests.set(dest, (r.dests.get(dest) ?? 0) + 1)
+    if (c.rate != null) {
+      r.cost += c.rate * (c.durationSec / 60)
+      r.hasRate = true
+    }
+  }
+  return [...map.values()].sort((a, b) => {
+    // Real zones first (alpha), "Unzoned" always last.
+    if (a.zone === 'Unzoned') return 1
+    if (b.zone === 'Unzoned') return -1
+    return a.zone.localeCompare(b.zone, undefined, { numeric: true })
+  })
+}
+
+function zonesSection(calls: ClassifiedCall[], style: ChartStyle, showCost: boolean): string {
+  const rows = zoneAggregate(calls)
+  if (!rows.length)
+    return sectionBlock('Call zones', emptyNote('No external calls to place into zones.'))
+  // Cost is internal-only; only surface it when explicitly enabled.
+  const anyRate = showCost && rows.some((r) => r.hasRate)
+  const zonePalette = ['#0ea5e9', '#10b981', '#8b5cf6', '#f59e0b', '#ec4899', '#14b8a6', '#ef4444']
+  const segs: Segment[] = rows
+    .filter((r) => r.zone !== 'Unzoned')
+    .map((r, i) => ({
+      label: r.zone,
+      value: r.talkSec,
+      color: zonePalette[i % zonePalette.length],
+      display: fmtDuration(r.talkSec)
+    }))
+  const chart = segs.length ? shareChart(segs, style) : ''
+  // The top destinations behind each zone total, so a surprising number (e.g.
+  // "why is most of Ireland in Zone 2?") can be traced without guesswork.
+  const makeup = (r: ZoneAgg): string =>
+    [...r.dests.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([d, n]) => `${d} (${n})`)
+      .join(', ')
+  const body = rows
+    .map(
+      (r) => `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+        <td class="py-1 pr-2 whitespace-nowrap">${esc(r.zone)}</td>
+        <td class="py-1 pr-2 text-slate-500 dark:text-slate-400">${esc(makeup(r))}</td>
+        <td class="py-1 pr-2 text-right tabular-nums">${r.calls}</td>
+        <td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(r.talkSec)}</td>
+        ${anyRate ? `<td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${r.hasRate ? `€${r.cost.toFixed(2)}` : '—'}</td>` : ''}
+      </tr>`
+    )
+    .join('')
+  const table = `<div class="mt-4 overflow-x-auto"><table class="w-full text-[11px]">
+    <thead><tr class="text-left text-slate-400">
+      <th class="pr-2 pb-1 font-medium">Zone</th>
+      <th class="pr-2 pb-1 font-medium">Top destinations</th>
+      <th class="pr-2 pb-1 font-medium text-right">Calls</th>
+      <th class="pr-2 pb-1 font-medium text-right">Talk</th>
+      ${anyRate ? '<th class="pr-2 pb-1 font-medium text-right">Est. cost</th>' : ''}
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table></div>`
+  const note = anyRate
+    ? '<p class="text-[10px] text-slate-400 mt-1">Estimated cost from the bundled tariff (EUR/min) — indicative only.</p>'
+    : ''
+  return sectionBlock('Call zones', chart + table + note)
 }
 
 /** Re-attach the search box + live-filter the per-extension table only, so the
@@ -562,14 +1069,15 @@ function wireSearch(
   report: CallReport,
   state: ViewState,
   nameFor: (ext: string) => string | undefined,
-  home: Home
+  home: Home,
+  deptFor: (ext: string) => string | undefined
 ): void {
   const filterEl = bodyEl.querySelector<HTMLInputElement>('#extFilter')
   const wrap = bodyEl.querySelector<HTMLElement>('#extTableWrap')
   if (!filterEl || !wrap) return
   filterEl.addEventListener('input', () => {
     state.search = filterEl.value
-    const calls = applyFilters(callsFor(report, state, home), state)
+    const calls = applyFilters(callsFor(report, state, home, deptFor), state)
     wrap.innerHTML = extTable(
       perExtension(calls, report.perExtension, state.search, nameFor),
       nameFor
@@ -585,10 +1093,12 @@ async function runExport(
   kind: ExportKind,
   report: CallReport,
   state: ViewState,
-  nameFor: (ext: string) => string | undefined
+  nameFor: (ext: string) => string | undefined,
+  customize: ReportCustomize,
+  deptFor: (ext: string) => string | undefined
 ): Promise<void> {
   const home = resolveHome(state.home)
-  const calls = applyFilters(callsFor(report, state, home), state)
+  const calls = applyFilters(callsFor(report, state, home, deptFor), state)
   const base = exportBaseName(report)
   let res: { canceled?: boolean; path?: string; error?: string }
   if (kind === 'calls-csv') {
@@ -599,7 +1109,7 @@ async function runExport(
   } else {
     res = await window.api.report.exportPdf(
       `${base}.pdf`,
-      buildPrintHtml(report, calls, state, home, nameFor)
+      buildPrintHtml(report, calls, state, home, nameFor, customize)
     )
   }
   if (res?.canceled) return
@@ -693,19 +1203,36 @@ function filtersSummary(state: ViewState, home: Home): string {
     `Rows: ${state.detail === 'call' ? 'by call' : 'by leg'}`,
     `Direction: ${state.direction}`,
     `Scope: ${state.scope}`,
+    `Department: ${state.department}`,
     `Country: ${state.country}`,
     `Status: ${state.status}`
   ].join('  ·  ')
 }
 
+/** Coloured bars for the PDF (inline-styled so they print). */
+function pdfBars(segs: Segment[]): string {
+  const max = Math.max(1, ...segs.map((s) => s.value))
+  return segs
+    .map(
+      (s) =>
+        `<div class="bar"><div class="lab">${esc(s.label)}</div><div class="track"><div class="fill" style="width:${Math.round(
+          (s.value / max) * 100
+        )}%;background:${s.color}"></div></div><div class="val">${esc(s.display ?? String(s.value))}</div></div>`
+    )
+    .join('')
+}
+
 /** A self-contained, inline-styled HTML document rendered to PDF by the main
- *  process. Kept independent of the app's Tailwind styles. */
+ *  process. Kept independent of the app's Tailwind styles. Sections honour the
+ *  report customisation: the on-screen order/visibility, with every chart
+ *  force-included when "include all charts" is set (for customer-facing PDFs). */
 function buildPrintHtml(
   report: CallReport,
   calls: ClassifiedCall[],
   state: ViewState,
   home: Home,
-  nameFor: (ext: string) => string | undefined
+  nameFor: (ext: string) => string | undefined,
+  customize: ReportCustomize
 ): string {
   const t = totals(calls)
   const title = report.live
@@ -714,61 +1241,138 @@ function buildPrintHtml(
   const kpi = (label: string, value: string): string =>
     `<div class="kpi"><div class="v">${esc(value)}</div><div class="l">${esc(label)}</div></div>`
 
-  const bars = groupCounts(calls, state.groupBy, nameFor)
-    .filter((b) => b.value > 0)
-    .slice(0, 14)
-  const barMax = Math.max(1, ...bars.map((b) => b.value))
-  const barsHtml = bars
-    .map(
-      (b) =>
-        `<div class="bar"><div class="lab">${esc(b.label)}</div><div class="track"><div class="fill" style="width:${Math.round((b.value / barMax) * 100)}%"></div></div><div class="val">${b.value}</div></div>`
-    )
-    .join('')
+  const visible = new Map(customize.sections.map((s) => [s.id, s.visible]))
+  const chartSections = new Set<SectionId>(['mainChart', 'callTime', 'zones', 'perDay'])
+  const want = (id: SectionId): boolean =>
+    (visible.get(id) ?? true) || (customize.includeAllChartsInPdf && chartSections.has(id))
 
-  const extRows = perExtension(calls, report.perExtension, '', nameFor)
-  const extTableHtml = pdfTable(
-    ['Ext', 'Name', 'In', 'Out', 'Nat', 'Intl', 'Ans', 'Miss', 'Talk'],
-    [false, false, true, true, true, true, true, true, true],
-    extRows.map((a) => [
-      a.extension,
-      nameFor(a.extension) ?? '',
-      a.inbound,
-      a.outbound,
-      a.national,
-      a.international,
-      a.answered,
-      a.missed,
-      fmtDuration(a.talkSec)
-    ])
-  )
+  const sectionHtml = (id: SectionId): string => {
+    switch (id) {
+      case 'summary':
+        return `<div class="kpis">
+          ${kpi('Calls', String(t.calls))}${kpi('Answered', String(t.answered))}${kpi('Missed', String(t.missed))}
+          ${kpi('Inbound', String(t.inbound))}${kpi('Outbound', String(t.outbound))}${kpi('Internal', String(t.internal))}
+          ${kpi('National', String(t.national))}${kpi('International', String(t.international))}${kpi('Talk time', fmtDuration(t.talkSec))}
+        </div>`
+      case 'mainChart':
+        return customize.charts
+          .map((c) => {
+            const gb: GroupBy = report.live && c.groupBy === 'day' ? 'extension' : c.groupBy
+            const bars = groupCounts(calls, gb, nameFor)
+              .filter((b) => b.value > 0)
+              .slice(0, 14)
+            const segs: Segment[] = bars.map((b) => ({
+              label: b.label,
+              value: b.value,
+              color: '#0ea5e9',
+              display: String(b.value)
+            }))
+            return `<h2>Breakdown by ${esc(groupLabel(gb))}</h2>${
+              segs.length ? pdfBars(segs) : '<p class="sub">No calls match the current filters.</p>'
+            }`
+          })
+          .join('')
+      case 'callTime': {
+        const segs: Segment[] = [
+          { label: 'National', value: t.nationalSec, color: '#10b981', display: fmtDuration(t.nationalSec) },
+          { label: 'International', value: t.internationalSec, color: '#8b5cf6', display: fmtDuration(t.internationalSec) },
+          { label: 'Internal', value: t.internalSec, color: '#94a3b8', display: fmtDuration(t.internalSec) }
+        ]
+        return `<h2>Call time — national vs international</h2>
+          <div class="kpis">${kpi('National time', fmtDuration(t.nationalSec))}${kpi('International time', fmtDuration(t.internationalSec))}${kpi('Internal time', fmtDuration(t.internalSec))}</div>
+          <div style="margin-top:6px">${pdfBars(segs.filter((s) => s.value > 0))}</div>`
+      }
+      case 'perDay':
+        return report.live ? '' : `<h2>Calls per day — inbound vs outbound</h2>${pdfDayChart(calls)}`
+      case 'zones': {
+        const rows = zoneAggregate(calls)
+        if (!rows.length) return ''
+        const anyRate = customize.showZoneCost && rows.some((r) => r.hasRate)
+        const table = pdfTable(
+          anyRate ? ['Zone', 'Calls', 'Talk', 'Est. cost'] : ['Zone', 'Calls', 'Talk'],
+          anyRate ? [false, true, true, true] : [false, true, true],
+          rows.map((r) =>
+            anyRate
+              ? [r.zone, r.calls, fmtDuration(r.talkSec), r.hasRate ? `€${r.cost.toFixed(2)}` : '—']
+              : [r.zone, r.calls, fmtDuration(r.talkSec)]
+          )
+        )
+        const palette = ['#0ea5e9', '#10b981', '#8b5cf6', '#f59e0b', '#ec4899', '#14b8a6', '#ef4444']
+        const segs: Segment[] = rows
+          .filter((r) => r.zone !== 'Unzoned')
+          .map((r, i) => ({
+            label: r.zone,
+            value: r.talkSec,
+            color: palette[i % palette.length],
+            display: fmtDuration(r.talkSec)
+          }))
+        return `<h2>Call zones</h2>${segs.length ? pdfBars(segs) : ''}${table}`
+      }
+      case 'departments': {
+        const deptAgg = groupAgg(
+          calls.filter((c) => c.dept),
+          (c) => c.dept as string
+        )
+        return deptAgg.length
+          ? `<h2>By department</h2>${pdfTable(
+              ['Department', 'Calls', 'In', 'Out', 'Talk'],
+              [false, true, true, true, true],
+              deptAgg.map((r) => [r.key, r.calls, r.inbound, r.outbound, fmtDuration(r.talkSec)])
+            )}`
+          : ''
+      }
+      case 'countries':
+        return `<h2>Top countries</h2>${pdfTable(
+          ['Country', 'Calls', 'In', 'Out', 'Talk'],
+          [false, true, true, true, true],
+          groupAgg(calls, (c) => c.country).map((r) => [
+            r.key,
+            r.calls,
+            r.inbound,
+            r.outbound,
+            fmtDuration(r.talkSec)
+          ])
+        )}`
+      case 'trunks': {
+        const trunkAgg = groupAgg(
+          calls.filter((c) => c.trunk),
+          (c) => c.trunk as string
+        )
+        return trunkAgg.length
+          ? `<h2>By trunk</h2>${pdfTable(
+              ['Trunk', 'Calls', 'In', 'Out', 'Talk'],
+              [false, true, true, true, true],
+              trunkAgg.map((r) => [r.key, r.calls, r.inbound, r.outbound, fmtDuration(r.talkSec)])
+            )}`
+          : ''
+      }
+      case 'extensions': {
+        const extRows = perExtension(calls, report.perExtension, '', nameFor)
+        return `<h2>Per-extension activity</h2>${pdfTable(
+          ['Ext', 'Name', 'In', 'Out', 'Nat', 'Intl', 'Ans', 'Miss', 'Talk'],
+          [false, false, true, true, true, true, true, true, true],
+          extRows.map((a) => [
+            a.extension,
+            nameFor(a.extension) ?? '',
+            a.inbound,
+            a.outbound,
+            a.national,
+            a.international,
+            a.answered,
+            a.missed,
+            fmtDuration(a.talkSec)
+          ])
+        )}`
+      }
+      default:
+        return ''
+    }
+  }
 
-  const countryHtml = pdfTable(
-    ['Country', 'Calls', 'In', 'Out', 'Talk'],
-    [false, true, true, true, true],
-    groupAgg(calls, (c) => c.country).map((r) => [
-      r.key,
-      r.calls,
-      r.inbound,
-      r.outbound,
-      fmtDuration(r.talkSec)
-    ])
-  )
-
-  const trunkAgg = groupAgg(
-    calls.filter((c) => c.trunk),
-    (c) => c.trunk as string
-  )
-  const trunkHtml = trunkAgg.length
-    ? `<h2>By trunk</h2>${pdfTable(
-        ['Trunk', 'Calls', 'In', 'Out', 'Talk'],
-        [false, true, true, true, true],
-        trunkAgg.map((r) => [r.key, r.calls, r.inbound, r.outbound, fmtDuration(r.talkSec)])
-      )}`
-    : ''
-
-  const dayChart = report.live
-    ? ''
-    : `<h2>Calls per day — inbound vs outbound</h2>${pdfDayChart(calls)}`
+  const body = customize.sections
+    .filter((s) => want(s.id))
+    .map((s) => sectionHtml(s.id))
+    .join('\n  ')
 
   return `<!doctype html><html><head><meta charset="utf-8" /><title>${esc(title)}</title>
 <style>
@@ -790,7 +1394,7 @@ function buildPrintHtml(
   .bar .lab { width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar .track { flex: 1; height: 12px; background: #f1f5f9; border-radius: 3px; overflow: hidden; }
   .bar .fill { height: 100%; background: #0ea5e9; }
-  .bar .val { width: 44px; text-align: right; color: #475569; }
+  .bar .val { width: 60px; text-align: right; color: #475569; }
   .legend { display: flex; gap: 14px; font-size: 10px; color: #475569; margin-top: 4px; }
   .legend span { display: inline-flex; align-items: center; gap: 4px; }
   .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
@@ -798,19 +1402,7 @@ function buildPrintHtml(
   <h1>${esc(title)}</h1>
   <p class="sub">Generated ${esc(fmtDateTime(report.generatedAt))}${report.baseUrl ? ` · ${esc(report.baseUrl.replace(/^https?:\/\//, ''))}` : ''}</p>
   <p class="filters">${esc(filtersSummary(state, home))}</p>
-  <div class="kpis">
-    ${kpi('Calls', String(t.calls))}${kpi('Answered', String(t.answered))}${kpi('Missed', String(t.missed))}
-    ${kpi('Inbound', String(t.inbound))}${kpi('Outbound', String(t.outbound))}${kpi('Internal', String(t.internal))}
-    ${kpi('National', String(t.national))}${kpi('International', String(t.international))}${kpi('Talk time', fmtDuration(t.talkSec))}
-  </div>
-  <h2>Breakdown by ${esc(groupLabel(state.groupBy))}</h2>
-  ${barsHtml || '<p class="sub">No calls match the current filters.</p>'}
-  ${dayChart}
-  <h2>Per-extension activity</h2>
-  ${extTableHtml}
-  <h2>Top countries</h2>
-  ${countryHtml}
-  ${trunkHtml}
+  ${body}
 </body></html>`
 }
 
@@ -901,7 +1493,7 @@ function pdfDayChart(calls: ClassifiedCall[]): string {
 
 // --- Aggregation ------------------------------------------------------------
 
-function totals(calls: ClassifiedCall[]): {
+interface Totals {
   calls: number
   answered: number
   missed: number
@@ -912,7 +1504,12 @@ function totals(calls: ClassifiedCall[]): {
   international: number
   activeExts: number
   talkSec: number
-} {
+  nationalSec: number
+  internationalSec: number
+  internalSec: number
+}
+
+function totals(calls: ClassifiedCall[]): Totals {
   const exts = new Set<string>()
   let answered = 0
   let inbound = 0
@@ -921,13 +1518,23 @@ function totals(calls: ClassifiedCall[]): {
   let national = 0
   let international = 0
   let talkSec = 0
+  let nationalSec = 0
+  let internationalSec = 0
+  let internalSec = 0
   for (const c of calls) {
     if (c.answered) answered++
     if (c.direction === 'inbound') inbound++
     else if (c.direction === 'outbound') outbound++
     else if (c.direction === 'internal') internal++
-    if (c.scope === 'national') national++
-    else if (c.scope === 'international') international++
+    if (c.scope === 'national') {
+      national++
+      nationalSec += c.durationSec
+    } else if (c.scope === 'international') {
+      international++
+      internationalSec += c.durationSec
+    } else if (c.scope === 'internal') {
+      internalSec += c.durationSec
+    }
     talkSec += c.durationSec
     if (c.extension) exts.add(c.extension)
   }
@@ -941,7 +1548,10 @@ function totals(calls: ClassifiedCall[]): {
     national,
     international,
     activeExts: exts.size,
-    talkSec
+    talkSec,
+    nationalSec,
+    internationalSec,
+    internalSec
   }
 }
 
@@ -1037,6 +1647,8 @@ function groupCounts(
         return c.country
       case 'trunk':
         return c.trunk ?? '(no trunk)'
+      case 'department':
+        return c.dept ?? '(no department)'
       case 'direction':
         return c.direction
       case 'scope':
@@ -1049,6 +1661,7 @@ function groupCounts(
   }
   for (const c of calls) {
     if (groupBy === 'extension' && !c.extension) continue
+    if (groupBy === 'department' && !c.dept) continue
     const k = keyOf(c)
     map.set(k, (map.get(k) ?? 0) + 1)
   }
@@ -1071,17 +1684,125 @@ function tile(label: string, value: string): string {
   </div>`
 }
 
-/** The customisable main chart: a column chart for day/hour (ordered series),
- *  a horizontal bar chart otherwise (ranked categories). */
+/** The customisable main chart: a column chart for day/hour (ordered series,
+ *  where a pie makes no sense), otherwise the chosen style — a horizontal bar
+ *  chart or a pie / donut of the ranked categories. */
 function mainChart(
   calls: ClassifiedCall[],
   groupBy: GroupBy,
-  nameFor: (ext: string) => string | undefined
+  nameFor: (ext: string) => string | undefined,
+  style: ChartStyle
 ): string {
   const bars = groupCounts(calls, groupBy, nameFor)
   if (!bars.some((b) => b.value > 0)) return emptyNote('No calls match the current filters.')
-  if (groupBy === 'day' || groupBy === 'hour') return columnChart(bars)
-  return barChart(bars.slice(0, 14))
+  // Bars: an ordered column chart for time series (day/hour), a ranked
+  // horizontal bar chart otherwise. Pie/donut: top categories as slices — always
+  // honoured, so switching style always changes the chart.
+  if (style === 'bar') {
+    return groupBy === 'day' || groupBy === 'hour' ? columnChart(bars) : barChart(bars.slice(0, 14))
+  }
+  const ranked = bars.slice(0, 14)
+  const segs: Segment[] = ranked.map((b, i) => ({
+    label: b.label,
+    value: b.value,
+    color: CAT_PALETTE[i % CAT_PALETTE.length],
+    display: String(b.value)
+  }))
+  return shareChart(segs, style)
+}
+
+/** Categorical colour palette for pie / donut slices. */
+const CAT_PALETTE = [
+  '#0ea5e9',
+  '#10b981',
+  '#8b5cf6',
+  '#f59e0b',
+  '#ec4899',
+  '#14b8a6',
+  '#ef4444',
+  '#6366f1',
+  '#84cc16',
+  '#eab308',
+  '#f97316',
+  '#06b6d4',
+  '#a855f7',
+  '#64748b'
+]
+
+interface Segment {
+  label: string
+  value: number
+  color: string
+  /** Legend value text (defaults to the raw value). */
+  display?: string
+}
+
+/** Render a set of shares either as a pie/donut (SVG + legend) or coloured bars,
+ *  per the chosen style. */
+function shareChart(segs: Segment[], style: ChartStyle): string {
+  const usable = segs.filter((s) => s.value > 0)
+  if (!usable.length) return emptyNote('Nothing to chart for the current filters.')
+  return style === 'bar' ? segmentBars(usable) : pieChart(usable, style === 'donut')
+}
+
+/** SVG pie (or donut) with a legend beneath. */
+function pieChart(segs: Segment[], donut: boolean): string {
+  const total = segs.reduce((a, s) => a + s.value, 0)
+  if (total <= 0) return emptyNote('Nothing to chart.')
+  const cx = 50
+  const cy = 50
+  const r = 46
+  const polar = (deg: number): [number, number] => {
+    const a = ((deg - 90) * Math.PI) / 180
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)]
+  }
+  let angle = 0
+  const slices = segs
+    .map((s) => {
+      const frac = s.value / total
+      const start = angle
+      const end = angle + frac * 360
+      angle = end
+      // A single 100% slice can't be drawn as an arc — render a full circle.
+      if (frac >= 0.9999)
+        return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${s.color}"><title>${esc(s.label)}: ${esc(s.display ?? String(s.value))}</title></circle>`
+      const [x1, y1] = polar(start)
+      const [x2, y2] = polar(end)
+      const large = end - start > 180 ? 1 : 0
+      return `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" fill="${s.color}"><title>${esc(s.label)}: ${esc(s.display ?? String(s.value))}</title></path>`
+    })
+    .join('')
+  const hole = donut
+    ? `<circle cx="${cx}" cy="${cy}" r="${r * 0.58}" class="fill-white dark:fill-slate-800" />`
+    : ''
+  const legend = segs
+    .map(
+      (s) =>
+        `<span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style="background:${s.color}"></span><span class="truncate">${esc(s.label)}</span><span class="text-slate-400 tabular-nums">${esc(s.display ?? String(s.value))}</span></span>`
+    )
+    .join('')
+  return `<div class="flex items-center gap-4 flex-wrap">
+      <svg viewBox="0 0 100 100" class="w-32 h-32 shrink-0">${slices}${hole}</svg>
+      <div class="flex-1 min-w-[8rem] grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-600 dark:text-slate-300">${legend}</div>
+    </div>`
+}
+
+/** Coloured horizontal bars for a set of shares (used by pie-style sections when
+ *  the user prefers bars). */
+function segmentBars(segs: Segment[]): string {
+  const max = Math.max(1, ...segs.map((s) => s.value))
+  return `<div class="space-y-1">${segs
+    .map((s) => {
+      const pct = Math.round((s.value / max) * 100)
+      return `<div class="flex items-center gap-2 text-xs">
+        <div class="w-40 shrink-0 truncate text-slate-600 dark:text-slate-300" title="${esc(s.label)}">${esc(s.label)}</div>
+        <div class="flex-1 h-4 rounded bg-slate-100 dark:bg-slate-900 overflow-hidden">
+          <div class="h-full" style="width:${pct}%;background:${s.color}"></div>
+        </div>
+        <div class="w-16 shrink-0 text-right tabular-nums text-slate-500">${esc(s.display ?? String(s.value))}</div>
+      </div>`
+    })
+    .join('')}</div>`
 }
 
 /** Horizontal bar chart of ranked categories. */
@@ -1291,6 +2012,7 @@ function groupLabel(g: GroupBy): string {
     day: 'day',
     country: 'country',
     trunk: 'trunk',
+    department: 'department',
     direction: 'direction',
     scope: 'national / international',
     hour: 'hour of day'
@@ -1299,14 +2021,17 @@ function groupLabel(g: GroupBy): string {
 
 // --- Home-country persistence ----------------------------------------------
 
-function readHomeCountry(): string {
+/** ISO2 the home country falls back to when the user hasn't chosen one. */
+const DEFAULT_HOME_COUNTRY = 'IE'
+
+export function readHomeCountry(): string {
   try {
-    return localStorage.getItem(HOME_KEY) ?? ''
+    return localStorage.getItem(HOME_KEY) ?? DEFAULT_HOME_COUNTRY
   } catch {
-    return ''
+    return DEFAULT_HOME_COUNTRY
   }
 }
-function writeHomeCountry(iso2: string): void {
+export function writeHomeCountry(iso2: string): void {
   try {
     if (iso2) localStorage.setItem(HOME_KEY, iso2)
     else localStorage.removeItem(HOME_KEY)

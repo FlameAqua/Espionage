@@ -26,11 +26,17 @@ interface Ctx {
   onHide: () => void
 }
 
+/** The pane's own heading, matching the "Navigation" title on the left panel. */
+function panelTitle(): string {
+  return `<span class="text-[11px] font-bold text-slate-400 uppercase tracking-wide">Details</span>`
+}
+
 export function renderDetails(container: HTMLElement, node: GraphNode | null, ctx: Ctx): void {
   if (!node) {
     container.innerHTML = `
       <div class="flex flex-col h-full">
-        <div class="flex items-center justify-end px-2 py-2 border-b border-slate-200 dark:border-slate-800">
+        <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-200 dark:border-slate-800">
+          ${panelTitle()}
           <button id="hide" class="px-2 py-1 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
         </div>
         <div class="p-6 text-sm text-slate-400">Select a node to inspect it.</div>
@@ -97,6 +103,7 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
       <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
         <div class="flex items-center justify-between mb-1.5">
           <button id="back" class="px-2 py-0.5 rounded text-xs ${ctx.canGoBack ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800' : 'text-slate-300 dark:text-slate-700 cursor-default'}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>
+          ${panelTitle()}
           <button id="hide" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
         </div>
         <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white" style="background:${meta.color}">${esc(meta.label)}</span>
@@ -133,6 +140,8 @@ export interface EdgeDetail {
   targetId: string
   kind: string
   labels: string[]
+  /** The single route that was clicked, when a split-out route edge was tapped. */
+  tappedLabel?: string
 }
 
 /** Render a tapped link/edge into the same details panel used for nodes. */
@@ -151,13 +160,19 @@ export function renderEdgeDetails(container: HTMLElement, info: EdgeDetail, ctx:
   const arrowTarget = isSelf
     ? `<span class="text-slate-400">↺ loops back</span>`
     : `<span class="text-slate-400 text-lg">→</span>${chip(info.targetId)}`
+  // When one of the split-out route edges was clicked, mark that route so the
+  // list echoes what's highlighted on the canvas.
   const rels = info.labels.length
     ? `<ul class="space-y-1">${info.labels
-        .map(
-          (l) =>
-            `<li class="flex items-start gap-2"><span class="text-slate-400">•</span><span class="text-slate-700 dark:text-slate-200 break-words">${esc(l)}</span></li>`
-        )
-        .join('')}</ul>`
+        .map((l) => {
+          const on = info.tappedLabel !== undefined && l === info.tappedLabel
+          return `<li class="flex items-start gap-2 ${on ? 'font-semibold' : ''}"><span class="${on ? 'text-sky-500' : 'text-slate-400'}">${on ? '▸' : '•'}</span><span class="${on ? 'text-sky-700 dark:text-sky-300' : 'text-slate-700 dark:text-slate-200'} break-words">${esc(l)}</span></li>`
+        })
+        .join('')}</ul>${
+        info.labels.length > 1
+          ? `<p class="text-[11px] text-slate-400 mt-1.5">Each route is drawn separately while this link is selected.</p>`
+          : ''
+      }`
     : `<p class="text-slate-400">Direct link (no extra detail).</p>`
 
   container.innerHTML = `
@@ -165,6 +180,7 @@ export function renderEdgeDetails(container: HTMLElement, info: EdgeDetail, ctx:
       <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
         <div class="flex items-center justify-between mb-1.5">
           <button id="back" class="px-2 py-0.5 rounded text-xs ${ctx.canGoBack ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800' : 'text-slate-300 dark:text-slate-700 cursor-default'}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>
+          ${panelTitle()}
           <button id="hide" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
         </div>
         <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white bg-slate-500">${isSelf ? 'Loop-back' : 'Link'}</span>

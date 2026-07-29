@@ -10,6 +10,9 @@ export type UndoEntry =
   /** A navigation change: `from`/`to` are node ids, or null for the "All" (whole
    *  graph, no focus) view. */
   | { type: 'nav'; from: string | null; to: string | null }
+  /** Nodes and/or edges being hidden or restored. `hidden: true` means the action
+   *  hid them, so undoing restores them (and vice versa for "show all"). */
+  | { type: 'hide'; nodeIds: string[]; edgeIds: string[]; edgeKinds: string[]; hidden: boolean }
 
 export class UndoManager {
   private undoStack: UndoEntry[] = []

@@ -133,14 +133,16 @@ function registerAppIpc(): void {
 
   // Save the current topology to a user-chosen JSON file (offline documentation
   // / sharing without credentials).
-  ipcMain.handle('app:saveSnapshot', async (evt, topology: Topology) => {
+  ipcMain.handle('app:saveSnapshot', async (evt, topology: Topology, defaultDir?: string) => {
     const win = BrowserWindow.fromWebContents(evt.sender)
     const host = String(topology?.baseUrl ?? 'system')
       .replace(/^https?:\/\//, '')
       .replace(/[^\w.-]/g, '_')
+    const fileName = `espionage-${host || 'system'}.json`
     const opts = {
       title: 'Save snapshot',
-      defaultPath: `espionage-${host || 'system'}.json`,
+      // Start in the folder configured in Settings, when there is one.
+      defaultPath: defaultDir ? join(defaultDir, fileName) : fileName,
       filters: [{ name: 'Espionage snapshot', extensions: ['json'] }]
     }
     const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))
@@ -151,6 +153,18 @@ function registerAppIpc(): void {
     } catch (err) {
       return { error: `Could not save snapshot: ${(err as Error).message}` }
     }
+  })
+
+  // Pick the default folder new snapshots are offered in (Settings).
+  ipcMain.handle('app:chooseFolder', async (evt, title?: string) => {
+    const win = BrowserWindow.fromWebContents(evt.sender)
+    const opts = {
+      title: title || 'Choose folder',
+      properties: ['openDirectory' as const, 'createDirectory' as const]
+    }
+    const result = await (win ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts))
+    if (result.canceled || !result.filePaths[0]) return { canceled: true }
+    return { path: result.filePaths[0] }
   })
 
   // Load a previously-saved snapshot for offline viewing.

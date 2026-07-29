@@ -38,6 +38,19 @@ export interface GraphNode {
 export type EdgeKind =
   'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk' | 'afterhours' | 'forward'
 
+/** Display name + colour per link type, shared by the canvas styling and the
+ *  settings panel that lets whole link types be hidden. */
+export const EDGE_KIND_META: Record<EdgeKind, { label: string; color: string }> = {
+  route: { label: 'Route', color: '#64748b' },
+  overflow: { label: 'Overflow / no answer', color: '#f59e0b' },
+  agent: { label: 'Queue agent', color: '#3b82f6' },
+  manager: { label: 'Queue manager', color: '#6366f1' },
+  member: { label: 'Ring group member', color: '#14b8a6' },
+  trunk: { label: 'Trunk', color: '#a855f7' },
+  afterhours: { label: 'Out of hours / holiday', color: '#0891b2' },
+  forward: { label: 'Call forwarding', color: '#ec4899' }
+}
+
 export interface GraphEdge {
   id: string
   source: string

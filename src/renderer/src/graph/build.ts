@@ -223,9 +223,13 @@ function routeFromValue(
       const ref = asDestRef(el) ?? firstNestedDest(el)
       if (ref) {
         const target = b.resolveTarget(ref, contextLabel)
+        // "key N" alone is misleading — it doesn't say whether the option drops
+        // to voicemail, rings a group, hits another IVR, etc. Append what the
+        // option actually does (from its ForwardType/PeerType) so the arrow's
+        // meaning is explicit rather than implying a plain call to the target.
         const base = input ? `key ${input}` : prettyKey(key)
-        if (target)
-          b.addEdge(sourceId, target.id, 'route', isVoicemail(el) ? `${base}: voicemail` : base)
+        const dest = describeDest(el)
+        if (target) b.addEdge(sourceId, target.id, 'route', dest ? `${base} → ${dest}` : base)
       }
     }
     return
@@ -269,6 +273,35 @@ function isVoicemail(o: Obj): boolean {
     isObj(x) &&
     /voicemail/i.test(str(pick(x, 'To', 'Type', 'DestinationType', 'PeerType', 'ForwardType')))
   return vm(o) || vm(o['Route']) || vm(o['Peer']) || vm(o['Destination'])
+}
+
+/** Human descriptor of what a destination-shaped option actually does, from its
+ *  type fields (checked on the object and its Route/Peer/Destination wrapper).
+ *  Used to enrich IVR "key N" labels so voicemail / ring-group / queue / IVR
+ *  hops read explicitly instead of looking like a plain call to the target.
+ *  Returns null for a bare extension/DN forward — the target node already says
+ *  it's an extension, so there's nothing to add. */
+function describeDest(o: Obj): string | null {
+  const typeOf = (x: unknown): string =>
+    isObj(x) ? str(pick(x, 'To', 'Type', 'DestinationType', 'PeerType', 'ForwardType')) : ''
+  const t = (typeOf(o) || typeOf(o['Route']) || typeOf(o['Peer']) || typeOf(o['Destination']))
+    .toLowerCase()
+    .replace(/\s+/g, '')
+  if (!t) return null
+  if (t.includes('voicemail')) return 'voicemail'
+  if (t.includes('ringgroup')) return 'ring group'
+  if (t.includes('queue')) return 'queue'
+  if (t.includes('ivr') || t.includes('receptionist')) return 'IVR'
+  if (t.includes('conference')) return 'conference'
+  if (t.includes('announcement')) return 'announcement'
+  if (t.includes('fax')) return 'fax'
+  if (t.includes('parking')) return 'parking'
+  if (t.includes('callflow') || t.includes('routepoint')) return 'call flow'
+  if (t.includes('external') || t.includes('outbound')) return 'external'
+  // Plain extension / DN forwards — no extra descriptor needed.
+  if (t === 'extension' || t === 'dn' || t === 'internal' || t === 'proceedwithnoexceptions')
+    return null
+  return null
 }
 
 /** Compute the 3CX management-console deep-link path for each node. Inbound

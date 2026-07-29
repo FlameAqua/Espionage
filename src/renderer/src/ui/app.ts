@@ -12,10 +12,15 @@ import {
   type ThemeName
 } from '../graph/view'
 import {
+  EDGE_KIND_META,
   NODE_KIND_META,
+  PRESENCE_META,
   SHARED_DEPARTMENT,
   departmentColor,
   departmentLabel,
+  presenceOf,
+  queueLoggedIn,
+  type EdgeKind,
   type GraphNode,
   type NodeKind
 } from '../graph/model'
@@ -25,7 +30,21 @@ import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
 import { auditTopology, groupFindings } from '../graph/audit'
 import { UndoManager } from './history'
-import { openReport, showLiveReport, showReportSetup } from './report'
+import {
+  openReport,
+  readHomeCountry,
+  showLiveReport,
+  showReportSetup,
+  writeHomeCountry
+} from './report'
+import { showZoneSettings } from './zones'
+import {
+  loadEdgeOptions,
+  readSnapshotDir,
+  saveEdgeOptions,
+  showSettings,
+  type EdgeOptions
+} from './settings'
 
 export interface AppCallbacks {
   /** Hard refresh: re-fetch and rebuild from scratch (back to the full view). */
@@ -57,6 +76,20 @@ interface DidRow {
   dests: string[]
 }
 
+/** Pixel sizes of the resizable chrome, persisted between launches. */
+interface LayoutSizes {
+  left: number
+  right: number
+  miniW: number
+  miniH: number
+  leftHidden: boolean
+  rightHidden: boolean
+}
+
+function clampSize(v: unknown, min: number, max: number, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback
+}
+
 const esc = (s: unknown): string =>
   String(s ?? '').replace(
     /[&<>"']/g,
@@ -64,7 +97,9 @@ const esc = (s: unknown): string =>
   )
 
 const THEME_KEY = '3cx-spy.theme'
-const btn = 'px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs text-slate-100'
+// Theme-aware so the header and side panels follow light/dark mode.
+const btn =
+  'px-2 py-1 rounded text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-100'
 
 let cleanup: (() => void)[] = []
 
@@ -128,35 +163,50 @@ export function renderApp(
 
   root.innerHTML = `
     <div class="h-screen grid grid-rows-[3rem_1fr] bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-200">
-      <header class="flex items-center gap-2 px-3 bg-slate-900 text-slate-100">
-        <span class="text-xs text-slate-400 font-mono truncate max-w-[240px]">${esc(host)}</span>
-        <div class="relative ml-2 w-56">
-          <input id="search" type="text" placeholder="Search…"
-            class="w-full px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" />
+      <!-- Three equal-flanked columns so the search box sits dead centre on
+           screen regardless of how wide the host name or the button group is. -->
+      <header class="grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-3 bg-white border-b border-slate-200 text-slate-800 dark:bg-slate-900 dark:border-slate-800 dark:text-slate-100">
+        <div class="flex items-center min-w-0">
+          <span class="text-xs text-slate-500 dark:text-slate-400 font-mono truncate max-w-[240px]">${esc(host)}</span>
+        </div>
+
+        <div class="relative justify-self-center w-[26rem] max-w-[42vw]">
+          <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">⌕</span>
+          <input id="search" type="text" placeholder="Search extensions, queues, IVRs…" title="Search (Ctrl+F)"
+            class="w-full pl-8 pr-3 py-1.5 rounded-lg bg-slate-50 border-2 border-slate-300 text-slate-800 placeholder:text-slate-400 dark:bg-slate-800 dark:border-slate-500 dark:text-slate-100 dark:placeholder:text-slate-400 text-[15px] focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500" />
           <div id="results" class="hidden absolute z-30 mt-1 w-full bg-white text-slate-800 dark:bg-slate-800 dark:text-slate-100 rounded-md shadow-lg border border-slate-200 dark:border-slate-700 max-h-72 overflow-y-auto"></div>
         </div>
 
-        <select id="layout" title="Layout" class="${btn} appearance-none pr-2">
-          <option value="flow">Flow</option>
-          <option value="compact">Compact</option>
-          <option value="force">Spread</option>
-          <option value="department">Department</option>
-        </select>
-
-        <div class="ml-auto flex items-center gap-1.5 text-sm">
+        <div class="flex items-center justify-end gap-1.5 text-sm min-w-0">
+          <label class="flex items-center gap-1.5 shrink-0 mr-1">
+            <span class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">View Mode</span>
+            <select id="layout" title="View Mode — how the graph is arranged" class="${btn} appearance-none pr-2">
+              <option value="flow">Flow</option>
+              <option value="compact">Compact</option>
+              <option value="force">Spread</option>
+              <option value="department">Department</option>
+            </select>
+          </label>
           ${errors.length ? `<button id="warn" class="px-2 py-1 rounded bg-amber-500/90 hover:bg-amber-500 text-white text-xs">${errors.length}⚠</button>` : ''}
           ${graph.warnings.length ? `<button id="unresolved" class="px-2 py-1 rounded bg-red-600/90 hover:bg-red-600 text-white text-xs">${graph.warnings.length} unresolved</button>` : ''}
-          <button id="refresh" class="${btn} w-7" title="Refresh — update from 3CX, keeping your current view" aria-label="Refresh"><span id="refreshIcon" class="inline-block">↻</span></button>
+          <button id="refresh" class="${btn} w-7" title="Soft refresh — update but preserve view (Ctrl+R)" aria-label="Soft refresh"><span id="refreshIcon" class="inline-block">↻</span></button>
           <button id="help" class="${btn} w-7" title="Help" aria-label="Help">?</button>
           <div class="relative">
             <button id="menuBtn" class="${btn}" title="Menu" aria-label="Menu">☰</button>
-            <div id="menu" class="hidden absolute right-0 top-full mt-1 z-40 min-w-[180px] py-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-md shadow-xl border border-slate-200 dark:border-slate-700"></div>
+            <div id="menu" class="hidden absolute right-0 top-full mt-1 z-40 min-w-[264px] py-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-md shadow-xl border border-slate-200 dark:border-slate-700"></div>
           </div>
         </div>
       </header>
 
       <div id="body" class="grid grid-cols-[12rem_1fr_20rem] min-h-0">
-        <aside class="min-h-0 flex flex-col bg-white border-r border-slate-200 dark:bg-slate-900 dark:border-slate-800">
+        <aside id="leftPanel" class="relative min-h-0 flex flex-col bg-white border-r border-slate-200 dark:bg-slate-900 dark:border-slate-800 overflow-hidden">
+          <!-- Drag the inner edge to resize; double-click it to collapse. -->
+          <div id="leftResize" title="Drag to resize · double-click to collapse" class="absolute top-0 right-0 bottom-0 w-1.5 z-20 cursor-col-resize hover:bg-sky-500/40"></div>
+          <!-- Mirrors the details panel's header: title left, Hide right. -->
+          <div class="shrink-0 flex items-center justify-between gap-2 px-3 pt-2.5">
+            <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wide">Navigation</span>
+            <button id="hideLeft" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">‹ Hide</button>
+          </div>
           <div class="flex-1 overflow-y-auto p-3">
             <button id="catHeader" type="button" class="w-full flex items-center justify-between mb-2">
               <span class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Categories</span>
@@ -232,52 +282,80 @@ export function renderApp(
               <input id="hideUnconnected" type="checkbox" class="accent-sky-500" />
               Hide unconnected nodes
             </label>
-            <div class="flex items-center gap-1">
-              <button id="zoomOut" class="${btn} w-7" title="Zoom out">−</button>
-              <input id="zoom" type="range" min="0" max="1000" value="500" class="flex-1 min-w-0 accent-sky-500" title="Zoom" />
-              <button id="zoomIn" class="${btn} w-7" title="Zoom in">+</button>
+            <div id="focusDepthRow" class="opacity-50" title="When focused on a node, how many hops out stay visible">
+              <div class="flex items-center justify-between text-xs mb-0.5">
+                <span class="text-slate-500 dark:text-slate-400">Focus Reach</span>
+                <span id="focusDepthVal" class="text-slate-400 tabular-nums">Neighbours</span>
+              </div>
+              <div class="flex items-center gap-1">
+                <button id="depthOut" class="${btn} w-7" title="Show fewer hops">−</button>
+                <input id="focusDepth" type="range" min="1" max="6" value="1" class="flex-1 min-w-0 accent-sky-500" />
+                <button id="depthIn" class="${btn} w-7" title="Show more hops">+</button>
+              </div>
+            </div>
+            <div>
+              <div class="text-xs text-slate-500 dark:text-slate-400 mb-0.5">Zoom Level</div>
+              <div class="flex items-center gap-1">
+                <button id="zoomOut" class="${btn} w-7" title="Zoom out">−</button>
+                <input id="zoom" type="range" min="0" max="1000" value="500" class="flex-1 min-w-0 accent-sky-500" title="Zoom Level" />
+                <button id="zoomIn" class="${btn} w-7" title="Zoom in">+</button>
+              </div>
             </div>
             <div class="flex items-center gap-1">
               <button id="fit" class="${btn} flex-1" title="Fit to screen">⤢ Fit</button>
-              <button id="lock" class="${btn} flex-1" title="Lock — stops nodes being dragged (they stay clickable). Unlock to reposition, or hold Space to pan through.">🔓 Lock</button>
+              <button id="lock" class="${btn} flex-1" title="Locked stops nodes being dragged (they stay clickable). Unlock to reposition them. Toggle with Space.">🔒 Locked</button>
             </div>
           </div>
         </aside>
 
         <main class="relative min-h-0 min-w-0 bg-slate-100 dark:bg-slate-950">
           <div id="graph" class="w-full h-full"></div>
+          <!-- Mirrors "Details ›" bottom-right. Its bottom offset is set in
+               applyLayout so it always clears the (resizable) minimap. -->
+          <button id="reopenLeft" class="hidden absolute left-3 z-20 px-2 py-1 rounded bg-slate-700 text-slate-100 text-xs shadow" title="Show the navigation panel">‹ Navigation</button>
           <div id="breadcrumb" class="absolute top-3 right-3 z-20 flex items-center flex-wrap justify-end gap-x-0.5 max-w-[65%] px-2.5 py-1 rounded-md bg-white/90 dark:bg-slate-800/90 border border-slate-200 dark:border-slate-700 shadow text-xs text-slate-600 dark:text-slate-300"></div>
-          <div class="absolute bottom-3 left-3 z-20 w-52 h-36 pointer-events-none">
+          <div id="minimapWrap" class="group absolute bottom-3 left-3 z-20 w-52 h-36 pointer-events-none">
             <div id="minimap" class="relative w-full h-full rounded-md border border-slate-300 dark:border-slate-700 bg-white/80 dark:bg-slate-900/80 shadow overflow-hidden cursor-pointer pointer-events-auto"></div>
-            <button id="mapToggle" class="absolute bottom-1 left-1 z-30 px-1.5 py-0.5 rounded bg-slate-700/90 hover:bg-slate-600 text-slate-100 text-[10px] shadow pointer-events-auto" title="Toggle minimap">Hide</button>
+            <button id="mapToggle" class="absolute bottom-1 left-1 z-30 w-5 h-5 flex items-center justify-center rounded bg-slate-700/90 hover:bg-slate-600 text-slate-100 text-[10px] leading-none shadow pointer-events-auto" title="Collapse minimap" aria-label="Collapse minimap">▾</button>
+            <!-- Anchored bottom-left, so the top-right corner is the grow handle.
+                 Invisible until the minimap is hovered, so it isn't permanent clutter. -->
+            <div id="miniResize" title="Drag to resize the minimap" class="absolute -top-1 -right-1 w-3.5 h-3.5 z-30 cursor-nesw-resize rounded-sm bg-transparent group-hover:bg-sky-500/70 transition-colors pointer-events-auto"></div>
           </div>
           <button id="reopen" class="hidden absolute bottom-3 right-3 z-20 px-2 py-1 rounded bg-slate-700 text-slate-100 text-xs shadow">Details ›</button>
           <div id="panel" class="hidden absolute z-20 inset-x-4 bottom-4 max-h-[40%] bg-white dark:bg-slate-800 dark:text-slate-200 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 flex flex-col overflow-hidden text-xs"></div>
         </main>
 
-        <aside id="details" class="min-h-0 bg-white border-l border-slate-200 overflow-hidden dark:bg-slate-900 dark:border-slate-800"></aside>
+        <!-- The handle is a sibling of #details because renderDetails replaces
+             that element's innerHTML on every selection. -->
+        <aside id="detailsPanel" class="relative min-h-0 bg-white border-l border-slate-200 overflow-hidden dark:bg-slate-900 dark:border-slate-800">
+          <div id="rightResize" title="Drag to resize · double-click to collapse" class="absolute top-0 left-0 bottom-0 w-1.5 z-20 cursor-col-resize hover:bg-sky-500/40"></div>
+          <div id="details" class="h-full min-h-0 overflow-hidden"></div>
+        </aside>
       </div>
 
       <div id="ctxmenu" class="hidden fixed z-50 w-max py-1 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-md shadow-xl border border-slate-200 dark:border-slate-700 text-sm"></div>
 
       <div id="helpModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-        <div class="w-[300px] max-w-full bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 p-4">
+        <div class="w-[460px] max-w-full max-h-[88vh] overflow-y-auto bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 p-4">
           <div class="flex items-center justify-between mb-3">
             <h2 class="font-semibold text-slate-800 dark:text-slate-100">Controls</h2>
             <button id="helpClose" class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
           </div>
           <div class="grid grid-cols-[2rem_1fr] gap-x-3 gap-y-3 items-center text-sm">
             ${helpRow(mouseSvg('left'), 'Click', 'details')}
+            ${helpRow(mouseSvg('left'), 'Click a link', 'split it into its routes')}
             ${helpRow(mouseSvg('left', '×2'), 'Double-click', 'focus')}
-            ${helpRow(mouseSvg('right'), 'Right-click', 'actions')}
+            ${helpRow(mouseSvg('right'), 'Right-click', 'actions (incl. Hide)')}
             ${helpRow(mouseSvg('right'), 'Right-drag', 'select group → move together')}
             ${helpRow(mouseSvg('wheel'), 'Scroll', 'zoom (Ctrl = faster)')}
             ${helpRow(dragSvg(), 'Drag', 'pan / move node')}
-            ${helpRow(keyCap('space'), 'Space / 🔒', 'pan through nodes')}
+            ${helpRow(keyCap('space'), 'Space / 🔒', 'lock / unlock node dragging')}
             ${helpRow(keyCap('⌃Z'), 'Ctrl+Z', 'undo move / jump back')}
             ${helpRow(keyCap('⌃Y'), 'Ctrl+Y', 'redo')}
             ${helpRow(mouseSvg('right'), 'Right-click bg', 'undo / redo menu')}
           </div>
+          <h2 class="font-semibold text-slate-800 dark:text-slate-100 mt-4 mb-2">Keyboard shortcuts</h2>
+          <div id="shortcutList" class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs"></div>
         </div>
       </div>
     </div>`
@@ -310,6 +388,19 @@ export function renderApp(
   }
   const nameFor = (ext: string): string | undefined => extNames.get(ext)
 
+  // Number → department, so reports can group by department (multi-tenant systems
+  // separate customers this way). Uses each node's resolved bucket; a real user
+  // extension wins collisions. The catch-all "Shared" bucket isn't a real
+  // department, so it's skipped.
+  const extDepts = new Map<string, string>()
+  for (const n of graph.nodes) {
+    if (!n.number) continue
+    const bucket = n.deptGroup && n.deptGroup !== SHARED_DEPARTMENT ? n.deptGroup : n.departments?.[0]
+    if (!bucket || bucket === SHARED_DEPARTMENT) continue
+    if (n.kind === 'user' || !extDepts.has(n.number)) extDepts.set(n.number, departmentLabel(bucket))
+  }
+  const deptFor = (ext: string): string | undefined => extDepts.get(ext)
+
   const showDetails = (node: GraphNode | null): void => {
     current = node
     egoMap?.destroy()
@@ -332,7 +423,7 @@ export function renderApp(
     current = null
     egoMap?.destroy()
     egoMap = null
-    if (detailsHidden) toggleDetails(true)
+    if (sizes.rightHidden) toggleDetails(true)
     renderEdgeDetails(detailsEl, info, {
       graph,
       canGoBack: history.length > 1,
@@ -356,9 +447,10 @@ export function renderApp(
     if (willFocus) clearDeptUI() // node-focus is mutually exclusive with dept filter
     if (willFocus) view.focusNeighbourhood(id)
     else view.centerOn(id)
-    if (detailsHidden) toggleDetails(true)
+    if (sizes.rightHidden) toggleDetails(true)
     showDetails(node)
     renderBreadcrumb()
+    syncFocusDepthRow()
   }
 
   // Single-click / navigation: details + pan, keeping the current focus (unless
@@ -395,21 +487,47 @@ export function renderApp(
         clearDeptUI()
         showDetails(null)
         renderBreadcrumb()
+        syncFocusDepthRow()
       } else if (graph.nodes.some((n) => n.id === id)) {
         if (history[history.length - 1] !== id) history.push(id)
         showNode(id)
       }
     })
+  /** Apply a hide/restore timeline entry. `hide` is the direction to move in:
+   *  true re-hides the recorded elements, false restores them. */
+  const applyHide = (
+    entry: { nodeIds: string[]; edgeIds: string[]; edgeKinds: string[] },
+    hide: boolean
+  ): void =>
+    undo.run(() => {
+      if (hide) {
+        for (const id of entry.nodeIds) view.hideNode(id)
+        for (const id of entry.edgeIds) view.hideEdge(id)
+        for (const kind of entry.edgeKinds) view.hideEdgeKind(kind)
+      } else {
+        view.unhideNodes(entry.nodeIds)
+        view.unhideEdges(entry.edgeIds)
+        if (entry.edgeKinds.length) {
+          const remaining = view.getHiddenEdgeKinds().filter((k) => !entry.edgeKinds.includes(k))
+          view.setHiddenEdgeKinds(remaining)
+        }
+      }
+      if (entry.edgeKinds.length) syncEdgeOptionsFromView()
+      syncFocusDepthRow()
+    })
+
   const doUndo = (): void => {
     const entry = undo.undo()
     if (!entry) return
     if (entry.type === 'move') view.applyPositions(entry.moves, 'from')
+    else if (entry.type === 'hide') applyHide(entry, !entry.hidden)
     else goTo(entry.from)
   }
   const doRedo = (): void => {
     const entry = undo.redo()
     if (!entry) return
     if (entry.type === 'move') view.applyPositions(entry.moves, 'to')
+    else if (entry.type === 'hide') applyHide(entry, entry.hidden)
     else goTo(entry.to)
   }
 
@@ -450,6 +568,7 @@ export function renderApp(
           clearDeptUI()
           showDetails(null)
           renderBreadcrumb()
+          syncFocusDepthRow()
         } else if (v === 'return' && lastNodeBeforeAll) {
           navigate(lastNodeBeforeAll, true)
         } else {
@@ -461,19 +580,185 @@ export function renderApp(
     })
   }
 
-  // --- Details panel show/hide -------------------------------------------
-  let detailsHidden = false
-  const toggleDetails = (show: boolean): void => {
-    detailsHidden = !show
-    bodyEl.style.gridTemplateColumns = show ? '12rem 1fr 20rem' : '12rem 1fr 0'
-    detailsEl.classList.toggle('hidden', !show)
-    reopenBtn.classList.toggle('hidden', show)
-    // Resize the canvas to the new width WITHOUT refitting (keeps zoom/pan).
-    requestAnimationFrame(() => view.resize())
+  // --- Panel / minimap layout (resizable, hideable, persisted) -------------
+  // Sizes are in px so a drag maps 1:1 to the pointer. `sizes` is the live
+  // layout; LAYOUT_DEFAULT_KEY holds the user's own "default" (Settings → Set
+  // current as default), falling back to BUILTIN_SIZES.
+  const LAYOUT_KEY = '3cx-spy.layout'
+  const LAYOUT_DEFAULT_KEY = '3cx-spy.layout.default'
+  const BUILTIN_SIZES: LayoutSizes = {
+    left: 192,
+    right: 320,
+    miniW: 208,
+    miniH: 144,
+    leftHidden: false,
+    rightHidden: false
   }
+  const readSizes = (key: string): LayoutSizes | null => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) return null
+      const s = JSON.parse(raw) as Partial<LayoutSizes>
+      return {
+        left: clampSize(s.left, 120, 480, BUILTIN_SIZES.left),
+        right: clampSize(s.right, 200, 640, BUILTIN_SIZES.right),
+        miniW: clampSize(s.miniW, 120, 640, BUILTIN_SIZES.miniW),
+        miniH: clampSize(s.miniH, 90, 520, BUILTIN_SIZES.miniH),
+        leftHidden: !!s.leftHidden,
+        rightHidden: !!s.rightHidden
+      }
+    } catch {
+      return null
+    }
+  }
+  const sizes: LayoutSizes = readSizes(LAYOUT_KEY) ??
+    readSizes(LAYOUT_DEFAULT_KEY) ?? { ...BUILTIN_SIZES }
+
+  const leftPanelEl = root.querySelector<HTMLElement>('#leftPanel')!
+  const detailsPanelEl = root.querySelector<HTMLElement>('#detailsPanel')!
+  const leftResizeEl = root.querySelector<HTMLElement>('#leftResize')!
+  const rightResizeEl = root.querySelector<HTMLElement>('#rightResize')!
+  const reopenLeftBtn = root.querySelector<HTMLButtonElement>('#reopenLeft')!
+  const minimapWrapEl = root.querySelector<HTMLElement>('#minimapWrap')!
+
+  const persistSizes = (): void => {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(sizes))
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
+  }
+
+  // Minimap collapse is a separate, transient toggle (not a persisted size).
+  let minimapCollapsed = false
+
+  /** Push `sizes` into the DOM. `resizeCanvas` is skipped mid-drag for the
+   *  minimap (which doesn't affect the graph canvas at all). */
+  const applyLayout = (resizeCanvas = true): void => {
+    bodyEl.style.gridTemplateColumns = `${sizes.leftHidden ? 0 : sizes.left}px 1fr ${
+      sizes.rightHidden ? 0 : sizes.right
+    }px`
+    // NEVER display:none a grid child here. Doing so takes it out of grid
+    // auto-placement, so the remaining panels slide into the wrong columns — the
+    // graph collapsed into the 0-width column while the details panel stretched
+    // across the whole window. Collapsing is done purely by zeroing the column
+    // width; the panels already clip their content with overflow-hidden.
+    leftPanelEl.classList.toggle('border-r', !sizes.leftHidden)
+    detailsPanelEl.classList.toggle('border-l', !sizes.rightHidden)
+    // A collapsed panel's drag handle would otherwise sit on the canvas edge.
+    leftResizeEl.classList.toggle('hidden', sizes.leftHidden)
+    rightResizeEl.classList.toggle('hidden', sizes.rightHidden)
+    reopenLeftBtn.classList.toggle('hidden', !sizes.leftHidden)
+    reopenBtn.classList.toggle('hidden', !sizes.rightHidden)
+    minimapWrapEl.style.width = `${sizes.miniW}px`
+    minimapWrapEl.style.height = minimapCollapsed ? '20px' : `${sizes.miniH}px`
+    // Keep the "Navigation" button clear of the minimap it shares a corner with.
+    const mapH = minimapCollapsed ? 20 : sizes.miniH
+    reopenLeftBtn.style.bottom = `${12 + mapH + 8}px`
+    // Resize the canvas to the new width WITHOUT refitting (keeps zoom/pan).
+    if (resizeCanvas) requestAnimationFrame(() => view.resize())
+  }
+
+  /** Collapse the minimap down to just its caret button. */
+  const applyMinimapCollapse = (): void => {
+    minimapEl.classList.toggle('hidden', minimapCollapsed)
+    // The resize grip belongs to the map, so it goes with it.
+    miniResizeEl.classList.toggle('hidden', minimapCollapsed)
+    mapToggle.textContent = minimapCollapsed ? '▴' : '▾'
+    mapToggle.title = minimapCollapsed ? 'Show minimap' : 'Collapse minimap'
+    applyLayout(false)
+    if (!minimapCollapsed) minimap.sync()
+  }
+
+  const toggleDetails = (show: boolean): void => {
+    sizes.rightHidden = !show
+    persistSizes()
+    applyLayout()
+  }
+  const toggleLeftPanel = (show: boolean): void => {
+    sizes.leftHidden = !show
+    persistSizes()
+    applyLayout()
+  }
+
+  /** Wire a vertical drag handle that resizes one of the side panels. */
+  const wirePanelResize = (
+    handleId: string,
+    edge: 'left' | 'right',
+    min: number,
+    max: number
+  ): void => {
+    const handle = root.querySelector<HTMLElement>(handleId)
+    if (!handle) return
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault()
+      const startX = e.clientX
+      const startW = edge === 'left' ? sizes.left : sizes.right
+      const onMove = (ev: MouseEvent): void => {
+        // The right panel grows leftwards, so its delta is inverted.
+        const delta = edge === 'left' ? ev.clientX - startX : startX - ev.clientX
+        const next = Math.min(max, Math.max(min, startW + delta))
+        if (edge === 'left') sizes.left = next
+        else sizes.right = next
+        applyLayout()
+      }
+      const onUp = (): void => {
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+        document.body.style.userSelect = ''
+        persistSizes()
+      }
+      document.body.style.userSelect = 'none'
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    })
+    // Double-clicking the handle collapses that panel — quicker than dragging it
+    // all the way in, and it's the same target.
+    handle.addEventListener('dblclick', () => {
+      if (edge === 'left') toggleLeftPanel(false)
+      else toggleDetails(false)
+    })
+  }
+  wirePanelResize('#leftResize', 'left', 120, 480)
+  wirePanelResize('#rightResize', 'right', 200, 640)
+
+  // Minimap: anchored bottom-left, so dragging the top-right corner grows it.
+  const miniResizeEl = root.querySelector<HTMLElement>('#miniResize')!
+  miniResizeEl.addEventListener('mousedown', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startY = e.clientY
+    const startW = sizes.miniW
+    const startH = sizes.miniH
+    const onMove = (ev: MouseEvent): void => {
+      sizes.miniW = Math.min(640, Math.max(120, startW + (ev.clientX - startX)))
+      sizes.miniH = Math.min(520, Math.max(90, startH - (ev.clientY - startY)))
+      applyLayout(false)
+    }
+    const onUp = (): void => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      document.body.style.userSelect = ''
+      persistSizes()
+      minimap.sync() // re-fit the overview into its new box
+    }
+    document.body.style.userSelect = 'none'
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  })
+
+  reopenLeftBtn.addEventListener('click', () => toggleLeftPanel(true))
+  root.querySelector('#hideLeft')!.addEventListener('click', () => toggleLeftPanel(false))
 
   // --- Context menu -------------------------------------------------------
   const hideCtx = (): void => ctxEl.classList.add('hidden')
+  /** A separator row, shared by all three context menus. */
+  const divider = (): HTMLElement => {
+    const d = document.createElement('div')
+    d.className = 'my-1 border-t border-slate-200 dark:border-slate-700'
+    return d
+  }
   const showCtx = (node: GraphNode, x: number, y: number): void => {
     const item = (icon: string, label: string, fn: () => void): HTMLElement => {
       const b = document.createElement('button')
@@ -486,14 +771,27 @@ export function renderApp(
       })
       return b
     }
-    const divider = (): HTMLElement => {
-      const d = document.createElement('div')
-      d.className = 'my-1 border-t border-slate-200 dark:border-slate-700'
-      return d
-    }
     ctxEl.innerHTML = ''
     ctxEl.append(item('🎯', 'Focus here', () => enterFocus(node.id)))
     ctxEl.append(item('🧭', 'Trace call flow', () => showTracePanel(node)))
+    ctxEl.append(
+      item('🚫', 'Hide', () => {
+        // Hiding the node the view is focused on would leave the focus centred on
+        // nothing, so drop back to the whole graph first.
+        if (view.getFocusId() === node.id) {
+          history.length = 0
+          view.clearFocus()
+          clearDeptUI()
+          renderBreadcrumb()
+          syncFocusDepthRow()
+        }
+        view.hideNode(node.id)
+        undo.push({ type: 'hide', nodeIds: [node.id], edgeIds: [], edgeKinds: [], hidden: true })
+        // The details panel would otherwise still describe a node that's gone.
+        if (current?.id === node.id) showDetails(null)
+        flash('Node hidden — undo with Ctrl+Z.')
+      })
+    )
     ctxEl.append(
       item('🪟', 'Open in new window', () =>
         window.api.app.openWindow(`#focus=${encodeURIComponent(node.id)}`)
@@ -534,6 +832,45 @@ export function renderApp(
     ctxEl.style.top = `${Math.min(y, window.innerHeight - rect.height - 8)}px`
   }
 
+  // Right-click a link: hide just it, or every link of that type.
+  const showEdgeCtx = (
+    info: EdgeTapInfo & { edgeId: string },
+    x: number,
+    y: number
+  ): void => {
+    const item = (icon: string, label: string, fn: () => void): HTMLElement => {
+      const b = document.createElement('button')
+      b.className =
+        'w-full text-left flex items-center gap-2 px-2.5 py-1 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap'
+      b.innerHTML = `<span class="w-4 text-center shrink-0">${icon}</span><span>${esc(label)}</span>`
+      b.addEventListener('click', () => {
+        hideCtx()
+        fn()
+      })
+      return b
+    }
+    const kindLabel = EDGE_KIND_META[info.kind as EdgeKind]?.label ?? info.kind
+    ctxEl.innerHTML = ''
+    ctxEl.append(
+      item('🚫', 'Hide this link', () => {
+        view.hideEdge(info.edgeId)
+        undo.push({ type: 'hide', nodeIds: [], edgeIds: [info.edgeId], edgeKinds: [], hidden: true })
+        flash('Link hidden — undo with Ctrl+Z.')
+      })
+    )
+    ctxEl.append(
+      item('🚫', `Hide all “${kindLabel}” links`, () => {
+        view.hideEdgeKind(info.kind)
+        syncEdgeOptionsFromView()
+        undo.push({ type: 'hide', nodeIds: [], edgeIds: [], edgeKinds: [info.kind], hidden: true })
+        flash(`All ${kindLabel.toLowerCase()} links hidden — see Settings to restore.`)
+      })
+    )
+    ctxEl.append(divider())
+    ctxEl.append(item('⚙', 'Link settings…', () => openSettings()))
+    placeCtx(x, y)
+  }
+
   // Right-click on empty canvas: a compact Undo / Redo menu.
   const showBgCtx = (x: number, y: number): void => {
     const item = (icon: string, label: string, fn: () => void): HTMLElement => {
@@ -552,11 +889,46 @@ export function renderApp(
     else ctxEl.append(disabledItem('↩', 'Undo'))
     if (undo.canRedo()) ctxEl.append(item('↪', 'Redo', doRedo))
     else ctxEl.append(disabledItem('↪', 'Redo'))
+    // Only way back from "Hide", so it lives on the always-reachable menu.
+    const hiddenNodes = view.hiddenCount()
+    const hiddenEdges = view.hiddenEdgeCount()
+    if (hiddenNodes || hiddenEdges) ctxEl.append(divider())
+    if (hiddenNodes) {
+      ctxEl.append(
+        item('👁', `Show ${hiddenNodes} hidden node${hiddenNodes === 1 ? '' : 's'}`, () => {
+          const ids = view.hiddenNodeIds()
+          view.unhideAll()
+          undo.push({ type: 'hide', nodeIds: ids, edgeIds: [], edgeKinds: [], hidden: false })
+          flash('Hidden nodes restored.')
+        })
+      )
+    }
+    if (hiddenEdges) {
+      ctxEl.append(
+        item('👁', `Show ${hiddenEdges} hidden link${hiddenEdges === 1 ? '' : 's'}`, () => {
+          const ids = view.hiddenEdgeIdList()
+          const kinds = view.getHiddenEdgeKinds()
+          view.unhideAllEdges()
+          syncEdgeOptionsFromView()
+          undo.push({ type: 'hide', nodeIds: [], edgeIds: ids, edgeKinds: kinds, hidden: false })
+          flash('Hidden links restored.')
+        })
+      )
+    }
     placeCtx(x, y)
   }
   const onDocClick = (): void => hideCtx()
   document.addEventListener('click', onDocClick)
   cleanup.push(() => document.removeEventListener('click', onDocClick))
+
+  // --- Link display options (persisted; see settings.ts) -------------------
+  let edgeOptions: EdgeOptions = loadEdgeOptions()
+  /** Mirror the view's hidden link types back into the saved options, after an
+   *  undo/redo has changed them behind the Settings panel's back. */
+  const syncEdgeOptionsFromView = (): void => {
+    edgeOptions = { ...edgeOptions, hiddenKinds: view.getHiddenEdgeKinds() as EdgeOptions['hiddenKinds'] }
+    saveEdgeOptions(edgeOptions)
+  }
 
   // --- Graph view ---------------------------------------------------------
   const view = new GraphView(graphEl, graph, visible, theme, {
@@ -571,18 +943,60 @@ export function renderApp(
     onNodeContext: (node, x, y) => showCtx(node, x, y),
     onNodeDoubleTap: (node) => enterFocus(node.id),
     onEdgeTap: (info) => showEdgeDetails(info),
+    onEdgeContext: (info, x, y) => showEdgeCtx(info, x, y),
     onNodesMoved: (moves: NodeMove[]) => undo.push({ type: 'move', moves }),
     onBackgroundContext: (x, y) => showBgCtx(x, y)
   })
+  // Apply the saved link options to the fresh view.
+  view.setEdgeMuting(edgeOptions.opacity)
+  if (edgeOptions.hiddenKinds.length) view.setHiddenEdgeKinds(edgeOptions.hiddenKinds)
   showDetails(null)
   renderBreadcrumb()
 
   const minimap = new Minimap(minimapEl, view.core(), theme)
+  // Restore the saved panel / minimap geometry now that both exist.
+  applyLayout()
   // Tear down in dependency order: minimap & ego map reference the main core, so
   // they must be destroyed before the view destroys that core.
   cleanup.push(() => minimap.destroy())
   cleanup.push(() => egoMap?.destroy())
   cleanup.push(() => view.destroy())
+
+  // --- Focus reach slider -------------------------------------------------
+  // How many hops out from the focused node stay visible. Persisted, and only
+  // meaningful while a node is focused — the row dims when nothing is focused.
+  // Defined here (before the restore/initial-focus path below) so showNode can
+  // safely call syncFocusDepthRow once focus is entered.
+  const FOCUS_DEPTH_KEY = '3cx-spy.focusDepth'
+  const depthSlider = root.querySelector<HTMLInputElement>('#focusDepth')!
+  const depthValEl = root.querySelector<HTMLElement>('#focusDepthVal')!
+  const depthRow = root.querySelector<HTMLElement>('#focusDepthRow')!
+  const depthToHops = (v: number): number => (v >= 6 ? Infinity : v)
+  const depthLabel = (v: number): string =>
+    v >= 6 ? 'Whole cluster' : v === 1 ? 'Neighbours' : `${v} hops`
+  const syncFocusDepthRow = (): void => {
+    depthRow.classList.toggle('opacity-50', view.getFocusId() == null)
+  }
+  const storedDepth = Number(localStorage.getItem(FOCUS_DEPTH_KEY))
+  const initDepth = storedDepth >= 1 && storedDepth <= 6 ? storedDepth : 1
+  depthSlider.value = String(initDepth)
+  depthValEl.textContent = depthLabel(initDepth)
+  view.setFocusDepth(depthToHops(initDepth))
+  const applyDepth = (v: number): void => {
+    const clamped = Math.min(6, Math.max(1, v))
+    depthSlider.value = String(clamped)
+    localStorage.setItem(FOCUS_DEPTH_KEY, String(clamped))
+    depthValEl.textContent = depthLabel(clamped)
+    view.setFocusDepth(depthToHops(clamped))
+  }
+  depthSlider.addEventListener('input', () => applyDepth(Number(depthSlider.value)))
+  root
+    .querySelector('#depthOut')!
+    .addEventListener('click', () => applyDepth(Number(depthSlider.value) - 1))
+  root
+    .querySelector('#depthIn')!
+    .addEventListener('click', () => applyDepth(Number(depthSlider.value) + 1))
+  syncFocusDepthRow()
 
   // --- Legend: show/hide (checkbox) + highlight (name) --------------------
   root.querySelectorAll<HTMLInputElement>('#legend input[data-kind]').forEach((c) => {
@@ -631,6 +1045,7 @@ export function renderApp(
   const setDept = (bucket: string | null): void => {
     activeDept = bucket
     view.setDepartmentFilter(bucket)
+    syncFocusDepthRow()
     clearHighlightUI()
     deptButtons.forEach((el) => {
       const on = (el.dataset.dept || null) === bucket
@@ -682,61 +1097,102 @@ export function renderApp(
   mapToggle.addEventListener('mousedown', (e) => e.stopPropagation())
   mapToggle.addEventListener('click', (e) => {
     e.stopPropagation()
-    const hidden = minimapEl.classList.toggle('hidden')
-    mapToggle.textContent = hidden ? 'Show' : 'Hide'
+    minimapCollapsed = !minimapCollapsed
+    applyMinimapCollapse()
   })
 
-  // --- Node lock (padlock + Space-to-pan) ---------------------------------
+  // --- Node lock (padlock / Space) ----------------------------------------
   const lockBtn = root.querySelector<HTMLButtonElement>('#lock')!
-  // Locked by default so panning never accidentally drags nodes; unlock via the
-  // padlock button (or hold Space) to reposition nodes.
+  // Locked by default so panning never accidentally drags nodes. Toggle with the
+  // padlock button or Space. Locked nodes stay fully clickable — only dragging
+  // them is disabled.
   let locked = true
-  let spaceHeld = false
   const applyLock = (): void => {
-    if (spaceHeld) {
-      // Hold Space: fully pass pointer events through so a drag anywhere pans.
-      view.setNodesGrabbable(false)
-    } else {
-      // Padlock lock: not draggable, but nodes/edges/departments stay clickable.
-      view.setDraggable(!locked)
-    }
-    lockBtn.textContent = locked || spaceHeld ? '🔒 Locked' : '🔓 Lock'
+    view.setDraggable(!locked)
+    lockBtn.textContent = locked ? '🔒 Locked' : '🔓 Unlocked'
     lockBtn.classList.toggle('bg-sky-700', locked)
   }
-  lockBtn.addEventListener('click', () => {
+  const toggleLock = (): void => {
     locked = !locked
     applyLock()
-  })
+  }
+  lockBtn.addEventListener('click', toggleLock)
   applyLock()
+
+  // --- Ctrl-key shortcuts for the menu / toolbar actions ------------------
+  // `key` matches KeyboardEvent.key (lowercase); `shift:true` also requires
+  // Shift. Kept clear of the existing Ctrl+Z / Ctrl+Y (undo / redo). The action
+  // closures reference handlers defined later in this function; that's fine —
+  // they only run on a keypress, well after setup completes.
+  interface Shortcut {
+    key: string
+    shift?: boolean
+    label: string
+    run: () => void
+  }
+  const shortcuts: Shortcut[] = [
+    {
+      key: 'f',
+      label: 'Search',
+      run: () => {
+        searchEl.focus()
+        searchEl.select()
+      }
+    },
+    { key: 'h', label: 'Health check', run: () => showAuditPanel() },
+    { key: 'x', label: 'Extensions', run: () => showExtensionsPanel() },
+    { key: 'd', label: 'DID table', run: () => showDidTable() },
+    { key: 'g', label: 'Generate report', run: () => showReportSetup(nameFor, deptFor) },
+    { key: 'l', label: 'Live report', run: () => void showLiveReport(nameFor, deptFor) },
+    { key: 'o', label: 'Open report', run: () => void openReport(nameFor, deptFor) },
+    { key: 'j', label: 'Call zones', run: () => showZoneSettings() },
+    { key: 'e', label: 'Export PNG', run: () => exportPng(view, theme, host) },
+    { key: 's', label: 'Save snapshot', run: () => void saveSnapshot() },
+    { key: 'i', label: 'Open snapshot', run: () => cb.onOpenSnapshot() },
+    { key: ',', label: 'Settings', run: () => openSettings() },
+    { key: 'm', label: 'Toggle theme', run: () => toggleTheme() },
+    { key: 'r', label: 'Refresh', run: () => refreshBtn.click() },
+    { key: 'r', shift: true, label: 'Hard refresh', run: () => cb.onReload() },
+    { key: 'u', label: 'Check for updates', run: () => void checkForUpdates() },
+    { key: 'q', label: 'Disconnect', run: () => cb.onDisconnect() }
+  ]
+  // Human accelerator hint for a shortcut, e.g. "Ctrl+Shift+R".
+  const accel = (s: Shortcut): string => `Ctrl+${s.shift ? 'Shift+' : ''}${s.key.toUpperCase()}`
+  const accelByLabel = new Map(shortcuts.map((s) => [s.label, accel(s)]))
+  // Suppress the app shortcuts while any full-screen modal/overlay is open, so
+  // e.g. Ctrl+G in an open report doesn't stack a second dialog behind it.
+  const modalOpen = (): boolean => !!document.querySelector('.fixed.inset-0:not(.hidden)')
+
   const onKeyDown = (e: KeyboardEvent): void => {
-    if (e.code === 'Space' && !isTyping(e.target) && !spaceHeld) {
+    // Space toggles the padlock outright (it used to be hold-to-pan).
+    if (e.code === 'Space' && !isTyping(e.target)) {
       e.preventDefault()
-      spaceHeld = true
-      applyLock()
+      toggleLock()
       return
     }
-    // Undo / redo. Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes.
     if ((e.ctrlKey || e.metaKey) && !isTyping(e.target)) {
       const key = e.key.toLowerCase()
+      // Undo / redo. Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes.
       if (key === 'z' && !e.shiftKey) {
         e.preventDefault()
         doUndo()
-      } else if (key === 'y' || (key === 'z' && e.shiftKey)) {
+        return
+      }
+      if (key === 'y' || (key === 'z' && e.shiftKey)) {
         e.preventDefault()
         doRedo()
+        return
+      }
+      if (modalOpen()) return
+      const sc = shortcuts.find((s) => s.key === key && !!s.shift === e.shiftKey)
+      if (sc) {
+        e.preventDefault()
+        sc.run()
       }
     }
   }
-  const onKeyUp = (e: KeyboardEvent): void => {
-    if (e.code === 'Space') {
-      spaceHeld = false
-      applyLock()
-    }
-  }
   window.addEventListener('keydown', onKeyDown)
-  window.addEventListener('keyup', onKeyUp)
   cleanup.push(() => window.removeEventListener('keydown', onKeyDown))
-  cleanup.push(() => window.removeEventListener('keyup', onKeyUp))
 
   // Capture the user-facing view so a soft refresh can restore it after refetch.
   const captureState = (): ViewState => ({
@@ -822,12 +1278,57 @@ export function renderApp(
     minimap.setTheme(theme)
     if (current) showDetails(current)
   }
+
+  const openSettings = (): void =>
+    showSettings({
+      theme,
+      edgeOptions,
+      onEdgeOptions: (o) => {
+        edgeOptions = o
+        saveEdgeOptions(o)
+        view.setEdgeMuting(o.opacity)
+        view.setHiddenEdgeKinds(o.hiddenKinds)
+      },
+      onToggleTheme: toggleTheme,
+      onOpenZones: () => showZoneSettings(),
+      onCheckUpdates: () => void checkForUpdates(),
+      individuallyHiddenEdges: view.hiddenEdgeIdList().length,
+      onRestoreHiddenEdges: () => {
+        const ids = view.hiddenEdgeIdList()
+        view.unhideEdges(ids)
+        undo.push({ type: 'hide', nodeIds: [], edgeIds: ids, edgeKinds: [], hidden: false })
+        flash('Hidden links restored.')
+      },
+      onSaveLayoutDefault: () => {
+        try {
+          localStorage.setItem(LAYOUT_DEFAULT_KEY, JSON.stringify(sizes))
+          flash('Current panel sizes saved as default.')
+        } catch {
+          flash('Could not save the layout default.', true)
+        }
+      },
+      onRestoreLayout: () => {
+        const target = readSizes(LAYOUT_DEFAULT_KEY) ?? BUILTIN_SIZES
+        Object.assign(sizes, target)
+        persistSizes()
+        applyLayout()
+        minimap.sync()
+        flash('Panel sizes restored.')
+      },
+      homeCountry: readHomeCountry(),
+      onHomeCountry: (iso2) => writeHomeCountry(iso2)
+    })
   const buildMenu = (): void => {
-    const item = (icon: string, label: string, fn: () => void): HTMLElement => {
+    const item = (icon: string, label: string, fn: () => void, accelHint?: string): HTMLElement => {
       const b = document.createElement('button')
       b.className =
-        'w-full text-left flex items-center gap-2.5 px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700'
-      b.innerHTML = `<span class="w-4 text-center">${icon}</span><span>${esc(label)}</span>`
+        'w-full text-left flex items-center gap-2.5 px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap'
+      const hint = accelHint ?? accelByLabel.get(label)
+      b.innerHTML = `<span class="w-4 text-center shrink-0">${icon}</span><span class="flex-1">${esc(label)}</span>${
+        hint
+          ? `<span class="shrink-0 pl-3 text-[10px] text-slate-400 font-mono tracking-tight">${esc(hint)}</span>`
+          : ''
+      }`
       b.addEventListener('click', () => {
         menuEl.classList.add('hidden')
         fn()
@@ -846,30 +1347,25 @@ export function renderApp(
     // Analyse — read-only insight tools.
     menuEl.append(section('Analyse'))
     menuEl.append(item('🩺', 'Health check', showAuditPanel))
+    menuEl.append(item('👥', 'Extensions', showExtensionsPanel))
     menuEl.append(item('🗂', 'DID table', showDidTable))
     // Reports — call-activity reporting.
     menuEl.append(section('Reports'))
-    menuEl.append(item('📊', 'Generate report', () => showReportSetup(nameFor)))
-    menuEl.append(item('📡', 'Live report', () => void showLiveReport(nameFor)))
-    menuEl.append(item('📈', 'Open report', () => void openReport(nameFor)))
+    menuEl.append(item('📊', 'Generate report', () => showReportSetup(nameFor, deptFor)))
+    menuEl.append(item('📡', 'Live report', () => void showLiveReport(nameFor, deptFor)))
+    menuEl.append(item('📈', 'Open report', () => void openReport(nameFor, deptFor)))
     // Export & snapshots — get data out / back in.
     menuEl.append(section('Export & snapshots'))
     menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
     menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
     menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
-    // View — appearance.
-    menuEl.append(section('View'))
-    menuEl.append(
-      item(
-        theme === 'dark' ? '☀' : '🌙',
-        theme === 'dark' ? 'Light mode' : 'Dark mode',
-        toggleTheme
-      )
-    )
+    // Everything configurable lives in Settings — deliberately not duplicated
+    // here, so there's one place to change a setting.
+    menuEl.append(section('Settings'))
+    menuEl.append(item('⚙', 'Settings', openSettings))
     // Session — connection lifecycle.
     menuEl.append(section('Session'))
     menuEl.append(item('🔄', 'Hard refresh', cb.onReload))
-    menuEl.append(item('⬆', 'Check for updates', () => checkForUpdates()))
     menuEl.append(item('⏏', 'Disconnect', cb.onDisconnect))
   }
   menuBtn.addEventListener('click', (e) => {
@@ -888,6 +1384,13 @@ export function renderApp(
 
   // --- Help modal ---------------------------------------------------------
   const helpModal = root.querySelector<HTMLElement>('#helpModal')!
+  const shortcutListEl = root.querySelector<HTMLElement>('#shortcutList')!
+  shortcutListEl.innerHTML = shortcuts
+    .map(
+      (s) =>
+        `<div class="flex items-center justify-between gap-2"><span class="text-slate-500 dark:text-slate-300 truncate">${esc(s.label)}</span><span class="shrink-0 px-1 py-0.5 rounded border border-current text-[9px] leading-none text-slate-400 font-mono">${esc(accel(s))}</span></div>`
+    )
+    .join('')
   root.querySelector('#help')!.addEventListener('click', () => helpModal.classList.remove('hidden'))
   root
     .querySelector('#helpClose')!
@@ -1039,6 +1542,59 @@ export function renderApp(
     panel.querySelector('#didCsv')?.addEventListener('click', () => exportDidCsv(rows, host))
   }
 
+  // --- Extension status ---------------------------------------------------
+  // Every extension with its live presence and whether it's logged in to queues,
+  // so an agent who's quietly signed out is easy to spot.
+  const showExtensionsPanel = (): void => {
+    const rows = graph.nodes
+      .filter((n) => n.kind === 'user')
+      .sort((a, b) => (a.number ?? '').localeCompare(b.number ?? '', undefined, { numeric: true }))
+    if (!rows.length) {
+      panelShell('Extensions', `<p class="text-slate-500 dark:text-slate-400">No extensions.</p>`)
+      return
+    }
+    const queueTotals = { in: 0, out: 0, unknown: 0 }
+    const body = rows
+      .map((n) => {
+        const presence = presenceOf(n.raw)
+        const meta = presence ? PRESENCE_META[presence] : null
+        const logged = queueLoggedIn(n.raw)
+        if (logged === true) queueTotals.in++
+        else if (logged === false) queueTotals.out++
+        else queueTotals.unknown++
+        const queueCell =
+          logged === null
+            ? '<span class="text-slate-400">—</span>'
+            : logged
+              ? '<span class="text-emerald-600 dark:text-emerald-400">Logged in</span>'
+              : '<span class="text-amber-600 dark:text-amber-400">Logged out</span>'
+        const depts = n.departments?.length ? n.departments.join(', ') : ''
+        return `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+          <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(n.number ?? '')}</td>
+          <td class="py-1 pr-2"><button data-nav="${esc(n.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(n.label)}</button></td>
+          <td class="py-1 pr-2 whitespace-nowrap">${
+            meta
+              ? `<span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full shrink-0" style="background:${meta.color}"></span>${esc(meta.label)}</span>`
+              : '<span class="text-slate-400">Unknown</span>'
+          }</td>
+          <td class="py-1 pr-2 whitespace-nowrap">${queueCell}</td>
+          <td class="py-1 truncate max-w-[160px] text-slate-500 dark:text-slate-400">${esc(depts)}</td>
+        </tr>`
+      })
+      .join('')
+    const summary = `<p class="text-[11px] text-slate-400 mb-1.5">${rows.length} extensions · ${queueTotals.in} logged in to queues · ${queueTotals.out} logged out${queueTotals.unknown ? ` · ${queueTotals.unknown} unknown` : ''}</p>`
+    const table = `<div class="overflow-x-auto"><table class="w-full text-[11px]">
+      <thead><tr class="text-left text-slate-400">
+        <th class="pr-2 pb-1 font-medium">Ext</th>
+        <th class="pr-2 pb-1 font-medium">Name</th>
+        <th class="pr-2 pb-1 font-medium">Status</th>
+        <th class="pr-2 pb-1 font-medium">Queues</th>
+        <th class="pb-1 font-medium">Department</th>
+      </tr></thead><tbody>${body}</tbody></table></div>`
+    panelShell(`Extensions — ${rows.length}`, summary + table)
+    wireNav()
+  }
+
   // --- Trace-a-call -------------------------------------------------------
   const showTracePanel = (node: GraphNode): void => {
     const { sources, terminals } = view.traceFlow(node.id)
@@ -1067,7 +1623,7 @@ export function renderApp(
 
   // --- Snapshot save ------------------------------------------------------
   const saveSnapshot = async (): Promise<void> => {
-    const res = await window.api.app.saveSnapshot(topology)
+    const res = await window.api.app.saveSnapshot(topology, readSnapshotDir() || undefined)
     if (res.error) flash(res.error, true)
     else if (res.path) flash('Snapshot saved.')
   }

@@ -9,3 +9,9 @@ declare module 'cytoscape-fcose' {
   const ext: Ext
   export default ext
 }
+
+// Vite raw-text imports (e.g. the bundled tariff CSV).
+declare module '*?raw' {
+  const content: string
+  export default content
+}
