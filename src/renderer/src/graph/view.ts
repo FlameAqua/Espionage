@@ -60,6 +60,10 @@ interface ViewCallbacks {
   onEdgeTap: (info: EdgeTapInfo) => void
   /** A link was right-clicked; coords are viewport (client) pixels. */
   onEdgeContext: (info: EdgeTapInfo & { edgeId: string }, x: number, y: number) => void
+  /** A department box (its own empty space, not a node inside it) was tapped. */
+  onDepartmentTap: (bucket: string) => void
+  /** A department box was right-clicked; coords are viewport (client) pixels. */
+  onDepartmentContext: (bucket: string, x: number, y: number) => void
   /** One or more nodes finished being dragged to a new position. */
   onNodesMoved: (moves: NodeMove[]) => void
   /** The empty background was right-clicked (not a box-select drag); coords are
@@ -153,8 +157,16 @@ export class GraphView {
     let lastTapId = ''
     let lastTapAt = 0
     this.cy.on('tap', 'node', (evt) => {
-      const node = (evt.target as NodeSingular).data('model') as GraphNode | undefined
-      if (!node) return // department container box — ignore taps on it
+      const target = evt.target as NodeSingular
+      // A compound department box has no model; tapping its own space selects the
+      // whole department rather than doing nothing.
+      if (target.hasClass('dept-parent')) {
+        this.collapseEdge()
+        this.cb.onDepartmentTap(String(target.data('bucket') ?? ''))
+        return
+      }
+      const node = target.data('model') as GraphNode | undefined
+      if (!node) return
       this.collapseEdge() // leaving a link restores its compact "N routes" form
       this.cy.nodes().unselect() // a plain tap clears any right-drag group selection
       const now = Date.now()
@@ -173,9 +185,18 @@ export class GraphView {
       }
     })
     this.cy.on('cxttap', 'node', (evt) => {
-      const node = (evt.target as NodeSingular).data('model') as GraphNode | undefined
-      if (!node) return
+      const target = evt.target as NodeSingular
       const oe = evt.originalEvent as MouseEvent
+      if (target.hasClass('dept-parent')) {
+        this.cb.onDepartmentContext(
+          String(target.data('bucket') ?? ''),
+          oe?.clientX ?? 0,
+          oe?.clientY ?? 0
+        )
+        return
+      }
+      const node = target.data('model') as GraphNode | undefined
+      if (!node) return
       this.cb.onNodeContext(node, oe?.clientX ?? 0, oe?.clientY ?? 0)
     })
     this.cy.on('tap', 'edge', (evt) => {
@@ -358,7 +379,8 @@ export class GraphView {
     const parents: ElementDefinition[] = []
     buckets.forEach((color, bucket) => {
       parents.push({
-        data: { id: `dept:${bucket}`, label: departmentLabel(bucket), deptColor: color },
+        // `bucket` is read back by the tap / context handlers.
+        data: { id: `dept:${bucket}`, bucket, label: departmentLabel(bucket), deptColor: color },
         classes: 'dept-parent'
       })
     })
@@ -555,6 +577,13 @@ export class GraphView {
   }
 
   /** Resize the canvas to its container without re-fitting (preserves view). */
+  /** Nudge the camera by a pixel delta. Used to cancel out the visual jump when
+   *  the canvas's LEFT edge moves (collapsing / resizing the left panel): pan is
+   *  relative to the container, so content would otherwise slide with the edge. */
+  panBy(x: number, y = 0): void {
+    this.cy.panBy({ x, y })
+  }
+
   resize(): void {
     this.cy.resize()
   }
@@ -672,10 +701,12 @@ export class GraphView {
    *  camera — so don't reintroduce that. */
   setFocusDepth(depth: number): void {
     this.focusDepth = depth
-    if (this.focusId == null) return
+    // Applies to a focused node and to a department filter alike.
+    if (this.focusId == null && this.deptFilter == null) return
     this.cy.stop()
     this.applyVisibility()
-    this.emphasizeFocus(this.focusId)
+    if (this.focusId != null) this.emphasizeFocus(this.focusId)
+    else if (this.deptFilter != null) this.highlightDepartment(this.deptFilter)
     // Deferred a frame so the display:none changes flush before the layout reads
     // positions (otherwise re-shown nodes lay out from stale coordinates).
     requestAnimationFrame(() => this.runLayout(true))
@@ -736,6 +767,45 @@ export class GraphView {
 
   getDepartmentFilter(): string | null {
     return this.deptFilter
+  }
+
+  /** Whether the view is narrowed to something — a focused node OR a department.
+   *  Both are "focused views", so both are governed by the Focus Reach setting. */
+  isFocusedView(): boolean {
+    return this.focusId !== null || this.deptFilter !== null
+  }
+
+  /** Every node assigned to a department bucket. */
+  departmentMembers(bucket: string): GraphNode[] {
+    const out: GraphNode[] = []
+    this.cy.nodes().forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      if (model && model.deptGroup === bucket) out.push(model)
+    })
+    return out
+  }
+
+  /** Spotlight a department: its members and the links between them, dimming the
+   *  rest. Mirrors what focusing a node does, one level up. */
+  highlightDepartment(bucket: string): void {
+    this.cy.elements().removeClass('faded selected dim lit')
+    this.cy.elements().not('.dept-parent').addClass('faded')
+    const members = this.cy.nodes().filter((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      return !!model && model.deptGroup === bucket
+    })
+    members.removeClass('faded').addClass('selected')
+    // Internal links only: a link leaving the department belongs to its neighbour
+    // as much as to it, so leave those dimmed.
+    members.edgesWith(members).removeClass('faded').addClass('lit')
+  }
+
+  /** Hide every member of a department. Returns the ids hidden, for undo. */
+  hideDepartment(bucket: string): string[] {
+    const ids = this.departmentMembers(bucket).map((n) => n.id)
+    for (const id of ids) this.manuallyHidden.add(id)
+    this.applyVisibility()
+    return ids
   }
 
   /** Whether a node exists and is currently on-screen (not filtered out). */
@@ -919,7 +989,16 @@ export class GraphView {
         const model = n.data('model') as GraphNode | undefined
         return !!model && model.deptGroup === this.deptFilter
       })
-      deptIds = new Set(members.closedNeighborhood().map((e) => e.id()))
+      // A department is a focused view too, so Focus Reach grows it: 1 hop = the
+      // members plus what they touch, higher = further out, top notch = the whole
+      // connected cluster they belong to.
+      let hood = Number.isFinite(this.focusDepth)
+        ? members.closedNeighborhood()
+        : members.component()
+      for (let hop = 1; Number.isFinite(this.focusDepth) && hop < this.focusDepth; hop++) {
+        hood = hood.closedNeighborhood()
+      }
+      deptIds = new Set(hood.map((e) => e.id()))
       // Also walk backward — who routes INTO a member — several hops deep, so
       // the whole entry chain (e.g. Inbound Rule -> shared main IVR -> this
       // department's own IVR/queue -> member) stays visible even when the
@@ -997,6 +1076,20 @@ export class GraphView {
 
   getEdgeMuting(): number {
     return this.edgeOpacity
+  }
+
+  /** Spotlight a specific set of nodes, dimming everything else — used to show
+   *  which nodes a snapshot comparison flagged as changed. */
+  highlightIds(ids: string[]): void {
+    const wanted = new Set(ids)
+    this.cy.elements().removeClass('faded selected dim lit')
+    this.cy.elements().not('.dept-parent').addClass('faded')
+    const matched = this.cy.nodes().filter((n) => wanted.has(n.id()))
+    matched.removeClass('faded').addClass('selected')
+    // Keep links between two highlighted nodes visible so a routing change reads
+    // as a path rather than two unrelated boxes.
+    matched.edgesWith(matched).removeClass('faded').addClass('lit')
+    if (!matched.empty()) this.cy.animate({ fit: { eles: matched, padding: 60 } }, { duration: 400 })
   }
 
   /** Dim everything except nodes of the given kind (null clears the highlight). */
@@ -1194,10 +1287,20 @@ function buildStyle(
   const edgeLabelColor = dark ? '#cbd5e1' : '#475569'
   const edgeLabelBg = dark ? '#0f172a' : '#ffffff'
   const borderColor = dark ? '#e2e8f0' : '#0f172a'
-  // Must match the canvas colour behind the graph (see the <main> background in
-  // app.ts) or the blended node fills won't look like the old translucent ones.
+  // What node fills are blended against to stay opaque (opaque bodies are what
+  // stop links showing through them).
+  //
+  // Light mode blends toward the canvas, which keeps the familiar pale tint. Dark
+  // mode deliberately does NOT: blending toward a near-black canvas crushed every
+  // category into much the same dark navy, so fills are built on a lighter slate
+  // instead. Nodes then read as raised panels against the dark canvas and the
+  // category colours stay distinguishable.
   const canvasBg = dark ? '#020617' : '#f1f5f9'
-  const fillAlpha = dark ? 0.32 : 0.18
+  const fillBase = dark ? '#243044' : canvasBg
+  const fillAlpha = dark ? 0.5 : 0.18
+  // Kind-coloured borders carry the category, so let them read strongly in dark
+  // mode where the fill contrast is inherently lower.
+  const nodeBorderOpacity = dark ? 0.85 : 0.35
 
   const style: cytoscape.StylesheetJson = [
     {
@@ -1216,7 +1319,7 @@ function buildStyle(
         shape: 'round-rectangle',
         'border-width': 2,
         'border-color': borderColor,
-        'border-opacity': 0.25
+        'border-opacity': nodeBorderOpacity
       }
     },
     {
@@ -1236,6 +1339,18 @@ function buildStyle(
         'text-background-color': edgeLabelBg,
         'text-background-opacity': 0.85,
         'text-background-padding': '1px'
+      }
+    },
+    // Self-loops (an IVR's "repeat prompt" routes back to itself). Loops need
+    // their arc configured explicitly, otherwise Cytoscape can't place the
+    // endpoints and logs "invalid endpoints and so it is impossible to draw".
+    {
+      selector: 'edge:loop',
+      style: {
+        'curve-style': 'bezier',
+        'loop-direction': '-45deg',
+        'loop-sweep': '30deg',
+        'control-point-step-size': 40
       }
     },
     // The individual routes a collapsed "N routes" edge splits into on click.
@@ -1288,7 +1403,7 @@ function buildStyle(
       style: {
         // Pre-blended + fully opaque: same tint as before, but edges routed
         // behind the node are hidden by it rather than showing through.
-        'background-color': blendToBackground(meta.color, canvasBg, fillAlpha),
+        'background-color': blendToBackground(meta.color, fillBase, fillAlpha),
         'background-opacity': 1,
         'border-color': meta.color
       }
@@ -1309,7 +1424,7 @@ function buildStyle(
     {
       selector: 'node.status-disabled',
       style: {
-        'background-color': blendToBackground('#94a3b8', canvasBg, dark ? 0.16 : 0.1),
+        'background-color': blendToBackground('#94a3b8', fillBase, dark ? 0.3 : 0.1),
         'background-opacity': 1,
         'border-style': 'dashed',
         'border-opacity': 0.5

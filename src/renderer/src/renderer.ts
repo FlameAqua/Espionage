@@ -9,6 +9,7 @@ import { initUpdates } from './ui/updates'
 
 const root = document.getElementById('root')!
 
+
 const LOADING_MESSAGES = [
   'Breaking the Geneva Convention…',
   'Bending fibre lines…',

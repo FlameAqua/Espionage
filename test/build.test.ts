@@ -37,4 +37,47 @@ describe('buildTopology', () => {
     )
     expect(agentEdge).toBeTruthy()
   })
+
+  it('leaves per-queue login undefined when the agent entry says nothing', () => {
+    const agentEdge = g.edges.find((e) => e.kind === 'agent')
+    expect(agentEdge?.agentLoggedIn).toBeUndefined()
+  })
+})
+
+// 3CX v20 lets a supervisor log an agent out of one queue while leaving them
+// logged in to another, so the state has to live on each queue → agent link.
+describe('buildTopology — per-queue agent login', () => {
+  const g = buildTopology({
+    ...topo,
+    users: { path: '', value: [{ Number: '2001', FirstName: 'Alice', Id: '1' }] },
+    queues: {
+      path: '',
+      value: [
+        {
+          Number: '8000',
+          Name: 'Sales',
+          Id: '10',
+          Agents: [{ Number: '2001', Id: '1', QueueStatus: 'LoggedIn' }]
+        },
+        {
+          Number: '8001',
+          Name: 'Support',
+          Id: '11',
+          Agents: [{ Number: '2001', Id: '1', QueueStatus: 'LoggedOut' }]
+        }
+      ]
+    }
+  })
+  const edgeFrom = (queueId: string): { agentLoggedIn?: boolean; labels: string[] } | undefined =>
+    g.edges.find((e) => e.source === queueId && e.target === 'user:2001' && e.kind === 'agent')
+
+  it('records each queue independently for the same extension', () => {
+    expect(edgeFrom('queue:8000')?.agentLoggedIn).toBe(true)
+    expect(edgeFrom('queue:8001')?.agentLoggedIn).toBe(false)
+  })
+
+  it('labels the logged-out link so it reads on the canvas', () => {
+    expect(edgeFrom('queue:8001')?.labels).toContain('agent (logged out)')
+    expect(edgeFrom('queue:8000')?.labels).toContain('agent')
+  })
 })

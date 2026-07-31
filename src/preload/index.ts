@@ -20,7 +20,10 @@ const api = {
   threecx: {
     connect: (req: ConnectRequest): Promise<ConnectResult> =>
       ipcRenderer.invoke('threecx:connect', req),
-    fetchTopology: (): Promise<Topology> => ipcRenderer.invoke('threecx:fetchTopology'),
+    /** `includeQueueLogins` additionally reads per-queue agent login state from
+     *  the web client's Switchboard (slower — see main/threecx/switchboard.ts). */
+    fetchTopology: (opts?: { includeQueueLogins?: boolean }): Promise<Topology> =>
+      ipcRenderer.invoke('threecx:fetchTopology', opts),
     refresh: (): Promise<void> => ipcRenderer.invoke('threecx:refresh'),
     disconnect: (): Promise<void> => ipcRenderer.invoke('threecx:disconnect'),
     isConnected: (): Promise<boolean> => ipcRenderer.invoke('threecx:isConnected')

@@ -18,6 +18,7 @@ import type {
   Topology
 } from '../../shared/types'
 import { redactSecrets } from '../../shared/redact'
+import { SCRAPE_BUDGET_MS, scrapeQueueAgentLogins } from './switchboard'
 import {
   classifyDirection,
   countryFromBareNumber,
@@ -206,7 +207,7 @@ async function fetchSet(path: string): Promise<EntitySet> {
   }
 }
 
-export async function fetchTopology(): Promise<Topology> {
+export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Promise<Topology> {
   if (!session) throw new Error('Not connected.')
 
   const [
@@ -248,6 +249,14 @@ export async function fetchTopology(): Promise<Topology> {
   )
   const [queues2, ringGroups2, groups2, users2, receptionists2] = retried
 
+  // Per-queue agent logins aren't in the config API at all, so optionally read
+  // them from the web client's Switchboard and stamp them onto the agent entries
+  // (see switchboard.ts). Everything downstream then treats them as if 3CX had
+  // returned them, and falls back to the extension-wide status when absent.
+  if (opts?.includeQueueLogins) {
+    await applyQueueAgentLogins(queues2, session)
+  }
+
   // Redact credentials before the data ever leaves the main process — the
   // renderer and any saved snapshot then never contain SIP passwords / PINs.
   return redactSecrets<Topology>({
@@ -263,6 +272,56 @@ export async function fetchTopology(): Promise<Topology> {
     trunks,
     groups: groups2
   })
+}
+
+// --- Per-queue agent logins (Switchboard read) -------------------------------
+
+/** Scrape the Switchboard and write each agent's per-queue login state onto that
+ *  queue's own `Agents[]` entry as `QueueStatus`. Mutates `queueSet` in place and
+ *  records any problem as a non-fatal error on the set, so a failed read never
+ *  costs the user their topology. */
+async function applyQueueAgentLogins(queueSet: EntitySet, sess: Session): Promise<void> {
+  const targets = (queueSet.value as Obj[])
+    .map((q) => ({ id: pickField(q, 'Id'), number: pickField(q, 'Number') }))
+    .filter((t) => t.id)
+  if (!targets.length) return
+
+  // Outer guard: the scrape has its own budget, but a topology fetch must never
+  // be blocked by it under any circumstances (a stalled navigation once left the
+  // app stuck on the loading screen), so cap it here too and move on.
+  const { byQueue, error } = await Promise.race([
+    scrapeQueueAgentLogins(sess.baseUrl, sess.req, targets, sess.allowInsecure),
+    new Promise<Awaited<ReturnType<typeof scrapeQueueAgentLogins>>>((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            byQueue: new Map(),
+            error: 'Per-queue login read did not finish in time; showing extension-wide status.'
+          }),
+        SCRAPE_BUDGET_MS + 15_000
+      )
+    )
+  ])
+  if (error) {
+    // Surface it without discarding whatever did come back.
+    queueSet.error = queueSet.error ? `${queueSet.error} ${error}` : error
+  }
+  if (!byQueue.size) return
+
+  for (const q of queueSet.value as Obj[]) {
+    const logins = byQueue.get(pickField(q, 'Id'))
+    if (!logins) continue
+    const byExt = new Map(logins.map((a) => [a.extension, a]))
+    const agents = q['Agents']
+    if (!Array.isArray(agents)) continue
+    for (const a of agents) {
+      if (!isObj(a)) continue
+      const hit = byExt.get(pickField(a, 'Number', 'Extension'))
+      if (!hit) continue
+      a['QueueStatus'] = hit.loggedIn ? 'LoggedIn' : 'LoggedOut'
+      if (hit.since) a['QueueStatusSince'] = hit.since
+    }
+  }
 }
 
 // --- Call-activity reports --------------------------------------------------
@@ -496,25 +555,54 @@ const CALL_LOG_ENDPOINTS = [
   '/xapi/v1/ReportCallLogData?startDate={from}&endDate={to}'
 ]
 
+/** HTTP status out of a "HTTP 404 on /path…" error message, if present. */
+function statusOf(message: string): number | null {
+  const m = /^HTTP (\d{3})\b/.exec(message)
+  return m ? Number(m[1]) : null
+}
+
+/** Explain why call reporting is unavailable, rather than quoting whichever
+ *  candidate endpoint happened to be tried last. */
+function describeReportFailure(failures: string[]): string {
+  const codes = failures.map(statusOf).filter((c): c is number => c !== null)
+  if (codes.some((c) => c === 401 || c === 403)) {
+    return 'Call reporting was refused (HTTP 401/403). The account used to connect probably lacks reporting permission — try a full admin account.'
+  }
+  if (codes.length && codes.every((c) => c === 404)) {
+    return 'This 3CX system does not expose a call-log endpoint (HTTP 404). Call reporting is licence-gated, so it is typically unavailable on the free/standard editions.'
+  }
+  return failures[0] ?? 'No call-log data returned for this period.'
+}
+
 /** Fetch a historical call-activity report for [fromISO, toISO]. Degrades to an
  *  empty, error-tagged report when no endpoint is available (licence-gated). */
 export async function fetchCallReport(fromISO: string, toISO: string): Promise<CallReport> {
   if (!session) throw new Error('Not connected.')
   let rawRecords: unknown[] = []
-  let lastError = ''
+  // Track success separately from row count: an endpoint that answers with zero
+  // rows means "no calls in this period", which is NOT an error. Previously the
+  // loop kept going after such a response and then reported the *next*
+  // candidate's 404, blaming an endpoint that was never going to work.
+  let answered = false
+  const failures: string[] = []
   for (const tpl of CALL_LOG_ENDPOINTS) {
     const path = tpl
       .replace('{from}', encodeURIComponent(fromISO))
       .replace('{to}', encodeURIComponent(toISO))
     try {
-      rawRecords = await getCollection(path)
-      lastError = ''
-      if (rawRecords.length) break
+      const rows = await getCollection(path)
+      answered = true
+      rawRecords = rows
+      if (rows.length) break // got data; stop probing
     } catch (err) {
-      lastError = (err as Error).message
+      failures.push((err as Error).message)
     }
   }
   const entries = rawRecords.filter(isObj).map((r) => normalizeCallEntry(r as Obj))
+  let error: string | undefined
+  if (!entries.length) {
+    error = answered ? 'No calls found in this period.' : describeReportFailure(failures)
+  }
   return redactSecrets<CallReport>({
     kind: 'call-report',
     generatedAt: new Date().toISOString(),
@@ -525,7 +613,7 @@ export async function fetchCallReport(fromISO: string, toISO: string): Promise<C
     homeCountry: guessHomeCountry(entries),
     entries,
     perExtension: rollupByExtension(entries),
-    error: entries.length ? undefined : lastError || 'No call-log data returned for this period.'
+    error
   })
 }
 
@@ -537,7 +625,16 @@ export async function fetchActiveCalls(): Promise<CallReport> {
   try {
     rawRecords = await getCollection('/xapi/v1/ActiveCalls')
   } catch (err) {
-    error = (err as Error).message
+    const message = (err as Error).message
+    const status = statusOf(message)
+    // A bare "HTTP 401" here reads like a login problem even though the topology
+    // loaded fine, so name the actual cause: this endpoint is permission-gated.
+    error =
+      status === 401 || status === 403
+        ? 'Live calls were refused (HTTP 401/403). The connected account lacks permission to view active calls — try a full admin account.'
+        : status === 404
+          ? 'This 3CX system does not expose the active-calls endpoint (HTTP 404), so the live report is unavailable.'
+          : message
   }
   const entries = rawRecords.filter(isObj).map((r) => normalizeCallEntry(r as Obj))
   return redactSecrets<CallReport>({

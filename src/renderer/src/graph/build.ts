@@ -9,6 +9,7 @@
 import type { Topology } from '../../../shared/types'
 import {
   SHARED_DEPARTMENT,
+  agentLoggedIn,
   type GraphEdge,
   type GraphNode,
   type NodeKind,
@@ -96,8 +97,8 @@ class Builder {
     kind: GraphEdge['kind'],
     label?: string,
     allowSelf = false
-  ): void {
-    if (source === target && !allowSelf) return
+  ): GraphEdge | null {
+    if (source === target && !allowSelf) return null
     const id = `${source}->${target}`
     let edge = this.edgeByPair.get(id)
     if (!edge) {
@@ -106,6 +107,7 @@ class Builder {
       this.edgeByPair.set(id, edge)
     }
     if (label && !edge.labels.includes(label)) edge.labels.push(label)
+    return edge
   }
 
   /** Resolve a destination reference (by number, then id) to an existing node,
@@ -661,7 +663,14 @@ function addMembers(
         id: str(pick(m, 'Id')) || undefined
       }
       const target = b.resolveTarget(ref, `${sourceId} ${key}`)
-      if (target) b.addEdge(sourceId, target.id, kind, kind)
+      if (!target) continue
+      // 3CX v20 can log an agent out of one queue but not another, so the login
+      // state is read per agent entry and recorded on this queue's own link —
+      // labelling logged-out agents so it's visible on the canvas too.
+      const perQueue = kind === 'agent' ? agentLoggedIn(m) : null
+      const label = perQueue === false ? 'agent (logged out)' : kind
+      const edge = b.addEdge(sourceId, target.id, kind, label)
+      if (edge && perQueue !== null) edge.agentLoggedIn = perQueue
     }
   }
 }

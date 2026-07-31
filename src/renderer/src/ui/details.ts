@@ -5,12 +5,15 @@ import {
   NODE_KIND_META,
   PRESENCE_META,
   SHARED_DEPARTMENT,
+  departmentColor,
+  departmentLabel,
   presenceOf,
-  queueLoggedIn,
+  queueLoginState,
   type GraphEdge,
   type GraphNode,
   type TopologyGraph
 } from '../graph/model'
+import { panelHeader, panelHeaderRow } from './panel-chrome'
 
 const esc = (s: unknown): string =>
   String(s ?? '').replace(
@@ -26,19 +29,19 @@ interface Ctx {
   onHide: () => void
 }
 
-/** The pane's own heading, matching the "Navigation" title on the left panel. */
-function panelTitle(): string {
-  return `<span class="text-[11px] font-bold text-slate-400 uppercase tracking-wide">Details</span>`
+/** The panel's Back control, greyed out when there's no history to go back to. */
+function backButton(ctx: Ctx): string {
+  const enabled = ctx.canGoBack
+    ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'
+    : 'text-slate-300 dark:text-slate-700 cursor-default'
+  return `<button id="back" class="px-2 py-0.5 rounded text-xs ${enabled}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>`
 }
 
 export function renderDetails(container: HTMLElement, node: GraphNode | null, ctx: Ctx): void {
   if (!node) {
     container.innerHTML = `
       <div class="flex flex-col h-full">
-        <div class="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-200 dark:border-slate-800">
-          ${panelTitle()}
-          <button id="hide" class="px-2 py-1 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
-        </div>
+        ${panelHeader({ title: 'Details', side: 'right', hideId: 'hide' })}
         <div class="p-6 text-sm text-slate-400">Select a node to inspect it.</div>
       </div>`
     container.querySelector('#hide')?.addEventListener('click', ctx.onHide)
@@ -88,7 +91,10 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
         )
         .join('')}</div>`
     : ''
-  const facts = keyFacts(node)
+  const facts = keyFacts(
+    node,
+    inc.filter((e) => e.kind === 'agent')
+  )
   const depts = node.departments?.length
     ? `<div class="flex flex-wrap gap-1">${node.departments
         .map(
@@ -101,10 +107,13 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
   container.innerHTML = `
     <div class="flex flex-col h-full">
       <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
-        <div class="flex items-center justify-between mb-1.5">
-          <button id="back" class="px-2 py-0.5 rounded text-xs ${ctx.canGoBack ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800' : 'text-slate-300 dark:text-slate-700 cursor-default'}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>
-          ${panelTitle()}
-          <button id="hide" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
+        <div class="mb-1.5">
+          ${panelHeaderRow({
+            title: 'Details',
+            side: 'right',
+            hideId: 'hide',
+            leading: backButton(ctx)
+          })}
         </div>
         <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white" style="background:${meta.color}">${esc(meta.label)}</span>
         <h2 class="mt-1.5 text-base font-semibold text-slate-800 dark:text-slate-100 leading-tight">${esc(node.label)}</h2>
@@ -124,6 +133,127 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">Raw JSON</summary>
           <pre class="mt-2 p-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[11px] leading-snug overflow-x-auto text-slate-700 dark:text-slate-300">${esc(JSON.stringify(node.raw, null, 2))}</pre>
         </details>
+      </div>
+    </div>`
+
+  container.querySelectorAll<HTMLElement>('[data-nav]').forEach((el) => {
+    el.addEventListener('click', () => ctx.onNavigate(el.dataset.nav!))
+  })
+  container.querySelector('#hide')?.addEventListener('click', ctx.onHide)
+  const back = container.querySelector<HTMLButtonElement>('#back')
+  if (back && ctx.canGoBack) back.addEventListener('click', ctx.onBack)
+}
+
+/** Render a tapped department box: which department, who's in it, and how it's
+ *  reached. Uses the same panel as nodes and links. */
+export function renderDepartmentDetails(
+  container: HTMLElement,
+  bucket: string,
+  members: GraphNode[],
+  ctx: Ctx
+): void {
+  const shared = bucket === SHARED_DEPARTMENT
+  const colour = departmentColor(bucket)
+  const byKind = new Map<string, GraphNode[]>()
+  for (const m of members) {
+    const list = byKind.get(m.kind)
+    if (list) list.push(m)
+    else byKind.set(m.kind, [m])
+  }
+  // Sort categories by the model's own order so it reads like the legend.
+  const kinds = (Object.keys(NODE_KIND_META) as Array<keyof typeof NODE_KIND_META>).filter((k) =>
+    byKind.has(k)
+  )
+  const memberIds = new Set(members.map((m) => m.id))
+  // Links crossing the boundary tell you how the department is reached and where
+  // it hands calls on to — usually the first thing you want from a tenant.
+  const inbound = ctx.graph.edges.filter((e) => memberIds.has(e.target) && !memberIds.has(e.source))
+  const outbound = ctx.graph.edges.filter((e) => memberIds.has(e.source) && !memberIds.has(e.target))
+  const nodeById = new Map(ctx.graph.nodes.map((n) => [n.id, n]))
+
+  const counts = kinds
+    .map((k) => {
+      const meta = NODE_KIND_META[k]
+      return `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] bg-slate-100 dark:bg-slate-800">
+        <span class="w-2 h-2 rounded-full" style="background:${meta.color}"></span>
+        ${esc(meta.label)} <span class="text-slate-400">${byKind.get(k)!.length}</span>
+      </span>`
+    })
+    .join(' ')
+
+  const memberList = kinds
+    .map((k) => {
+      const rows = byKind
+        .get(k)!
+        .slice()
+        .sort((a, b) => (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true }))
+        .map(
+          (m) => `<li data-nav="${esc(m.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
+            ${m.kind === 'user' ? presenceDot(m.raw) : `<span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${NODE_KIND_META[m.kind].color}"></span>`}
+            <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(m.label)}</span>
+            ${m.number ? `<span class="text-slate-400 font-mono text-xs">${esc(m.number)}</span>` : ''}
+          </li>`
+        )
+        .join('')
+      return `<div class="mb-2">
+        <h4 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-0.5">${esc(NODE_KIND_META[k].label)}</h4>
+        <ul class="space-y-0.5">${rows}</ul>
+      </div>`
+    })
+    .join('')
+
+  const crossing = (edges: GraphEdge[], pick: (e: GraphEdge) => string, title: string): string => {
+    if (!edges.length) return ''
+    const seen = new Set<string>()
+    const rows = edges
+      .map((e) => {
+        const id = pick(e)
+        if (seen.has(id)) return ''
+        seen.add(id)
+        const n = nodeById.get(id)
+        if (!n) return ''
+        return `<li data-nav="${esc(id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
+          <span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META[n.kind].color}"></span>
+          <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(n.label)}</span>
+          ${n.number ? `<span class="text-slate-400 font-mono text-xs">${esc(n.number)}</span>` : ''}
+        </li>`
+      })
+      .join('')
+    if (!rows) return ''
+    return `<div>
+      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${esc(title)}</h3>
+      <ul class="space-y-0.5">${rows}</ul>
+    </div>`
+  }
+
+  container.innerHTML = `
+    <div class="flex flex-col h-full">
+      <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
+        <div class="mb-1.5">
+          ${panelHeaderRow({
+            title: 'Details',
+            side: 'right',
+            hideId: 'hide',
+            leading: backButton(ctx)
+          })}
+        </div>
+        <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white" style="background:${colour}">Department</span>
+        <h2 class="mt-1.5 text-base font-semibold text-slate-800 dark:text-slate-100 leading-tight">${esc(departmentLabel(bucket))}</h2>
+        <div class="text-xs text-slate-500">${members.length} member${members.length === 1 ? '' : 's'}</div>
+      </div>
+      <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
+        ${
+          shared
+            ? `<p class="text-xs text-slate-500 dark:text-slate-400">These entities touch more than one department, so they're grouped together rather than belonging to any single one.</p>`
+            : ''
+        }
+        <div class="flex flex-wrap gap-1">${counts}</div>
+        ${crossing(inbound, (e) => e.source, 'Reached from')}
+        ${crossing(outbound, (e) => e.target, 'Routes out to')}
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Members</h3>
+          ${memberList || '<p class="text-slate-400">Nothing in this department.</p>'}
+        </div>
       </div>
     </div>`
 
@@ -178,10 +308,13 @@ export function renderEdgeDetails(container: HTMLElement, info: EdgeDetail, ctx:
   container.innerHTML = `
     <div class="flex flex-col h-full">
       <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
-        <div class="flex items-center justify-between mb-1.5">
-          <button id="back" class="px-2 py-0.5 rounded text-xs ${ctx.canGoBack ? 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800' : 'text-slate-300 dark:text-slate-700 cursor-default'}" ${ctx.canGoBack ? '' : 'disabled'}>‹ Back</button>
-          ${panelTitle()}
-          <button id="hide" class="px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" title="Hide panel">Hide ›</button>
+        <div class="mb-1.5">
+          ${panelHeaderRow({
+            title: 'Details',
+            side: 'right',
+            hideId: 'hide',
+            leading: backButton(ctx)
+          })}
         </div>
         <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white bg-slate-500">${isSelf ? 'Loop-back' : 'Link'}</span>
         <h2 class="mt-1.5 text-base font-semibold text-slate-800 dark:text-slate-100 leading-tight">${esc(edgeKindLabel(info.kind))}</h2>
@@ -274,15 +407,23 @@ function presenceDot(raw: Record<string, unknown>): string {
   return `<span class="w-2.5 h-2.5 rounded-full shrink-0 ${border}" style="background:${color}" title="${title}"></span>`
 }
 
-/** A "logged in" / "logged out" pill from the user's global QueueStatus, or empty
- *  when the field is absent. */
-function loginBadge(raw: Record<string, unknown>): string {
-  const li = queueLoggedIn(raw)
-  if (li === null) return ''
-  const cls = li
+/** A "logged in" / "logged out" pill. `perQueue` is this queue's own state when a
+ *  3CX build actually reports one; otherwise the extension's effective state is
+ *  used (QueueStatus corrected for an auto-log-out profile), with the reason in
+ *  the tooltip. */
+function loginBadge(raw: Record<string, unknown>, perQueue?: boolean): string {
+  const state = perQueue === undefined ? queueLoginState(raw) : { loggedIn: perQueue }
+  if (!state) return ''
+  const cls = state.loggedIn
     ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
     : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
-  return `<span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold shrink-0 ${cls}">${li ? 'logged in' : 'logged out'}</span>`
+  const reason = 'reason' in state ? state.reason : undefined
+  const title =
+    reason ??
+    (perQueue === undefined
+      ? 'The extension&apos;s queue login status'
+      : 'This queue only — the agent may differ in other queues')
+  return `<span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold shrink-0 ${cls}" title="${esc(title)}">${state.loggedIn ? 'logged in' : 'logged out'}${reason ? ' ⓘ' : ''}</span>`
 }
 
 /** Extensions: the queues they're an agent of (incoming `agent` edges), each with
@@ -292,27 +433,39 @@ function queueMembershipSection(
   inc: GraphEdge[],
   nodeById: Map<string, GraphNode>
 ): string {
+  // Keep the edge alongside the queue: login state is per queue↔agent link.
   const queues = inc
     .filter((e) => e.kind === 'agent')
-    .map((e) => nodeById.get(e.source))
-    .filter((q): q is GraphNode => !!q && q.kind === 'queue')
+    .map((e) => ({ queue: nodeById.get(e.source), edge: e }))
+    .filter((x): x is { queue: GraphNode; edge: GraphEdge } => !!x.queue && x.queue.kind === 'queue')
   if (!queues.length) return ''
-  const badge = loginBadge(node.raw)
   const rows = queues
     .map(
-      (q) => `
+      ({ queue: q, edge }) => `
       <li>
         <button data-nav="${esc(q.id)}" class="w-full text-left flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
           <span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META.queue.color}"></span>
           <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(q.label)}${q.number ? ` <span class="text-slate-400 font-mono">${esc(q.number)}</span>` : ''}</span>
-          ${badge}
+          ${loginBadge(node.raw, edge.agentLoggedIn)}
         </button>
       </li>`
     )
     .join('')
+  const perQueue = queues.filter((x) => x.edge.agentLoggedIn !== undefined)
+  const loggedIn = perQueue.filter((x) => x.edge.agentLoggedIn).length
+  // When 3CX reports real per-queue state, summarise it. Otherwise say so
+  // outright: the same extension-wide status is repeated on every row, and a
+  // supervisor's per-queue logout lives in the MyPhone service, not the API we
+  // read — so without this note the rows look more precise than they are.
+  const summary = perQueue.length
+    ? `<p class="text-[10px] text-slate-400 mb-1">Logged in to ${loggedIn} of ${perQueue.length} queue${perQueue.length === 1 ? '' : 's'}.</p>`
+    : queueLoginState(node.raw)
+      ? `<p class="text-[10px] text-slate-400 mb-1">Status shown is extension-wide — the configuration API reports one value, so a per-queue logout set by a supervisor won't appear here.</p>`
+      : ''
   return `
     <div>
       <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Queues <span class="text-slate-400">(${queues.length})</span></h3>
+      ${summary}
       <ul class="space-y-0.5">${rows}</ul>
     </div>`
 }
@@ -325,31 +478,38 @@ function memberStatusSection(
 ): string {
   const members = out
     .filter((e) => e.kind === 'agent' || e.kind === 'member')
-    .map((e) => nodeById.get(e.target))
-    .filter((u): u is GraphNode => !!u && u.kind === 'user')
+    .map((e) => ({ user: nodeById.get(e.target), edge: e }))
+    .filter((x): x is { user: GraphNode; edge: GraphEdge } => !!x.user && x.user.kind === 'user')
   if (!members.length) return ''
   const isQueue = node.kind === 'queue'
   const rows = members
     .map(
-      (u) => `
+      ({ user: u, edge }) => `
       <li>
         <button data-nav="${esc(u.id)}" class="w-full text-left flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
           ${presenceDot(u.raw)}
           <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(u.label)}${u.number ? ` <span class="text-slate-400 font-mono">${esc(u.number)}</span>` : ''}</span>
-          ${isQueue ? loginBadge(u.raw) : ''}
+          ${isQueue ? loginBadge(u.raw, edge.agentLoggedIn) : ''}
         </button>
       </li>`
     )
     .join('')
   const title = isQueue ? 'In this queue' : 'Members'
+  // How many are serving THIS queue, which is what a supervisor cares about.
+  const perQueue = members.filter((x) => x.edge.agentLoggedIn !== undefined)
+  const summary =
+    isQueue && perQueue.length
+      ? `<p class="text-[10px] text-slate-400 mb-1">${perQueue.filter((x) => x.edge.agentLoggedIn).length} of ${perQueue.length} logged in to this queue.</p>`
+      : ''
   return `
     <div>
       <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${title} <span class="text-slate-400">(${members.length})</span></h3>
+      ${summary}
       <ul class="space-y-0.5">${rows}</ul>
     </div>`
 }
 
-function keyFacts(node: GraphNode): string {
+function keyFacts(node: GraphNode, agentEdges: GraphEdge[] = []): string {
   const r = node.raw
   const rows: [string, unknown][] = []
   const add = (label: string, ...keys: string[]): void => {
@@ -364,8 +524,26 @@ function keyFacts(node: GraphNode): string {
   switch (node.kind) {
     case 'user': {
       add('Registered', 'IsRegistered')
-      const li = queueLoggedIn(r)
-      if (li !== null) rows.push(['Logged into queue', li ? 'Yes' : 'No'])
+      // Per-queue login when 3CX reported it (an agent can be out of one queue
+      // and in another), else the extension's single global status.
+      const perQueue = agentEdges.filter((e) => e.agentLoggedIn !== undefined)
+      if (perQueue.length) {
+        const inCount = perQueue.filter((e) => e.agentLoggedIn).length
+        rows.push([
+          'Queue logins',
+          inCount === perQueue.length
+            ? `All ${perQueue.length}`
+            : `${inCount} of ${perQueue.length}`
+        ])
+      } else {
+        const st = queueLoginState(r)
+        if (st) {
+          rows.push([
+            'Logged into queues',
+            st.loggedIn ? 'Yes' : st.reason ? 'No — auto logged out' : 'No'
+          ])
+        }
+      }
       add('Current Ext Status', 'CurrentProfileName')
       add('Email', 'Email', 'EmailAddress')
       add('Mobile', 'Mobile')

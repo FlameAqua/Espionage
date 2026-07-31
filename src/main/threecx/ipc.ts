@@ -13,9 +13,12 @@ export function registerThreecxIpc(): void {
     }
   })
 
-  ipcMain.handle('threecx:fetchTopology', async (): Promise<Topology> => {
-    return client.fetchTopology()
-  })
+  ipcMain.handle(
+    'threecx:fetchTopology',
+    async (_evt, opts?: { includeQueueLogins?: boolean }): Promise<Topology> => {
+      return client.fetchTopology(opts)
+    }
+  )
 
   ipcMain.handle('threecx:refresh', async (): Promise<void> => {
     // Rejects on failure so the renderer's reload path can surface the error.

@@ -58,6 +58,12 @@ export interface GraphEdge {
   /** One entry per underlying relationship collapsed into this edge. */
   labels: string[]
   kind: EdgeKind
+  /** For `agent` edges: whether that agent is logged in to THIS queue.
+   *  3CX v20 lets a supervisor log an agent out of one queue while leaving them
+   *  logged in to others, so login state belongs on the queue↔agent link rather
+   *  than on the extension. `undefined` = the queue's agent entry carried no
+   *  per-queue signal, so callers fall back to the extension's global state. */
+  agentLoggedIn?: boolean
 }
 
 export interface TopologyGraph {
@@ -142,6 +148,88 @@ export function queueLoggedIn(raw: Record<string, unknown>): boolean | null {
   if (/out/i.test(qs)) return false
   if (/in/i.test(qs)) return true
   return null
+}
+
+/** Interpret one value as a queue login state. Deliberately strict: only clear
+ *  booleans and unambiguous "logged in/out" wording count, so a field that
+ *  happens to hold something else (a presence profile, a skill group) is ignored
+ *  rather than guessed at. */
+function loginValue(v: unknown): boolean | null {
+  if (typeof v === 'boolean') return v
+  if (typeof v === 'number') return v === 1 ? true : v === 0 ? false : null
+  if (typeof v !== 'string') return null
+  const s = v.trim()
+  if (!s) return null
+  if (/^(?:true|false)$/i.test(s)) return /^true$/i.test(s)
+  // Check "out" first — "LoggedOut" also contains "in"-free wording, but
+  // "LoggedIn" must not match an /out/ test.
+  if (/logged\s*out|^out$|^signed\s*out$/i.test(s)) return false
+  if (/logged\s*in|^in$|^signed\s*in$/i.test(s)) return true
+  return null
+}
+
+/** Whether a single agent entry from a queue's expanded `Agents[]` is logged in
+ *  to that queue.
+ *
+ *  IMPORTANT: on 3CX v20 this normally returns null — a real agent entry from
+ *  `Queues?$expand=Agents` carries only Number / Name / SkillGroup / Tags / Id,
+ *  with no login field. The per-queue login a supervisor controls in the web
+ *  client is NOT exposed on that endpoint, so it can't be read from the topology
+ *  we fetch. The check is kept (cheaply, and strict enough never to false-match)
+ *  in case a build does start returning it; callers must handle null by falling
+ *  back to queueLoginState() below. */
+export function agentLoggedIn(agent: Record<string, unknown>): boolean | null {
+  for (const key of ['QueueStatus', 'IsLoggedIn', 'LoggedIn', 'AgentStatus', 'LoginStatus']) {
+    if (!(key in agent)) continue
+    const parsed = loginValue(agent[key])
+    if (parsed !== null) return parsed
+  }
+  return null
+}
+
+/** The extension's currently-active forwarding/status profile, matched by name
+ *  against CurrentProfileName (3CX allows a custom label per profile). */
+function currentProfileOf(raw: Record<string, unknown>): Record<string, unknown> | null {
+  const active = String(raw['CurrentProfileName'] ?? '').trim()
+  if (!active) return null
+  const profiles = raw['ForwardingProfiles']
+  if (!Array.isArray(profiles)) return null
+  for (const p of profiles) {
+    if (typeof p !== 'object' || p === null) continue
+    const o = p as Record<string, unknown>
+    const custom = String(o['CustomName'] ?? '').trim()
+    const name = String(o['Name'] ?? '').trim()
+    if (custom === active || name === active) return o
+  }
+  return null
+}
+
+export interface QueueLoginState {
+  loggedIn: boolean
+  /** Set when the state isn't simply QueueStatus, so the UI can explain itself. */
+  reason?: string
+}
+
+/** The extension's EFFECTIVE queue login state.
+ *
+ *  `QueueStatus` alone is not the answer: a status profile with
+ *  `OfficeHoursAutoQueueLogOut` logs the agent out of queues while it's active,
+ *  so an extension can read "LoggedIn" there and still be out of every queue —
+ *  which is exactly how a logged-out agent got mislabelled as logged in. */
+export function queueLoginState(raw: Record<string, unknown>): QueueLoginState | null {
+  const status = queueLoggedIn(raw)
+  const profile = currentProfileOf(raw)
+  if (profile?.['OfficeHoursAutoQueueLogOut'] === true) {
+    const name = String(raw['CurrentProfileName'] ?? '').trim()
+    return {
+      loggedIn: false,
+      reason: name
+        ? `The “${name}” profile logs this extension out of queues automatically`
+        : 'The active profile logs this extension out of queues automatically'
+    }
+  }
+  if (status === null) return null
+  return { loggedIn: status }
 }
 
 export const NODE_KIND_META: Record<NodeKind, { label: string; color: string }> = {

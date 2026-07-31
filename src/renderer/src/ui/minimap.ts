@@ -88,6 +88,10 @@ export class Minimap {
       })
     })
     this.main.edges(':visible').forEach((e) => {
+      // Skip self-loops (e.g. an IVR's "repeat prompt"): the minimap draws edges
+      // with curve-style haystack, which cannot render a loop and logs "invalid
+      // endpoints" for each one. They'd be a dot on a dot at this scale anyway.
+      if (e.source().id() === e.target().id()) return
       els.push({ data: { id: e.id(), source: e.source().id(), target: e.target().id() } })
     })
     this.mini.elements().remove()
@@ -111,24 +115,33 @@ export class Minimap {
    *  zoom into a corner they grow, because far fewer of them are in play. */
   private applyScale(): void {
     if (this.mini.nodes().empty()) return
-    const z = this.mini.zoom() || 1
+    const z = this.mini.zoom()
     const bb = this.mini.elements().boundingBox({})
     const ext = this.main.extent()
+    // Every input here can be non-finite in normal use: an empty or zero-sized
+    // main viewport makes extent() NaN/Infinity, and a not-yet-laid-out minimap
+    // can report a zero bounding box. Unguarded, that produced "width: NaN"
+    // warnings from Cytoscape on every animation frame.
+    const usableZoom = Number.isFinite(z) && z > 0 ? z : 1
+    const spanX = ext.x2 - ext.x1
+    const spanY = ext.y2 - ext.y1
+    const fracX = bb.w > 0 && Number.isFinite(spanX) ? spanX / bb.w : 1
+    const fracY = bb.h > 0 && Number.isFinite(spanY) ? spanY / bb.h : 1
     // Fraction of the graph's extent the main viewport currently covers (1 = all).
-    const shown = clamp(
-      Math.max((ext.x2 - ext.x1) / Math.max(1, bb.w), (ext.y2 - ext.y1) / Math.max(1, bb.h)),
-      0,
-      1
-    )
+    const shown = clamp(Math.max(fracX, fracY), 0, 1)
     // Denser graphs start smaller, then everything grows as you zoom in.
     const count = this.mini.nodes().length
     const base = count > 400 ? 3.5 : count > 150 ? 4.5 : 6
     const dotPx = base + (1 - shown) * 4
+    if (!Number.isFinite(dotPx) || dotPx <= 0) return
     if (Math.abs(dotPx - this.lastDotPx) < 0.25) return // avoid restyling every frame
     this.lastDotPx = dotPx
+    const nodeSize = dotPx / usableZoom
+    const edgeWidth = Math.max(0.6, dotPx / 7) / usableZoom
+    if (!Number.isFinite(nodeSize) || !Number.isFinite(edgeWidth)) return
     this.mini.batch(() => {
-      this.mini.nodes().style({ width: dotPx / z, height: dotPx / z })
-      this.mini.edges().style({ width: Math.max(0.6, dotPx / 7) / z })
+      this.mini.nodes().style({ width: nodeSize, height: nodeSize })
+      this.mini.edges().style({ width: edgeWidth })
     })
   }
 
