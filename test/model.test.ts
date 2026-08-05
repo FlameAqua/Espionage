@@ -5,6 +5,7 @@ import {
   queueLoggedIn,
   queueLoginState,
   departmentColor,
+  routeGroupOf,
   SHARED_DEPARTMENT
 } from '../src/renderer/src/graph/model'
 
@@ -136,5 +137,44 @@ describe('departmentColor', () => {
 
   it('is deterministic per department name', () => {
     expect(departmentColor('Sales')).toBe(departmentColor('Sales'))
+  })
+})
+
+// The granularity at which links can be hidden. Hiding a link's KIND is far too
+// blunt — an out-of-hours destination and an IVR key press are both plain
+// `route` links — so labels are normalised down to the recurring branch name.
+describe('routeGroupOf', () => {
+  it('keeps a branch name as its own group', () => {
+    expect(routeGroupOf('out of office hours destination')).toBe('out of office hours destination')
+  })
+
+  it('separates out-of-hours from ordinary routes', () => {
+    expect(routeGroupOf('office hours destination')).not.toBe(
+      routeGroupOf('out of office hours destination')
+    )
+  })
+
+  it('collapses every digit option into one group', () => {
+    expect(routeGroupOf('key 1 → queue')).toBe('key press')
+    expect(routeGroupOf('key 7 → voicemail')).toBe('key press')
+  })
+
+  it('drops the destination suffix, which says where the branch ends not what it is', () => {
+    expect(routeGroupOf('timeout: voicemail')).toBe('timeout')
+    expect(routeGroupOf('timeout')).toBe('timeout')
+  })
+
+  it('ignores live state so a logged-out agent groups with the rest', () => {
+    expect(routeGroupOf('agent (logged out)')).toBe('agent')
+    expect(routeGroupOf('agent')).toBe('agent')
+  })
+
+  it('is case-insensitive', () => {
+    expect(routeGroupOf('Away: no answer')).toBe(routeGroupOf('away: no answer'))
+  })
+
+  it('returns an empty group for an unlabelled link', () => {
+    expect(routeGroupOf('')).toBe('')
+    expect(routeGroupOf('   ')).toBe('')
   })
 })

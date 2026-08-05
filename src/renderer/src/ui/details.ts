@@ -11,6 +11,7 @@ import {
   queueLoginState,
   type GraphEdge,
   type GraphNode,
+  type NodeKind,
   type TopologyGraph
 } from '../graph/model'
 import { panelHeader, panelHeaderRow } from './panel-chrome'
@@ -120,10 +121,16 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
         ${node.number ? `<div class="text-xs text-slate-500 font-mono">${node.kind === 'inboundRule' ? 'DID' : 'ext'} ${esc(node.number)}</div>` : ''}
       </div>
       <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
-        <div id="egomap" class="h-44 w-full rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50"></div>
+        <!-- relative + overflow-hidden so the mini-map's own reach/fit controls
+             can float over it without escaping the rounded border. The background
+             matches the MAIN CANVAS (slate-100 / slate-950), not the panel: node
+             fills are pre-blended against those colours to stay opaque, so any
+             other backdrop makes them look washed out or muddy. -->
+        <div id="egomap" class="relative overflow-hidden h-44 w-full rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-950" title="Click a neighbour to select it · double-click to focus · right-click for actions"></div>
         ${info}
         ${depts ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${node.deptGroup === SHARED_DEPARTMENT ? 'Multiple departments' : 'Departments'}</h3>${depts}</div>` : ''}
         ${facts}
+        ${outboundRulesSection(node)}
         <details class="group">
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">View more info</summary>
           ${moreInfo(node)}
@@ -133,6 +140,83 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">Raw JSON</summary>
           <pre class="mt-2 p-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[11px] leading-snug overflow-x-auto text-slate-700 dark:text-slate-300">${esc(JSON.stringify(node.raw, null, 2))}</pre>
         </details>
+      </div>
+    </div>`
+
+  container.querySelectorAll<HTMLElement>('[data-nav]').forEach((el) => {
+    el.addEventListener('click', () => ctx.onNavigate(el.dataset.nav!))
+  })
+  container.querySelector('#hide')?.addEventListener('click', ctx.onHide)
+  const back = container.querySelector<HTMLButtonElement>('#back')
+  if (back && ctx.canGoBack) back.addEventListener('click', ctx.onBack)
+}
+
+/** Render a whole category (a click on the legend): how it breaks down by
+ *  department, and every member — matching the nodes lit on the canvas. */
+export function renderKindDetails(
+  container: HTMLElement,
+  kind: NodeKind,
+  nodes: GraphNode[],
+  ctx: Ctx
+): void {
+  const meta = NODE_KIND_META[kind]
+
+  // Department split: on a multi-tenant system this is usually the first thing
+  // you want from "show me every queue".
+  const byDept = new Map<string, number>()
+  for (const n of nodes) {
+    const key = n.deptGroup ?? ''
+    byDept.set(key, (byDept.get(key) ?? 0) + 1)
+  }
+  const deptRows = [...byDept.entries()]
+    .sort(([a], [b]) => {
+      if (!a) return 1
+      if (!b) return -1
+      if (a === SHARED_DEPARTMENT) return 1
+      if (b === SHARED_DEPARTMENT) return -1
+      return a.localeCompare(b)
+    })
+    .map(
+      ([bucket, count]) => `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] bg-slate-100 dark:bg-slate-800">
+        <span class="w-2 h-2 rounded-full" style="background:${bucket ? departmentColor(bucket) : '#cbd5e1'}"></span>
+        ${esc(bucket ? departmentLabel(bucket) : 'No department')} <span class="text-slate-400">${count}</span>
+      </span>`
+    )
+    .join(' ')
+
+  const rows = nodes
+    .slice()
+    .sort((a, b) => (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true }))
+    .map(
+      (n) => `<li data-nav="${esc(n.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
+        ${n.kind === 'user' ? presenceDot(n.raw) : `<span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${meta.color}"></span>`}
+        <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(n.label)}</span>
+        ${n.number ? `<span class="text-slate-400 font-mono text-xs">${esc(n.number)}</span>` : ''}
+      </li>`
+    )
+    .join('')
+
+  container.innerHTML = `
+    <div class="flex flex-col h-full">
+      <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
+        <div class="mb-1.5">
+          ${panelHeaderRow({
+            title: 'Details',
+            side: 'right',
+            hideId: 'hide',
+            leading: backButton(ctx)
+          })}
+        </div>
+        <span class="inline-block px-2 py-0.5 rounded text-[11px] font-semibold text-white" style="background:${meta.color}">Category</span>
+        <h2 class="mt-1.5 text-base font-semibold text-slate-800 dark:text-slate-100 leading-tight">${esc(meta.label)}</h2>
+        <div class="text-xs text-slate-500">${nodes.length} on this system</div>
+      </div>
+      <div class="overflow-y-auto flex-1 px-4 py-3 space-y-4 text-sm">
+        ${deptRows ? `<div><h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">By department</h3><div class="flex flex-wrap gap-1">${deptRows}</div></div>` : ''}
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">${esc(meta.label)} <span class="text-slate-400">(${nodes.length})</span></h3>
+          ${rows ? `<ul class="space-y-0.5">${rows}</ul>` : '<p class="text-slate-400">None on this system.</p>'}
+        </div>
       </div>
     </div>`
 
@@ -507,6 +591,25 @@ function memberStatusSection(
       ${summary}
       <ul class="space-y-0.5">${rows}</ul>
     </div>`
+}
+
+/** The outbound dial-plan rules that leave the system down this trunk / bridge.
+ *  A busy line carries dozens, which as flat "Sends …" fact rows pushed
+ *  everything else off the panel — so they're collapsed into their own section,
+ *  closed by default with the count on the summary. */
+function outboundRulesSection(node: GraphNode): string {
+  const rules = node.outboundRules ?? []
+  if (!rules.length) return ''
+  const rows = rules
+    .map(
+      (r) =>
+        `<li class="flex items-start gap-2 px-1 py-0.5"><span class="text-slate-400">•</span><span class="flex-1 break-words text-slate-700 dark:text-slate-300">${esc(r)}</span></li>`
+    )
+    .join('')
+  return `<details class="group">
+    <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">Outbound Rules <span class="text-slate-400">(${rules.length})</span></summary>
+    <ul class="mt-1 space-y-0.5 text-[11px]">${rows}</ul>
+  </details>`
 }
 
 function keyFacts(node: GraphNode, agentEdges: GraphEdge[] = []): string {

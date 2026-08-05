@@ -35,6 +35,9 @@ const api = {
     /** `defaultDir` pre-selects the folder configured in Settings. */
     saveSnapshot: (topology: Topology, defaultDir?: string): Promise<SaveSnapshotResult> =>
       ipcRenderer.invoke('app:saveSnapshot', topology, defaultDir),
+    /** The folder snapshots go to when none is configured, so Settings can show
+     *  a real path rather than "system default". */
+    defaultSnapshotDir: (): Promise<string> => ipcRenderer.invoke('app:defaultSnapshotDir'),
     openSnapshot: (): Promise<OpenSnapshotResult> => ipcRenderer.invoke('app:openSnapshot'),
     /** Directory picker, used to set the default snapshot folder. */
     chooseFolder: (title?: string): Promise<{ canceled?: boolean; path?: string }> =>

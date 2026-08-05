@@ -29,6 +29,15 @@ export interface GraphNode {
   deptGroup?: string
   /** Computed key facts to show in the details panel (e.g. bridge routing). */
   info?: { label: string; value: string }[]
+  /** Outbound dial-plan rules that leave the system down this line, as
+   *  "prefix — name" strings. A busy trunk carries dozens, so the details panel
+   *  collapses these into their own section instead of listing them as facts. */
+  outboundRules?: string[]
+  /** Extra text this node can be found by, beyond its name and number: the DIDs
+   *  an inbound rule answers, every number a trunk carries, an extension's email.
+   *  Each entry keeps its label so a search hit can say WHY it matched
+   *  ("DID 35318899103") rather than appearing to match nothing at all. */
+  searchTerms?: { label: string; value: string }[]
   /** Path after `/#/office/` to deep-link this node in the 3CX console. */
   threecxPath?: string
   /** Original entity JSON (or a small synthesized object for external/unknown). */
@@ -49,6 +58,27 @@ export const EDGE_KIND_META: Record<EdgeKind, { label: string; color: string }> 
   trunk: { label: 'Trunk', color: '#a855f7' },
   afterhours: { label: 'Out of hours / holiday', color: '#0891b2' },
   forward: { label: 'Call forwarding', color: '#ec4899' }
+}
+
+/** The "route type" a link label belongs to — the granularity at which links can
+ *  be hidden or reasoned about.
+ *
+ *  A link's `kind` (Route / Overflow / …) is far too coarse to act on: an inbound
+ *  rule's "out of office hours destination" and an IVR's "key 3 → queue" are both
+ *  plain `route` links, so hiding one used to take out every other route on the
+ *  canvas. Labels are normalised so the per-instance parts (which digit was
+ *  pressed, whether an agent happens to be logged out) fall away and the
+ *  recurring branch name is what's left. */
+export function routeGroupOf(label: string): string {
+  const s = label.trim()
+  if (!s) return ''
+  // Every digit option is the same kind of branch, so they group together.
+  if (/^key\s+\S+/i.test(s)) return 'key press'
+  // "timeout: voicemail" → "timeout": the suffix only says what sits at the far
+  // end of the branch, not which branch it is.
+  const head = s.split(':')[0]
+  // "agent (logged out)" → "agent": a live state, not a different kind of link.
+  return (head.replace(/\s*\([^)]*\)\s*$/, '').trim() || s).toLowerCase()
 }
 
 export interface GraphEdge {

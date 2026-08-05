@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "description": "Interactive graph viewer for a 3CX phone system's call flow",
   "main": "./out/main/index.js",
-  "author": "example.com",
-  "homepage": "https://electron-vite.org",
+  "author": "Adrian Szydlo",
+  "homepage": "https://github.com/FlameAqua/3cx-spy",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
@@ -27,7 +27,6 @@
     "@electron-toolkit/utils": "^4.0.0",
     "cytoscape": "^3.34.0",
     "cytoscape-dagre": "^4.0.0",
-    "cytoscape-fcose": "^2.2.0",
     "dagre": "^0.8.5",
     "electron-updater": "^6.3.9"
   },

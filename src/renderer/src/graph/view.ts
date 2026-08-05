@@ -4,7 +4,6 @@
 import cytoscape from 'cytoscape'
 import type { Core, ElementDefinition, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
-import fcose from 'cytoscape-fcose'
 import {
   EDGE_KIND_META,
   NODE_KIND_META,
@@ -12,16 +11,16 @@ import {
   departmentColor,
   departmentLabel,
   presenceOf,
+  routeGroupOf,
   type GraphNode,
   type NodeKind,
   type TopologyGraph
 } from './model'
 
 cytoscape.use(dagre)
-cytoscape.use(fcose)
 
 export type ThemeName = 'light' | 'dark'
-export type LayoutName = 'flow' | 'force' | 'breadthfirst' | 'compact' | 'department'
+export type LayoutName = 'flow' | 'compact' | 'department'
 
 /** Default link opacity — links read as background structure so the nodes stay
  *  the foreground. Adjustable in Settings (see setEdgeMuting). */
@@ -36,6 +35,23 @@ export interface EdgeTapInfo {
   /** Set when one of the split-out per-route edges was tapped, so the details
    *  panel can call out which single route it was. */
   tappedLabel?: string
+}
+
+/** Everything the edge context menu needs: the link itself, plus the distinct
+ *  route types it carries so each can be hidden on its own. */
+export interface EdgeContextInfo extends EdgeTapInfo {
+  edgeId: string
+  /** Normalised route groups on this link (see routeGroupOf), most specific
+   *  first — the tapped route, when a split-out one was clicked. */
+  routeGroups: string[]
+}
+
+/** A search result: the node, plus what matched when it wasn't the node's own
+ *  name or number (e.g. "DID 35318899103"), so an otherwise baffling hit
+ *  explains itself. */
+export interface SearchHit {
+  node: GraphNode
+  via?: string
 }
 
 /** One node's position change from a drag, for the undo/redo timeline. */
@@ -59,7 +75,7 @@ interface ViewCallbacks {
   /** A link/edge was tapped. */
   onEdgeTap: (info: EdgeTapInfo) => void
   /** A link was right-clicked; coords are viewport (client) pixels. */
-  onEdgeContext: (info: EdgeTapInfo & { edgeId: string }, x: number, y: number) => void
+  onEdgeContext: (info: EdgeContextInfo, x: number, y: number) => void
   /** A department box (its own empty space, not a node inside it) was tapped. */
   onDepartmentTap: (bucket: string) => void
   /** A department box was right-clicked; coords are viewport (client) pixels. */
@@ -95,6 +111,9 @@ export class GraphView {
   private hiddenEdgeIds = new Set<string>()
   /** Whole link types hidden (context menu "Hide all" / Settings). */
   private hiddenEdgeKinds = new Set<string>()
+  /** Individual route types hidden (context menu "Hide all … routes"), e.g. just
+   *  the out-of-hours destinations rather than every `route` link. */
+  private hiddenRouteGroups = new Set<string>()
   /** The collapsed edge currently exploded into its individual routes, if any. */
   private splitEdgeId: string | null = null
   private theme: ThemeName
@@ -220,17 +239,27 @@ export class GraphView {
       const e = evt.target
       const oe = evt.originalEvent as MouseEvent | undefined
       // Right-clicking a per-route copy targets the link it came from, so "Hide"
-      // hides the whole link rather than one temporary stand-in.
-      const baseId = e.hasClass('route-split')
-        ? String(e.id()).split('::route:')[0]
-        : String(e.id())
+      // hides the whole link rather than one temporary stand-in — but the route
+      // that was actually clicked still leads the per-route hide options.
+      const isSplit = e.hasClass('route-split')
+      const baseId = isSplit ? String(e.id()).split('::route:')[0] : String(e.id())
+      const base = this.cy.getElementById(baseId)
+      const tappedLabel = isSplit ? String(e.data('label')) : undefined
+      const labels = ((base.empty() ? e : base).data('labels') as string[]) ?? []
+      const groups: string[] = []
+      for (const l of tappedLabel ? [tappedLabel, ...labels] : labels) {
+        const g = routeGroupOf(l)
+        if (g && !groups.includes(g)) groups.push(g)
+      }
       this.cb.onEdgeContext(
         {
           edgeId: baseId,
           sourceId: String(e.data('source')),
           targetId: String(e.data('target')),
           kind: String(e.data('kind')),
-          labels: (e.data('labels') as string[]) ?? []
+          labels,
+          tappedLabel,
+          routeGroups: groups
         },
         oe?.clientX ?? 0,
         oe?.clientY ?? 0
@@ -421,40 +450,47 @@ export class GraphView {
     const base = { animate: false as const, fit: false, padding: 45 }
     switch (this.layoutName) {
       case 'compact': {
-        // A tight concentric ring. When focused, the focus node sits alone in
-        // the centre and ALL neighbours share one outer ring (binary value);
-        // otherwise rings are graded by node degree.
+        // A dense grid, blocked by category. This used to be a concentric ring,
+        // which spent most of its area on empty space in the middle and put a
+        // single node at the centre of a huge circle — the opposite of compact.
+        // A grid packs the most nodes into the least space, which is the only
+        // thing this mode is for: an inventory read of a big system, or a
+        // focused node's neighbourhood seen all at once.
         const id = this.focusId
+        const order = Object.keys(NODE_KIND_META)
+        const rank = (n: NodeSingular): number => {
+          // The focused node leads, so it's findable at a glance (top-left).
+          if (id && n.id() === id) return -1
+          const model = n.data('model') as GraphNode | undefined
+          return model ? order.indexOf(model.kind) : order.length
+        }
         return {
-          name: 'concentric',
-          // @ts-ignore concentric callback
-          concentric: (n: NodeSingular) => (id ? (n.id() === id ? 2 : 1) : n.degree(false) + 1),
-          levelWidth: () => 1,
-          minNodeSpacing: id ? 30 : 36,
+          name: 'grid',
+          condense: true,
+          avoidOverlap: true,
+          avoidOverlapPadding: 8,
+          // Like with like, so the grid reads as blocks of extensions, queues,
+          // rules … rather than an arbitrary scatter.
+          sort: (a: NodeSingular, b: NodeSingular) => {
+            const d = rank(a) - rank(b)
+            if (d !== 0) return d
+            const an = (a.data('model') as GraphNode | undefined) ?? null
+            const bn = (b.data('model') as GraphNode | undefined) ?? null
+            return (an?.number ?? an?.label ?? '').localeCompare(
+              bn?.number ?? bn?.label ?? '',
+              undefined,
+              { numeric: true }
+            )
+          },
           ...base
         } as cytoscape.LayoutOptions
       }
-      case 'force':
-        // fcose spaces nodes without overlaps and packs disconnected clusters.
-        return {
-          name: 'fcose',
-          quality: 'proof',
-          randomize: true,
-          nodeSeparation: 140,
-          nodeRepulsion: () => 14000,
-          idealEdgeLength: () => 110,
-          gravity: 0.2,
-          packComponents: true,
-          ...base
-        } as cytoscape.LayoutOptions
       case 'department':
         // Same dagre (LR flow) engine as Flow, but compound-aware:
         // cytoscape-dagre lays each department box's members out internally in
         // call-flow order AND arranges the boxes themselves along the flow, with
-        // shared / department-less nodes flowing between them. This replaces the
-        // old fcose force layout, which packed nodes into blobs and dropped the
-        // boxes in seemingly random places. Spacing is a touch looser than Flow
-        // so the box padding + titles have room to breathe.
+        // shared / department-less nodes flowing between them. Spacing is a touch
+        // looser than Flow so the box padding + titles have room to breathe.
         return {
           name: 'dagre',
           // @ts-ignore dagre options — larger nodeSep gives vertically-stacked
@@ -467,14 +503,6 @@ export class GraphView {
           ranker: 'tight-tree',
           ...base
         }
-      case 'breadthfirst':
-        return {
-          name: 'breadthfirst',
-          directed: true,
-          spacingFactor: 1.0,
-          roots: this.focusId ? this.cy.getElementById(this.focusId) : undefined,
-          ...base
-        } as cytoscape.LayoutOptions
       case 'flow':
       default:
         return {
@@ -604,26 +632,10 @@ export class GraphView {
     this.cy.viewport({ zoom, pan })
   }
 
-  /** Full pass-through mode for Space-pan: elements ignore pointer events
-   *  (`pan-through`) so a drag starting anywhere — even on a node — pans the view.
-   *  Used only while Space is held. */
-  setNodesGrabbable(grabbable: boolean): void {
-    if (grabbable) {
-      this.cy.nodes().grabify()
-      this.cy.elements().removeClass('pan-through')
-    } else {
-      this.cy.nodes().ungrabify()
-      this.cy.elements().addClass('pan-through')
-    }
-    this.cy.autoungrabify(!grabbable)
-  }
-
   /** Padlock lock: nodes (and department boxes) can't be dragged, but stay fully
    *  clickable / selectable — so a drag to pan never accidentally moves a node,
    *  while taps, right-clicks and edge clicks all still work. */
   setDraggable(draggable: boolean): void {
-    // Never leave elements event-blocked here — locked nodes must stay clickable.
-    this.cy.elements().removeClass('pan-through')
     if (draggable) this.cy.nodes().grabify()
     else this.cy.nodes().ungrabify()
     this.cy.autoungrabify(!draggable)
@@ -878,26 +890,80 @@ export class GraphView {
     return [...this.hiddenEdgeKinds]
   }
 
+  /** Hide every link carrying only routes of one type (e.g. every "out of office
+   *  hours destination"), leaving the rest of that link *kind* alone. */
+  hideRouteGroup(group: string): void {
+    this.collapseEdge()
+    this.hiddenRouteGroups.add(group)
+    this.applyVisibility()
+  }
+
+  /** Replace the set of hidden route types outright (Settings panel / undo). */
+  setHiddenRouteGroups(groups: Iterable<string>): void {
+    this.collapseEdge()
+    this.hiddenRouteGroups = new Set(groups)
+    this.applyVisibility()
+  }
+
+  getHiddenRouteGroups(): string[] {
+    return [...this.hiddenRouteGroups]
+  }
+
+  /** Every distinct route type currently on the graph, with how many links carry
+   *  it — drives the per-route list in Settings. */
+  routeGroupCounts(): Array<{ group: string; count: number }> {
+    const counts = new Map<string, number>()
+    this.cy.edges().forEach((e) => {
+      if (e.hasClass('route-split')) return
+      const seen = new Set<string>()
+      for (const l of ((e.data('labels') as string[]) ?? [])) {
+        const g = routeGroupOf(l)
+        if (!g || seen.has(g)) continue
+        seen.add(g)
+        counts.set(g, (counts.get(g) ?? 0) + 1)
+      }
+    })
+    return [...counts.entries()]
+      .map(([group, count]) => ({ group, count }))
+      .sort((a, b) => a.group.localeCompare(b.group))
+  }
+
   hiddenEdgeIdList(): string[] {
     return [...this.hiddenEdgeIds]
   }
 
-  /** How many links are hidden right now, individually or by type. */
-  hiddenEdgeCount(): number {
-    let byKind = 0
-    if (this.hiddenEdgeKinds.size) {
-      this.cy.edges().forEach((e) => {
-        if (this.hiddenEdgeKinds.has(String(e.data('kind')))) byKind++
-      })
-    }
-    return this.hiddenEdgeIds.size + byKind
+  /** Whether every route a link carries has had its type hidden. A collapsed link
+   *  bundles several routes, so it only disappears once nothing it carries would
+   *  still be shown — hiding "timeout" mustn't take out the link's main route. */
+  private routesSuppressed(labels: string[]): boolean {
+    if (!this.hiddenRouteGroups.size || !labels.length) return false
+    return labels.every((l) => this.hiddenRouteGroups.has(routeGroupOf(l)))
   }
 
-  /** Restore every hidden link (individual and by type). */
+  /** How many links are hidden right now, individually or by type / route type. */
+  hiddenEdgeCount(): number {
+    let n = this.hiddenEdgeIds.size
+    if (this.hiddenEdgeKinds.size || this.hiddenRouteGroups.size) {
+      this.cy.edges().forEach((e) => {
+        if (e.hasClass('route-split')) return
+        if (this.hiddenEdgeIds.has(String(e.id()))) return // already counted
+        if (
+          this.hiddenEdgeKinds.has(String(e.data('kind'))) ||
+          this.routesSuppressed((e.data('labels') as string[]) ?? [])
+        )
+          n++
+      })
+    }
+    return n
+  }
+
+  /** Restore every hidden link (individual, by type, and by route type). */
   unhideAllEdges(): void {
-    if (!this.hiddenEdgeIds.size && !this.hiddenEdgeKinds.size) return
+    if (!this.hiddenEdgeIds.size && !this.hiddenEdgeKinds.size && !this.hiddenRouteGroups.size)
+      return
     this.hiddenEdgeIds.clear()
     this.hiddenEdgeKinds.clear()
+    this.hiddenRouteGroups.clear()
     this.applyVisibility()
   }
 
@@ -1048,8 +1114,12 @@ export class GraphView {
           !e.source().hasClass('hidden') && !e.target().hasClass('hidden')
         // A per-route copy inherits the hidden state of the edge it split from.
         const baseId = e.hasClass('route-split') ? String(e.id()).split('::route:')[0] : e.id()
+        // A split copy carries exactly one label, so a hidden route type removes
+        // just that route from an expanded link and leaves its siblings drawn.
         const suppressed =
-          this.hiddenEdgeIds.has(baseId) || this.hiddenEdgeKinds.has(String(e.data('kind')))
+          this.hiddenEdgeIds.has(baseId) ||
+          this.hiddenEdgeKinds.has(String(e.data('kind'))) ||
+          this.routesSuppressed((e.data('labels') as string[]) ?? [])
         // The collapsed edge stays hidden while its per-route copies stand in.
         e.toggleClass('hidden', !endpointsVisible || suppressed || e.id() === this.splitEdgeId)
       })
@@ -1161,6 +1231,61 @@ export class GraphView {
     return [...named, ...byKind]
   }
 
+  /** The same search, but reporting WHY each node matched.
+   *
+   *  Ranked so the obvious hit stays on top: name, then number, then anything the
+   *  node is merely findable by (a DID it answers, that DID's friendly name, an
+   *  extension's email), then whole categories by name. The extra terms are the
+   *  point — a DID is not a node of its own, so typing one used to find nothing
+   *  even though a rule answers it and a trunk carries it. */
+  searchDetailed(term: string): SearchHit[] {
+    const t = term.trim().toLowerCase()
+    if (!t) return []
+    const models = this.cy
+      .nodes()
+      .map((n) => n.data('model') as GraphNode | undefined)
+      .filter((m): m is GraphNode => !!m)
+
+    const hits: Array<SearchHit & { rank: number }> = []
+    const seen = new Set<string>()
+    const take = (node: GraphNode, rank: number, via?: string): void => {
+      if (seen.has(node.id)) return
+      seen.add(node.id)
+      hits.push({ node, via, rank })
+    }
+
+    for (const m of models) {
+      const label = m.label.toLowerCase()
+      // Exact name beats a name that merely contains the term, which beats the
+      // extension number — otherwise searching "800" surfaces every DID ending
+      // in 800 above the queue actually numbered 800.
+      if (label === t) take(m, 0)
+      else if (label.startsWith(t)) take(m, 1)
+      else if (label.includes(t)) take(m, 2)
+      else if (m.number === term.trim()) take(m, 3)
+      else if ((m.number ?? '').includes(t)) take(m, 4)
+    }
+    // The broad matches below are gated on a few characters: one digit matches
+    // most of a trunk's DID block, and one letter matches most category names,
+    // either of which would bury the name match the user is actually after.
+    if (t.length >= 3) {
+      for (const m of models) {
+        if (seen.has(m.id)) continue
+        for (const s of m.searchTerms ?? []) {
+          if (!s.value.toLowerCase().includes(t)) continue
+          take(m, s.value.toLowerCase() === t ? 5 : 6, `${s.label} ${s.value}`)
+          break
+        }
+      }
+      // "queue", "trunk", "external" … list that whole category last.
+      for (const [kind, meta] of Object.entries(NODE_KIND_META)) {
+        if (!meta.label.toLowerCase().includes(t)) continue
+        for (const m of models) if (m.kind === kind) take(m, 7, meta.label)
+      }
+    }
+    return hits.sort((a, b) => a.rank - b.rank).map(({ node, via }) => ({ node, via }))
+  }
+
   private highlightNeighbourhood(node: NodeSingular): void {
     const hood = node.closedNeighborhood()
     this.cy.elements().removeClass('selected dim lit')
@@ -1192,27 +1317,14 @@ function rawIsFalse(raw: Record<string, unknown>, ...keys: string[]): boolean {
 
 function toElements(graph: TopologyGraph): ElementDefinition[] {
   const els: ElementDefinition[] = []
-  // Queue / ring-group ids that actually have agents or members.
-  const hasMembers = new Set<string>()
-  for (const e of graph.edges) {
-    if (e.kind === 'agent' || e.kind === 'member') hasMembers.add(e.source)
-  }
+  const hasMembers = idsWithMembers(graph)
   for (const n of graph.nodes) {
-    const classes: string[] = [n.kind]
-    if (n.kind === 'user' && rawIsFalse(n.raw, 'Enabled', 'IsEnabled'))
-      classes.push('status-disabled')
+    const classes: string[] = [n.kind, ...statusClasses(n, hasMembers)]
     // Live presence dot (green/orange/red/grey) on user extensions.
     if (n.kind === 'user') {
       const p = presenceOf(n.raw)
       if (p) classes.push(`presence-${p}`)
     }
-    if (
-      (n.kind === 'trunk' || n.kind === 'bridge') &&
-      rawIsFalse(n.raw, 'IsRegistered', 'Registered')
-    )
-      classes.push('status-unregistered')
-    if ((n.kind === 'queue' || n.kind === 'ringGroup') && !hasMembers.has(n.id))
-      classes.push('status-empty')
     els.push({
       data: {
         id: n.id,
@@ -1249,10 +1361,70 @@ function compactEdgeLabel(labels: string[]): string {
 }
 
 /** A small filled circle with a contrasting ring, as a data-URI SVG, used as the
- *  presence badge background-image on user nodes. */
-function presenceDot(fill: string, ring: string): string {
+ *  presence badge background-image on user nodes. Shared with the details-panel
+ *  mini-map so both draw the same badge. */
+export function presenceDotUri(fill: string, ring: string): string {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="5" fill="${fill}" stroke="${ring}" stroke-width="1.5"/></svg>`
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+}
+
+/** Every colour decision the graph's node/edge rendering depends on, in one
+ *  place. Exported because the details-panel mini-map draws the same graph at a
+ *  smaller scale: when it kept its own copy of these it silently drifted, ending
+ *  up with translucent node bodies (so links showed straight through them) and a
+ *  dark mode that never matched the canvas. */
+export function themePalette(theme: ThemeName): {
+  canvasBg: string
+  fillBase: string
+  fillAlpha: number
+  nodeBorderOpacity: number
+  labelColor: string
+  borderColor: string
+  edgeLabelColor: string
+  edgeLabelBg: string
+} {
+  const dark = theme === 'dark'
+  return {
+    // What node fills are blended against to stay opaque (opaque bodies are what
+    // stop links showing through them).
+    //
+    // Light mode blends toward the canvas, which keeps the familiar pale tint.
+    // Dark mode deliberately does NOT: blending toward a near-black canvas
+    // crushed every category into much the same dark navy, so fills are built on
+    // a lighter slate instead. Nodes then read as raised panels against the dark
+    // canvas and the category colours stay distinguishable.
+    canvasBg: dark ? '#020617' : '#f1f5f9',
+    fillBase: dark ? '#243044' : '#f1f5f9',
+    fillAlpha: dark ? 0.5 : 0.18,
+    // Kind-coloured borders carry the category, so let them read strongly in dark
+    // mode where the fill contrast is inherently lower.
+    nodeBorderOpacity: dark ? 0.85 : 0.35,
+    labelColor: dark ? '#e2e8f0' : '#0f172a',
+    borderColor: dark ? '#e2e8f0' : '#0f172a',
+    edgeLabelColor: dark ? '#cbd5e1' : '#475569',
+    edgeLabelBg: dark ? '#0f172a' : '#ffffff'
+  }
+}
+
+/** Queue / ring-group ids that actually have agents or members — needed to flag
+ *  the empty ones. */
+export function idsWithMembers(graph: TopologyGraph): Set<string> {
+  const has = new Set<string>()
+  for (const e of graph.edges) if (e.kind === 'agent' || e.kind === 'member') has.add(e.source)
+  return has
+}
+
+/** Status-flag classes for a node: a disabled extension, a trunk/bridge that
+ *  isn't registered, a queue or ring group with nobody in it. Shared with the
+ *  mini-map so a problem node looks like a problem in both views. */
+export function statusClasses(n: GraphNode, hasMembers: Set<string>): string[] {
+  const out: string[] = []
+  if (n.kind === 'user' && rawIsFalse(n.raw, 'Enabled', 'IsEnabled')) out.push('status-disabled')
+  if ((n.kind === 'trunk' || n.kind === 'bridge') && rawIsFalse(n.raw, 'IsRegistered', 'Registered'))
+    out.push('status-unregistered')
+  if ((n.kind === 'queue' || n.kind === 'ringGroup') && !hasMembers.has(n.id))
+    out.push('status-empty')
+  return out
 }
 
 /** Blend a colour toward the canvas background. Lets a node be drawn fully
@@ -1260,7 +1432,7 @@ function presenceDot(fill: string, ring: string): string {
  *  because a see-through node body let every edge behind it show straight
  *  through, making dense areas unreadable. Opaque bodies occlude those edges
  *  instead, so the node reads clearly where a link crosses it. */
-function blendToBackground(hex: string, bg: string, alpha: number): string {
+export function blendToBackground(hex: string, bg: string, alpha: number): string {
   const parse = (h: string): [number, number, number] => {
     const s = h.replace('#', '')
     const v = s.length === 3
@@ -1283,24 +1455,15 @@ function buildStyle(
   edgeOpacity: number = DEFAULT_EDGE_OPACITY
 ): cytoscape.StylesheetJson {
   const dark = theme === 'dark'
-  const labelColor = dark ? '#e2e8f0' : '#0f172a'
-  const edgeLabelColor = dark ? '#cbd5e1' : '#475569'
-  const edgeLabelBg = dark ? '#0f172a' : '#ffffff'
-  const borderColor = dark ? '#e2e8f0' : '#0f172a'
-  // What node fills are blended against to stay opaque (opaque bodies are what
-  // stop links showing through them).
-  //
-  // Light mode blends toward the canvas, which keeps the familiar pale tint. Dark
-  // mode deliberately does NOT: blending toward a near-black canvas crushed every
-  // category into much the same dark navy, so fills are built on a lighter slate
-  // instead. Nodes then read as raised panels against the dark canvas and the
-  // category colours stay distinguishable.
-  const canvasBg = dark ? '#020617' : '#f1f5f9'
-  const fillBase = dark ? '#243044' : canvasBg
-  const fillAlpha = dark ? 0.5 : 0.18
-  // Kind-coloured borders carry the category, so let them read strongly in dark
-  // mode where the fill contrast is inherently lower.
-  const nodeBorderOpacity = dark ? 0.85 : 0.35
+  const {
+    fillBase,
+    fillAlpha,
+    nodeBorderOpacity,
+    labelColor,
+    borderColor,
+    edgeLabelColor,
+    edgeLabelBg
+  } = themePalette(theme)
 
   const style: cytoscape.StylesheetJson = [
     {
@@ -1462,7 +1625,7 @@ function buildStyle(
     style.push({
       selector: `node.presence-${presence}`,
       style: {
-        'background-image': presenceDot(meta.color, dark ? '#0f172a' : '#ffffff'),
+        'background-image': presenceDotUri(meta.color, dark ? '#0f172a' : '#ffffff'),
         'background-width': '12px',
         'background-height': '12px',
         'background-position-x': '99%',
@@ -1510,9 +1673,34 @@ function buildStyle(
       }
     },
     { selector: '.hidden', style: { display: 'none' } },
-    // While panning (padlock / Space) elements pass pointer events through to
-    // the core so a drag starting on a node/edge pans instead of grabbing it.
-    { selector: '.pan-through', style: { events: 'no' } }
+    ...pressFeedbackStyle()
   )
   return style
+}
+
+/** The grey press feedback shown while the mouse is down on a node, a link or
+ *  the background.
+ *
+ *  Cytoscape's defaults are generous — a 10px halo around the element and a 30px
+ *  blob on the canvas — which reads as a fat grey border rather than a tap
+ *  acknowledgement. Kept, but trimmed close to the element. Exported because
+ *  EVERY Cytoscape instance in the app needs it: the main canvas, the details
+ *  mini-map and the overview minimap each build their own stylesheet, and one
+ *  left on the defaults sticks out immediately. `scale` shrinks it further for
+ *  the small views, whose nodes are a fraction of the size. */
+export function pressFeedbackStyle(scale = 1): cytoscape.StylesheetJson {
+  const pad = Math.max(1, Math.round(3 * scale))
+  return [
+    { selector: 'node:active', style: { 'overlay-padding': pad, 'overlay-opacity': 0.12 } },
+    { selector: 'edge:active', style: { 'overlay-padding': pad, 'overlay-opacity': 0.12 } },
+    {
+      selector: 'core',
+      // The typings demand a complete Core block; only these two differ from the
+      // defaults, so the partial is asserted through.
+      style: {
+        'active-bg-size': Math.max(4, Math.round(12 * scale)),
+        'active-bg-opacity': 0.12
+      } as Partial<cytoscape.Css.Core> as cytoscape.Css.Core
+    }
+  ]
 }

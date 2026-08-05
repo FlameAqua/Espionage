@@ -21,6 +21,21 @@ async function ensureReportsDir(): Promise<string> {
   return dir
 }
 
+/** Folder snapshots are offered in when the user hasn't picked one in Settings.
+ *  Documents is the natural home for a file the user is meant to keep and share;
+ *  Downloads is the fallback on the rare platform without a Documents path. */
+function defaultSnapshotDir(): string {
+  try {
+    return app.getPath('documents')
+  } catch {
+    try {
+      return app.getPath('downloads')
+    } catch {
+      return app.getPath('home')
+    }
+  }
+}
+
 /** Create a window. `hash` (e.g. "#focus=user:1001") opens it on a node. */
 function createWindow(hash = ''): void {
   // Create the browser window.
@@ -131,6 +146,11 @@ function registerAppIpc(): void {
     return undefined
   })
 
+  // Where snapshots are offered when the user hasn't chosen a folder. Resolved
+  // here rather than left to the OS dialog so Settings can show the real path
+  // instead of an unhelpful "system default".
+  ipcMain.handle('app:defaultSnapshotDir', () => defaultSnapshotDir())
+
   // Save the current topology to a user-chosen JSON file (offline documentation
   // / sharing without credentials).
   ipcMain.handle('app:saveSnapshot', async (evt, topology: Topology, defaultDir?: string) => {
@@ -141,8 +161,9 @@ function registerAppIpc(): void {
     const fileName = `espionage-${host || 'system'}.json`
     const opts = {
       title: 'Save snapshot',
-      // Start in the folder configured in Settings, when there is one.
-      defaultPath: defaultDir ? join(defaultDir, fileName) : fileName,
+      // Start in the folder configured in Settings, else the same built-in
+      // fallback Settings displays — so the dialog and the label always agree.
+      defaultPath: join(defaultDir || defaultSnapshotDir(), fileName),
       filters: [{ name: 'Espionage snapshot', extensions: ['json'] }]
     }
     const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))

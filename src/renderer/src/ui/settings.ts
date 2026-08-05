@@ -21,12 +21,16 @@ const SNAPSHOT_DIR_KEY = 'espionage.snapshotDir'
 export interface EdgeOptions {
   /** Link types hidden from the canvas. */
   hiddenKinds: EdgeKind[]
+  /** Individual route types hidden (see routeGroupOf) — finer than hiddenKinds,
+   *  so e.g. out-of-hours destinations can go without taking every route with
+   *  them. Free-form strings, since they come from the system's own labels. */
+  hiddenRoutes: string[]
   /** Link opacity, 0–1. Lower keeps links in the background. */
   opacity: number
 }
 
 export function defaultEdgeOptions(): EdgeOptions {
-  return { hiddenKinds: [], opacity: DEFAULT_EDGE_OPACITY }
+  return { hiddenKinds: [], hiddenRoutes: [], opacity: DEFAULT_EDGE_OPACITY }
 }
 
 export function loadEdgeOptions(): EdgeOptions {
@@ -38,6 +42,7 @@ export function loadEdgeOptions(): EdgeOptions {
     const known = new Set(Object.keys(EDGE_KIND_META))
     return {
       hiddenKinds: (saved.hiddenKinds ?? []).filter((k) => known.has(k)) as EdgeKind[],
+      hiddenRoutes: (saved.hiddenRoutes ?? []).filter((r) => typeof r === 'string'),
       opacity:
         typeof saved.opacity === 'number' && saved.opacity >= 0 && saved.opacity <= 1
           ? saved.opacity
@@ -101,6 +106,9 @@ function group(title: string, inner: string): string {
 export interface SettingsCallbacks {
   theme: ThemeName
   edgeOptions: EdgeOptions
+  /** Every route type present on the current graph, with how many links carry it
+   *  — the checklist for hiding routes individually. */
+  routeGroups: Array<{ group: string; count: number }>
   /** Live-applied whenever the user changes a link option. */
   onEdgeOptions: (o: EdgeOptions) => void
   onToggleTheme: () => void
@@ -121,6 +129,7 @@ export interface SettingsCallbacks {
 export function showSettings(cb: SettingsCallbacks): void {
   const opts: EdgeOptions = {
     hiddenKinds: [...cb.edgeOptions.hiddenKinds],
+    hiddenRoutes: [...cb.edgeOptions.hiddenRoutes],
     opacity: cb.edgeOptions.opacity
   }
   let theme = cb.theme
@@ -141,6 +150,26 @@ export function showSettings(cb: SettingsCallbacks): void {
         <input type="checkbox" data-kind="${kind}" ${opts.hiddenKinds.includes(kind) ? '' : 'checked'} class="accent-sky-500" />
         <span class="w-4 h-0.5 rounded shrink-0" style="background:${meta.color}"></span>
         <span class="truncate">${esc(meta.label)}</span>
+      </label>`
+    )
+    .join('')
+
+  // Route types are the finer cut: a link's KIND says "this is a route", a route
+  // type says which branch it is (out of hours, timeout, key press…). Hidden ones
+  // are always listed even if nothing on the current graph carries them, so a
+  // route hidden earlier can still be found and switched back on.
+  const routeRows = [
+    ...cb.routeGroups,
+    ...opts.hiddenRoutes
+      .filter((r) => !cb.routeGroups.some((g) => g.group === r))
+      .map((group) => ({ group, count: 0 }))
+  ]
+    .sort((a, b) => a.group.localeCompare(b.group))
+    .map(
+      ({ group, count }) => `<label class="flex items-center gap-2 text-xs cursor-pointer select-none py-0.5">
+        <input type="checkbox" data-route="${esc(group)}" ${opts.hiddenRoutes.includes(group) ? '' : 'checked'} class="accent-sky-500" />
+        <span class="flex-1 truncate" title="${esc(group)}">${esc(group)}</span>
+        <span class="text-slate-400 tabular-nums shrink-0">${count}</span>
       </label>`
     )
     .join('')
@@ -169,7 +198,13 @@ export function showSettings(cb: SettingsCallbacks): void {
               <div id="stEdgeRestoreWrap" class="mt-2 ${cb.individuallyHiddenEdges ? '' : 'hidden'}">
                 <button id="stEdgeRestore" class="${smallBtn}">Restore ${cb.individuallyHiddenEdges} individually hidden link${cb.individuallyHiddenEdges === 1 ? '' : 's'}</button>
               </div>
-            </div>`
+            </div>` +
+            (routeRows
+              ? `<details class="py-2" ${opts.hiddenRoutes.length ? 'open' : ''}>
+              <summary class="cursor-pointer text-slate-700 dark:text-slate-200 select-none">Visible routes <span class="text-[11px] text-slate-400">— hide one branch without hiding its whole link type</span></summary>
+              <div class="mt-1 max-h-48 overflow-y-auto pr-1 grid grid-cols-2 gap-x-4">${routeRows}</div>
+            </details>`
+              : '')
         )}
 
         ${group(
@@ -206,9 +241,13 @@ export function showSettings(cb: SettingsCallbacks): void {
           row(
             'Default snapshot folder',
             `<button id="stSnapDir" class="${smallBtn}">Choose…</button>
-             <button id="stSnapClear" class="${smallBtn}">Clear</button>`,
+             <button id="stSnapClear" class="${smallBtn}">Reset</button>`,
             'Where “Save snapshot” opens.'
-          ) + `<div class="py-1.5 text-[11px] text-slate-400 font-mono break-all" id="stSnapDirPath"></div>`
+          ) +
+            `<div class="py-1.5 flex items-start gap-2">
+              <span id="stSnapDirTag" class="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300"></span>
+              <span class="text-[11px] text-slate-400 font-mono break-all" id="stSnapDirPath"></span>
+            </div>`
         )}
 
         ${group(
@@ -261,6 +300,18 @@ export function showSettings(cb: SettingsCallbacks): void {
       apply()
     })
   }
+  // --- Route types ---
+  const hiddenRoutes = new Set<string>(opts.hiddenRoutes)
+  for (const box of overlay.querySelectorAll<HTMLInputElement>('[data-route]')) {
+    box.addEventListener('change', () => {
+      const group = box.dataset.route!
+      if (box.checked) hiddenRoutes.delete(group)
+      else hiddenRoutes.add(group)
+      opts.hiddenRoutes = [...hiddenRoutes]
+      apply()
+    })
+  }
+
   overlay.querySelector('#stEdgeRestore')?.addEventListener('click', () => {
     cb.onRestoreHiddenEdges()
     overlay.querySelector('#stEdgeRestoreWrap')?.classList.add('hidden')
@@ -287,12 +338,23 @@ export function showSettings(cb: SettingsCallbacks): void {
   overlay.querySelector('#stZones')!.addEventListener('click', () => cb.onOpenZones())
 
   // --- Snapshot folder ---
+  // Always show the folder that will actually be used. "Not set — system
+  // default" told the user nothing: there's no way to know from that where a
+  // snapshot is about to land, so the built-in fallback path is resolved from
+  // the main process and shown too, just tagged as the default.
   const snapPathEl = overlay.querySelector<HTMLElement>('#stSnapDirPath')!
+  const snapTagEl = overlay.querySelector<HTMLElement>('#stSnapDirTag')!
+  let builtInSnapDir = ''
   const showSnapDir = (): void => {
     const dir = readSnapshotDir()
-    snapPathEl.textContent = dir || 'Not set — the system default is used.'
+    snapTagEl.textContent = dir ? 'Chosen' : 'Default'
+    snapPathEl.textContent = dir || builtInSnapDir || 'Resolving…'
   }
   showSnapDir()
+  void window.api.app.defaultSnapshotDir().then((dir) => {
+    builtInSnapDir = dir
+    showSnapDir()
+  })
   overlay.querySelector('#stSnapDir')!.addEventListener('click', async () => {
     const res = await window.api.app.chooseFolder('Default snapshot folder')
     if (res?.path) {

@@ -306,15 +306,24 @@ function describeDest(o: Obj): string | null {
   return null
 }
 
-/** Compute the 3CX management-console deep-link path for each node. Inbound
- *  rules live under their owning trunk (matched by DID → trunk DidNumbers). */
-function setThreecxPaths(b: Builder, topo: Topology): void {
-  const didToTrunk = new Map<string, string>()
+/** DID number → owning trunk's 3CX entity Id, from each trunk's DidNumbers list.
+ *  A trunk typically owns a long block of numbers, so this is how an inbound rule
+ *  is tied back to the line it actually arrives on when the rule itself doesn't
+ *  name a TrunkId. */
+function didToTrunkMap(topo: Topology): Map<string, string> {
+  const map = new Map<string, string>()
   for (const t of topo.trunks.value as Obj[]) {
     const tid = str(pick(t, 'Id'))
     const dids = t['DidNumbers']
-    if (tid && Array.isArray(dids)) for (const d of dids) if (str(d)) didToTrunk.set(str(d), tid)
+    if (tid && Array.isArray(dids)) for (const d of dids) if (str(d)) map.set(str(d), tid)
   }
+  return map
+}
+
+/** Compute the 3CX management-console deep-link path for each node. Inbound
+ *  rules live under their owning trunk (matched by DID → trunk DidNumbers). */
+function setThreecxPaths(b: Builder, topo: Topology): void {
+  const didToTrunk = didToTrunkMap(topo)
   for (const node of b.nodes) {
     const id = str(node.raw['Id'])
     switch (node.kind) {
@@ -348,9 +357,11 @@ function setThreecxPaths(b: Builder, topo: Topology): void {
   }
 }
 
-/** Record, on each bridge node, the outbound-rule prefixes routed across it
- *  (i.e. which extension ranges this system sends to the remote PBX). */
-function attachBridgeOutbound(b: Builder, topo: Topology): void {
+/** Record, on each bridge / trunk node, the outbound-rule prefixes routed across
+ *  it (i.e. which dialled patterns leave the system down that line). Outbound
+ *  rules aren't nodes of their own — as a flat list of dial patterns they'd bury
+ *  the call flow — so they're summarised on the line they use. */
+function attachOutboundRules(b: Builder, topo: Topology): void {
   for (const rule of (topo.outboundRules?.value ?? []) as Obj[]) {
     const prefix = str(pick(rule, 'Prefix'))
     const name = str(pick(rule, 'Name'))
@@ -362,15 +373,147 @@ function attachBridgeOutbound(b: Builder, topo: Topology): void {
       const tid = str(pick(r, 'TrunkId'))
       if (!tid || tid === '-1' || seen.has(tid)) continue
       seen.add(tid)
-      const node = b.getByEntityId(tid)
-      if (!node || node.kind !== 'bridge') continue
-      node.info ??= []
+      const node = b.getById(`bridge:${tid}`) ?? b.getById(`trunk:${tid}`)
+      if (!node) continue
       const value = prefix ? `${prefix}${name ? ` — ${name}` : ''}` : name
-      if (value) node.info.push({ label: 'Sends', value })
+      if (value) (node.outboundRules ??= []).push(value)
       // Label the bridge → remote-system edge with the sent prefixes.
       const host = str(pick(node.raw, 'RemoteMyPhoneUriHost'))
       if (host && prefix) b.addEdge(node.id, `system:${host}`, 'trunk', prefix)
     }
+  }
+}
+
+/** The trunk / bridge an inbound rule belongs to. 3CX names it directly on the
+ *  rule most of the time, but not always — falling back to the trunk that owns
+ *  the rule's DID is what keeps a trunk from floating unconnected. */
+function trunkForRule(b: Builder, rule: Obj, didToTrunk: Map<string, string>): GraphNode | null {
+  const byEntity = (id: string): GraphNode | undefined =>
+    b.getById(`trunk:${id}`) ?? b.getById(`bridge:${id}`)
+  const trunkId = str(pick(rule, 'TrunkId', 'GatewayId'))
+  if (trunkId) {
+    const n = byEntity(trunkId)
+    if (n) return n
+  }
+  const trunkNumber = str(pick(rule, 'TrunkDN', 'TrunkNumber'))
+  if (trunkNumber) {
+    const n = b.getByNumber(trunkNumber)
+    if (n && (n.kind === 'trunk' || n.kind === 'bridge')) return n
+  }
+  // Last resort: whichever trunk lists this rule's DID among its numbers.
+  for (const did of ruleDidList(rule)) {
+    const tid = didToTrunk.get(did)
+    const n = tid ? byEntity(tid) : undefined
+    if (n) return n
+  }
+  return null
+}
+
+/** 3CX's own key names for a trunk's default destinations, mapped to labels that
+ *  read the way the console words them. The mapped name is fed back through the
+ *  normal route pipeline, so `routeKind` still classifies out-of-hours and
+ *  holiday branches as `afterhours` (dashed) from the mapped name alone. */
+const TRUNK_ROUTE_KEYS: [RegExp, string][] = [
+  [/^outofoffice|^nonbusiness|^afterhours/i, 'OutOfOfficeHoursDestination'],
+  [/^holiday/i, 'HolidayDestination'],
+  [/^specifictime|^breaktime/i, 'SpecificHoursDestination'],
+  [/^office/i, 'OfficeHoursDestination']
+]
+
+/** Draw a trunk's OWN default routing.
+ *
+ *  3CX models "where do unmatched calls on this line go?" as a hidden inbound
+ *  rule with Condition `ForwardAll` — it never appears in the portal's Inbound
+ *  Rules list (it's edited on the trunk's page), so it's skipped as a node. But
+ *  skipping it outright left every trunk as an island: the default destination a
+ *  trunk points at is exactly what makes it part of the call flow. So the rule's
+ *  destinations are attached to the TRUNK node instead of a node of their own. */
+function attachTrunkDefaultRoutes(b: Builder, topo: Topology, didToTrunk: Map<string, string>): void {
+  for (const rule of topo.inboundRules.value as Obj[]) {
+    if (!isTrunkDefaultRule(rule)) continue
+    const trunk = trunkForRule(b, rule, didToTrunk)
+    if (!trunk) continue
+    const context = `trunk "${trunk.label}" default route`
+    for (const [key, value] of Object.entries(rule)) {
+      if (!DEST_KEY_RE.test(key)) continue
+      const mapped = TRUNK_ROUTE_KEYS.find(([re]) => re.test(key))?.[1] ?? key
+      routeFromValue(b, trunk.id, mapped, value, context)
+    }
+    collectDnForwards(b, trunk.id, rule, context)
+  }
+}
+
+/** Summarise the line itself in the details panel: how many numbers it carries,
+ *  its main/presented number, and where it terminates. Every number the trunk
+ *  answers on also becomes searchable, so typing a DID finds the line carrying
+ *  it — they'd otherwise be invisible (a trunk's `number` is its internal DN). */
+function attachTrunkInfo(raw: Obj, node: GraphNode): void {
+  const info: { label: string; value: string }[] = []
+  const terms: { label: string; value: string }[] = []
+  const external = str(pick(raw, 'ExternalNumber'))
+  if (external) {
+    info.push({ label: 'Main number', value: external })
+    terms.push({ label: 'Main number', value: external })
+  }
+  const callerId = str(pick(raw, 'OutboundCallerID'))
+  if (callerId && callerId !== external) {
+    info.push({ label: 'Outbound caller ID', value: callerId })
+    terms.push({ label: 'Caller ID', value: callerId })
+  }
+  const dids = raw['DidNumbers']
+  if (Array.isArray(dids) && dids.length) {
+    info.push({ label: 'DID numbers', value: `${dids.length}` })
+    for (const d of dids) if (str(d)) terms.push({ label: 'DID', value: str(d) })
+  }
+  const direction = str(pick(raw, 'Direction'))
+  if (direction) info.push({ label: 'Direction', value: direction })
+  const gw = isObj(raw['Gateway']) ? (raw['Gateway'] as Obj) : {}
+  const host = str(pick(gw, 'Host'))
+  if (host) {
+    const port = str(pick(gw, 'Port'))
+    info.push({ label: 'Host', value: port ? `${host}:${port}` : host })
+    terms.push({ label: 'Host', value: host })
+  }
+  if (info.length) node.info = [...(node.info ?? []), ...info]
+  if (terms.length) node.searchTerms = [...(node.searchTerms ?? []), ...terms]
+}
+
+/** DID number → the friendly name it's given in 3CX's DID list ("Oscar
+ *  Traynor"). That name is the one a human actually knows the number by, but it
+ *  lives on the DidNumbers collection rather than on the inbound rule that
+ *  answers it — so without this the name is unsearchable and unshown. */
+function didNameMap(topo: Topology): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const d of topo.didNumbers.value as Obj[]) {
+    const num = str(pick(d, 'Number', 'DidNumber', 'DID', 'Did'))
+    const name = str(pick(d, 'Name', 'DisplayName', 'Description', 'FriendlyName'))
+    if (num && name) map.set(num, name)
+  }
+  return map
+}
+
+/** Make an inbound rule findable by every DID it answers and by those DIDs'
+ *  friendly names, and — when 3CX left the rule unnamed — label it with the DID
+ *  name rather than a meaningless "DID Rule". */
+function attachRuleDids(node: GraphNode, rule: Obj, didNames: Map<string, string>): void {
+  const dids = ruleDidList(rule)
+  if (!dids.length) return
+  const terms: { label: string; value: string }[] = []
+  const names: string[] = []
+  for (const did of dids) {
+    terms.push({ label: 'DID', value: did })
+    const name = didNames.get(did)
+    if (name && !names.includes(name)) names.push(name)
+  }
+  for (const name of names) terms.push({ label: 'DID name', value: name })
+  node.searchTerms = [...(node.searchTerms ?? []), ...terms]
+  if (names.length) {
+    node.info = [
+      ...(node.info ?? []),
+      { label: names.length > 1 ? 'DID names' : 'DID name', value: names.join(', ') }
+    ]
+    // A rule 3CX never named reads far better as the number's own name.
+    if (!displayName(rule)) node.label = names[0]
   }
 }
 
@@ -399,7 +542,15 @@ export function buildTopology(topo: Topology): TopologyGraph {
   for (const raw of topo.users.value as Obj[]) {
     const number = str(pick(raw, 'Number', 'Extension'))
     if (!number) continue
-    b.addNode('user', number, displayName(raw) || `#${number}`, raw, number)
+    const node = b.addNode('user', number, displayName(raw) || `#${number}`, raw, number)
+    // People get looked up by the contact detail the searcher happens to have.
+    for (const [label, ...keys] of [
+      ['Email', 'Email', 'EmailAddress'],
+      ['Mobile', 'Mobile', 'MobileNumber']
+    ] as string[][]) {
+      const value = str(pick(raw, ...keys))
+      if (value) (node.searchTerms ??= []).push({ label, value })
+    }
   }
   for (const raw of topo.queues.value as Obj[]) {
     const number = str(pick(raw, 'Number'))
@@ -457,24 +608,32 @@ export function buildTopology(topo: Topology): TopologyGraph {
       const sys = b.addNode('system', remoteHost, remoteHost, { Host: remoteHost })
       b.addEdge(node.id, sys.id, 'trunk')
     } else {
-      b.addNode('trunk', id || number, name, raw, number || undefined)
+      attachTrunkInfo(raw, b.addNode('trunk', id || number, name, raw, number || undefined))
     }
   }
+  const didNames = didNameMap(topo)
   for (const raw of topo.inboundRules.value as Obj[]) {
     if (isTrunkDefaultRule(raw)) continue
     const id = str(pick(raw, 'Id'))
     // Show the dialled number (DID) on the rule itself — DIDs aren't their own
     // nodes; the Inbound Rule is what routing hangs off.
     const did = ruleDid(raw)
-    b.addNode('inboundRule', id || displayName(raw), ruleName(raw, id), raw, did)
+    const node = b.addNode('inboundRule', id || displayName(raw), ruleName(raw, id), raw, did)
+    attachRuleDids(node, raw, didNames)
   }
 
   // Departments become badges on their members, not nodes on the canvas.
   attachDepartments(b, topo)
-  // Outbound rules tell us which number ranges each bridge sends to its system.
-  attachBridgeOutbound(b, topo)
+  // Outbound rules tell us which number ranges each line sends out.
+  attachOutboundRules(b, topo)
   // Deep-link paths for the "Open in 3CX" action.
   setThreecxPaths(b, topo)
+  // Which trunk owns which DID — needed to tie inbound rules (and the trunks'
+  // own default destinations, below) back to the line calls arrive on.
+  const didToTrunk = didToTrunkMap(topo)
+  // A trunk's own "route unmatched calls to…" destinations, which 3CX hides
+  // inside a ForwardAll inbound rule.
+  attachTrunkDefaultRoutes(b, topo, didToTrunk)
 
   // --- Pass 2: membership edges (explicit, well-known shapes).
   for (const raw of topo.queues.value as Obj[]) {
@@ -495,7 +654,7 @@ export function buildTopology(topo: Topology): TopologyGraph {
     const id = str(pick(raw, 'Id'))
     const self = `inboundRule:${id || displayName(raw)}`
     collectRoutes(b, self, raw, `inbound rule "${displayName(raw) || id}"`)
-    linkRuleTrunk(b, self, raw)
+    linkRuleTrunk(b, self, raw, didToTrunk)
   }
   for (const raw of topo.receptionists.value as Obj[]) {
     const number = str(pick(raw, 'Number'))
@@ -675,12 +834,13 @@ function addMembers(
   }
 }
 
-function linkRuleTrunk(b: Builder, ruleId: string, rule: Obj): void {
-  const trunkId = str(pick(rule, 'TrunkId', 'GatewayId'))
-  const trunkNumber = str(pick(rule, 'TrunkNumber'))
-  let trunk: GraphNode | undefined
-  if (trunkId) trunk = b.getById(`trunk:${trunkId}`)
-  if (!trunk && trunkNumber) trunk = b.getByNumber(trunkNumber)
+function linkRuleTrunk(
+  b: Builder,
+  ruleId: string,
+  rule: Obj,
+  didToTrunk: Map<string, string>
+): void {
+  const trunk = trunkForRule(b, rule, didToTrunk)
   if (trunk) b.addEdge(trunk.id, ruleId, 'trunk', 'inbound')
 }
 
@@ -770,27 +930,31 @@ function ruleName(raw: Obj, id: string): string {
   return id ? `Rule ${id}` : 'Inbound Rule'
 }
 
-/** The dialled number(s) an inbound rule matches, shown on the rule node.
- *  3CX keeps the DID in `Data` when Condition is BasedOnDID. */
-function ruleDid(rule: Obj): string | undefined {
-  const multi = (s: string): string | undefined => {
-    const parts = s.split(/[,\s;]+/).filter(Boolean)
-    if (!parts.length) return undefined
-    return parts.length > 1 ? `${parts[0]} +${parts.length - 1}` : parts[0]
-  }
+/** Every dialled number an inbound rule matches on, in the order 3CX reports
+ *  them. Used both for the rule's own label and to find the trunk that owns it. */
+function ruleDidList(rule: Obj): string[] {
+  const split = (s: string): string[] => s.split(/[,\s;]+/).filter(Boolean)
   const cond = str(pick(rule, 'Condition'))
   const data = str(pick(rule, 'Data'))
-  if (data && /did/i.test(cond)) return multi(data)
+  if (data && /did/i.test(cond)) return split(data)
   const direct = str(pick(rule, 'DID', 'Did', 'DidNumber', 'Number'))
-  if (direct) return multi(direct)
+  if (direct) return split(direct)
   const list = rule['DIDs'] ?? rule['DidNumbers'] ?? rule['Dids']
   if (Array.isArray(list) && list.length) {
     const nums = list
       .map((d) => (isObj(d) ? str(pick(d, 'Number', 'DidNumber', 'DID', 'Did')) : str(d)))
       .filter(Boolean)
-    if (nums.length) return nums.length > 1 ? `${nums[0]} +${nums.length - 1}` : nums[0]
+    if (nums.length) return nums
   }
-  return data ? multi(data) : undefined
+  return data ? split(data) : []
+}
+
+/** The dialled number(s) an inbound rule matches, shown on the rule node.
+ *  3CX keeps the DID in `Data` when Condition is BasedOnDID. */
+function ruleDid(rule: Obj): string | undefined {
+  const nums = ruleDidList(rule)
+  if (!nums.length) return undefined
+  return nums.length > 1 ? `${nums[0]} +${nums.length - 1}` : nums[0]
 }
 
 /** Attach department (group) names to the user nodes that belong to them. */

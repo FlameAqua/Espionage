@@ -6,9 +6,11 @@ import type { Topology } from '../../../shared/types'
 import { buildTopology } from '../graph/build'
 import {
   GraphView,
+  type EdgeContextInfo,
   type EdgeTapInfo,
   type LayoutName,
   type NodeMove,
+  type SearchHit,
   type ThemeName
 } from '../graph/view'
 import {
@@ -24,7 +26,12 @@ import {
   type GraphNode,
   type NodeKind
 } from '../graph/model'
-import { renderDepartmentDetails, renderDetails, renderEdgeDetails } from './details'
+import {
+  renderDepartmentDetails,
+  renderDetails,
+  renderEdgeDetails,
+  renderKindDetails
+} from './details'
 import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
@@ -100,9 +107,18 @@ const esc = (s: unknown): string =>
   )
 
 const THEME_KEY = '3cx-spy.theme'
-// Theme-aware so the header and side panels follow light/dark mode.
-const btn =
-  'px-2 py-1 rounded text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-100'
+// Theme-aware so the header and side panels follow light/dark mode. The skin and
+// the sizing are separate because Tailwind resolves conflicting utilities by
+// stylesheet order, not by the order they appear in a class attribute — so
+// appending `px-1` to a string already containing `px-2` does NOT reliably win.
+// Anything needing different padding composes from the skin instead.
+const btnSkin =
+  'rounded bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-100'
+const btn = `px-2 py-1 text-xs ${btnSkin}`
+// Narrow variant for the paired Fit / Lock buttons: identical padding and type
+// size on both, so they stay the same width and neither "Unlocked" nor "Fit"
+// wraps to a second line in a 12rem panel.
+const btnTight = `px-1 py-1 text-[11px] whitespace-nowrap ${btnSkin}`
 
 let cleanup: (() => void)[] = []
 
@@ -129,22 +145,18 @@ export function renderApp(
   const presentKinds = (Object.keys(NODE_KIND_META) as NodeKind[]).filter((k) => counts[k])
   // Core 3CX categories always shown in the legend — even at zero, greyed out —
   // so an absent category (e.g. no queues) is explicit rather than just missing.
-  const ALWAYS_SHOW_KINDS: NodeKind[] = [
-    'user',
-    'queue',
-    'ringGroup',
-    'ivr',
-    'inboundRule',
-    'trunk',
-    'group'
-  ]
+  // NB 'group' is deliberately absent: departments are badges on their members,
+  // never nodes, so the row could only ever read 0 — and the Departments section
+  // below the legend is the real control for them.
+  const ALWAYS_SHOW_KINDS: NodeKind[] = ['user', 'queue', 'ringGroup', 'ivr', 'inboundRule', 'trunk']
   // Everything to list: core categories + any synthetic kind that's actually present.
   const displayKinds = (Object.keys(NODE_KIND_META) as NodeKind[]).filter(
     (k) => ALWAYS_SHOW_KINDS.includes(k) || counts[k]
   )
-  // Trunks are noisy for day-to-day call-flow reading, so hide them by default.
-  const DEFAULT_OFF: NodeKind[] = ['trunk']
-  const visible = new Set<NodeKind>(presentKinds.filter((k) => !DEFAULT_OFF.includes(k)))
+  // Every present category is on by default. Trunks used to be off — they were
+  // unconnected islands that added nothing — but they now carry their own default
+  // routing and their DIDs' inbound rules, so they're part of the call flow.
+  const visible = new Set<NodeKind>(presentKinds)
   let theme = getTheme()
   applyTheme(theme)
 
@@ -183,10 +195,9 @@ export function renderApp(
         <div class="flex items-center justify-end gap-1.5 text-sm min-w-0">
           <label class="flex items-center gap-1.5 shrink-0 mr-1">
             <span class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">View Mode</span>
-            <select id="layout" title="View Mode — how the graph is arranged" class="${btn} appearance-none pr-2">
+            <select id="layout" title="View Mode — Flow follows the call path, Compact packs everything into a grid by category, Department groups by tenant" class="${btn} appearance-none pr-2">
               <option value="flow">Flow</option>
               <option value="compact">Compact</option>
-              <option value="force">Spread</option>
               <option value="department">Department</option>
             </select>
           </label>
@@ -300,9 +311,11 @@ export function renderApp(
                 <button id="zoomIn" class="${btn} w-7" title="Zoom in">+</button>
               </div>
             </div>
+            <!-- Equal halves. Both use btnTight so "Unlocked" fits on one line
+                 without the lock button having to be wider than Fit. -->
             <div class="flex items-center gap-1">
-              <button id="fit" class="${btn} flex-1" title="Fit to screen">⤢ Fit</button>
-              <button id="lock" class="${btn} flex-1" title="Locked stops nodes being dragged (they stay clickable). Unlock to reposition them. Toggle with Space.">🔒 Locked</button>
+              <button id="fit" class="${btnTight} flex-1" title="Fit to screen">⤢ Fit</button>
+              <button id="lock" class="${btnTight} flex-1" title="Locked stops nodes being dragged (they stay clickable). Unlock to reposition them. Toggle with Space.">🔒 Locked</button>
             </div>
           </div>
         </aside>
@@ -348,6 +361,7 @@ export function renderApp(
             ${helpRow(mouseSvg('left'), 'Click a link', 'split it into its routes')}
             ${helpRow(mouseSvg('left', '×2'), 'Double-click', 'focus')}
             ${helpRow(mouseSvg('right'), 'Right-click', 'actions (incl. Hide)')}
+            ${helpRow(mouseSvg('right'), 'Right-click a link', 'hide that route type, or all of them')}
             ${helpRow(mouseSvg('right'), 'Right-drag', 'select group → move together')}
             ${helpRow(mouseSvg('wheel'), 'Scroll', 'zoom (Ctrl = faster)')}
             ${helpRow(dragSvg(), 'Drag', 'pan / move node')}
@@ -356,6 +370,10 @@ export function renderApp(
             ${helpRow(keyCap('⌃Y'), 'Ctrl+Y', 'redo')}
             ${helpRow(mouseSvg('right'), 'Right-click bg', 'undo / redo menu')}
           </div>
+          <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+            The mini-map in the Details panel takes the same gestures, and has its
+            own arrangement and reach controls in its top-right corner.
+          </p>
           <h2 class="font-semibold text-slate-800 dark:text-slate-100 mt-4 mb-2">Keyboard shortcuts</h2>
           <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
             <kbd class="px-1 py-0.5 rounded border border-current text-[9px]">Ctrl+K</kbd>
@@ -428,8 +446,50 @@ export function renderApp(
     })
     if (node) {
       const egoEl = detailsEl.querySelector<HTMLElement>('#egomap')
-      if (egoEl) egoMap = new EgoMap(egoEl, graph, node.id, theme, (id) => navigate(id, true))
+      // The mini-map gets the same gestures as the canvas — including the full
+      // node context menu — so a neighbour can be acted on without hunting for
+      // it on the main graph first.
+      if (egoEl)
+        egoMap = new EgoMap(
+          egoEl,
+          graph,
+          node.id,
+          theme,
+          {
+            onNavigate: (id) => navigate(id, true),
+            onFocus: (id) => enterFocus(id),
+            onContext: (id, x, y) => {
+              const target = graph.nodes.find((n) => n.id === id)
+              if (target) showCtx(target, x, y)
+            }
+          },
+          // It draws the same graph, so it obeys the same link settings.
+          edgeOptions
+        )
     }
+  }
+
+  // Clicking a category name in the legend lights its nodes on the canvas; this
+  // says what that category IS and lists every member, so the highlight comes
+  // with an explanation rather than just a colour.
+  const showKindDetails = (kind: NodeKind): void => {
+    current = null
+    selectedDept = null
+    egoMap?.destroy()
+    egoMap = null
+    if (sizes.rightHidden) toggleDetails(true)
+    renderKindDetails(
+      detailsEl,
+      kind,
+      graph.nodes.filter((n) => n.kind === kind),
+      {
+        graph,
+        canGoBack: history.length > 1,
+        onNavigate: (id) => navigate(id, true),
+        onBack: goBack,
+        onHide: () => toggleDetails(false)
+      }
+    )
   }
 
   // Tapping a department box selects the whole department: spotlight its members
@@ -527,14 +587,21 @@ export function renderApp(
   /** Apply a hide/restore timeline entry. `hide` is the direction to move in:
    *  true re-hides the recorded elements, false restores them. */
   const applyHide = (
-    entry: { nodeIds: string[]; edgeIds: string[]; edgeKinds: string[] },
+    entry: {
+      nodeIds: string[]
+      edgeIds: string[]
+      edgeKinds: string[]
+      routeGroups?: string[]
+    },
     hide: boolean
   ): void =>
     undo.run(() => {
+      const routeGroups = entry.routeGroups ?? []
       if (hide) {
         for (const id of entry.nodeIds) view.hideNode(id)
         for (const id of entry.edgeIds) view.hideEdge(id)
         for (const kind of entry.edgeKinds) view.hideEdgeKind(kind)
+        for (const group of routeGroups) view.hideRouteGroup(group)
       } else {
         view.unhideNodes(entry.nodeIds)
         view.unhideEdges(entry.edgeIds)
@@ -542,8 +609,13 @@ export function renderApp(
           const remaining = view.getHiddenEdgeKinds().filter((k) => !entry.edgeKinds.includes(k))
           view.setHiddenEdgeKinds(remaining)
         }
+        if (routeGroups.length) {
+          view.setHiddenRouteGroups(
+            view.getHiddenRouteGroups().filter((g) => !routeGroups.includes(g))
+          )
+        }
       }
-      if (entry.edgeKinds.length) syncEdgeOptionsFromView()
+      if (entry.edgeKinds.length || routeGroups.length) syncEdgeOptionsFromView()
       openPanelRefresh?.() // an undone/redone hide changes the hidden-nodes list
       syncFocusDepthRow()
     })
@@ -563,6 +635,13 @@ export function renderApp(
     else goTo(entry.to)
   }
 
+  /** How a node is named in the breadcrumb / history. Normally its extension
+   *  number, which is the short unambiguous handle — except for trunks and
+   *  bridges, whose "number" is an internal DN 3CX assigns (10000, 10001, …)
+   *  that tells you nothing. Those read by name. */
+  const crumbLabel = (n: GraphNode): string =>
+    n.kind === 'trunk' || n.kind === 'bridge' ? n.label : (n.number ?? n.label)
+
   // Breadcrumb: All › (…) › up to the 4 most recent nodes, current last.
   const renderBreadcrumb = (): void => {
     const sep = '<span class="text-slate-400 mx-1">›</span>'
@@ -571,7 +650,7 @@ export function renderApp(
     if (start > 0) parts.push('<span class="text-slate-400">…</span>')
     for (let i = start; i < history.length; i++) {
       const n = graph.nodes.find((x) => x.id === history[i])
-      const label = n ? (n.number ?? n.label) : '?'
+      const label = n ? crumbLabel(n) : '?'
       const isCurrent = i === history.length - 1
       parts.push(
         `<button data-crumb="${i}" class="${isCurrent ? 'font-semibold text-sky-600 dark:text-sky-400' : 'hover:underline'}">${esc(label)}</button>`
@@ -582,7 +661,7 @@ export function renderApp(
     if (!history.length && lastNodeBeforeAll) {
       const n = graph.nodes.find((x) => x.id === lastNodeBeforeAll)
       if (n)
-        html += `<button data-crumb="return" class="ml-2 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-200" title="Back to last node">↩ ${esc(n.number ?? n.label)}</button>`
+        html += `<button data-crumb="return" class="ml-2 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-200" title="Back to last node">↩ ${esc(crumbLabel(n))}</button>`
     }
     breadcrumbEl.innerHTML = html
     breadcrumbEl.querySelectorAll<HTMLElement>('[data-crumb]').forEach((b) => {
@@ -915,12 +994,9 @@ export function renderApp(
     placeCtx(x, y)
   }
 
-  // Right-click a link: hide just it, or every link of that type.
-  const showEdgeCtx = (
-    info: EdgeTapInfo & { edgeId: string },
-    x: number,
-    y: number
-  ): void => {
+  // Right-click a link: hide just it, every link carrying the same KIND of route
+  // (e.g. only the out-of-hours destinations), or the whole link type.
+  const showEdgeCtx = (info: EdgeContextInfo, x: number, y: number): void => {
     const item = (icon: string, label: string, fn: () => void): HTMLElement => {
       const b = document.createElement('button')
       b.className =
@@ -941,6 +1017,27 @@ export function renderApp(
         flash('Link hidden — undo with Ctrl+Z.')
       })
     )
+    // The specific routes this link carries. A link's *kind* lumps every ordinary
+    // route together, so without these, hiding "the out of office hours
+    // destination" took out every route on the graph. Capped at three so a link
+    // bundling many routes doesn't produce a menu the length of the window.
+    for (const group of info.routeGroups.slice(0, 3)) {
+      ctxEl.append(
+        item('🚫', `Hide all “${group}” routes`, () => {
+          view.hideRouteGroup(group)
+          syncEdgeOptionsFromView()
+          undo.push({
+            type: 'hide',
+            nodeIds: [],
+            edgeIds: [],
+            edgeKinds: [],
+            routeGroups: [group],
+            hidden: true
+          })
+          flash(`All “${group}” routes hidden — see Settings to restore.`)
+        })
+      )
+    }
     ctxEl.append(
       item('🚫', `Hide all “${kindLabel}” links`, () => {
         view.hideEdgeKind(info.kind)
@@ -993,9 +1090,17 @@ export function renderApp(
         item('👁', `Show ${hiddenEdges} hidden link${hiddenEdges === 1 ? '' : 's'}`, () => {
           const ids = view.hiddenEdgeIdList()
           const kinds = view.getHiddenEdgeKinds()
+          const routes = view.getHiddenRouteGroups()
           view.unhideAllEdges()
           syncEdgeOptionsFromView()
-          undo.push({ type: 'hide', nodeIds: [], edgeIds: ids, edgeKinds: kinds, hidden: false })
+          undo.push({
+            type: 'hide',
+            nodeIds: [],
+            edgeIds: ids,
+            edgeKinds: kinds,
+            routeGroups: routes,
+            hidden: false
+          })
           flash('Hidden links restored.')
         })
       )
@@ -1008,10 +1113,15 @@ export function renderApp(
 
   // --- Link display options (persisted; see settings.ts) -------------------
   let edgeOptions: EdgeOptions = loadEdgeOptions()
-  /** Mirror the view's hidden link types back into the saved options, after an
-   *  undo/redo has changed them behind the Settings panel's back. */
+  /** Mirror the view's hidden link types / route types back into the saved
+   *  options, after a context-menu hide or an undo/redo has changed them behind
+   *  the Settings panel's back. */
   const syncEdgeOptionsFromView = (): void => {
-    edgeOptions = { ...edgeOptions, hiddenKinds: view.getHiddenEdgeKinds() as EdgeOptions['hiddenKinds'] }
+    edgeOptions = {
+      ...edgeOptions,
+      hiddenKinds: view.getHiddenEdgeKinds() as EdgeOptions['hiddenKinds'],
+      hiddenRoutes: view.getHiddenRouteGroups()
+    }
     saveEdgeOptions(edgeOptions)
   }
 
@@ -1040,6 +1150,7 @@ export function renderApp(
   // Apply the saved link options to the fresh view.
   view.setEdgeMuting(edgeOptions.opacity)
   if (edgeOptions.hiddenKinds.length) view.setHiddenEdgeKinds(edgeOptions.hiddenKinds)
+  if (edgeOptions.hiddenRoutes.length) view.setHiddenRouteGroups(edgeOptions.hiddenRoutes)
   showDetails(null)
   renderBreadcrumb()
 
@@ -1119,6 +1230,10 @@ export function renderApp(
       el.classList.toggle('ring-1', on)
       el.classList.toggle('ring-sky-500', on)
     })
+    // The highlight and the panel are one action: selecting a category explains
+    // it, deselecting returns the panel to its empty state.
+    if (kind) showKindDetails(kind)
+    else showDetails(null)
   }
   hlButtons.forEach((b) => {
     b.addEventListener('click', () => {
@@ -1281,7 +1396,6 @@ export function renderApp(
     const layouts: Array<[LayoutName, string]> = [
       ['flow', 'Flow'],
       ['compact', 'Compact'],
-      ['force', 'Spread'],
       ['department', 'Department']
     ]
     for (const [value, name] of layouts) {
@@ -1347,11 +1461,13 @@ export function renderApp(
       commands: paletteCommands(),
       // Reuse the same matcher the header search uses, so results agree.
       findNodes: (q) =>
-        view.search(q).slice(0, 8).map((n) => ({
-          id: n.id,
-          label: n.label,
-          detail: n.number,
-          colour: NODE_KIND_META[n.kind].color
+        view.searchDetailed(q).slice(0, 8).map(({ node, via }) => ({
+          id: node.id,
+          label: node.label,
+          // Prefer the reason this hit matched at all — an extension number the
+          // searcher didn't type explains less than the DID they did.
+          detail: via ?? node.number,
+          colour: NODE_KIND_META[node.kind].color
         })),
       onNavigate: (id) => navigate(id, true)
     })
@@ -1421,7 +1537,7 @@ export function renderApp(
       c.checked = visible.has(c.dataset.kind as NodeKind)
     })
     // Layout.
-    if (['flow', 'compact', 'force', 'department'].includes(s.layout)) layoutSel.value = s.layout
+    if (['flow', 'compact', 'department'].includes(s.layout)) layoutSel.value = s.layout
     view.setLayout(layoutSel.value as LayoutName)
     // Breadcrumb history (drop ids that no longer exist after the refresh).
     history.length = 0
@@ -1485,11 +1601,15 @@ export function renderApp(
     showSettings({
       theme,
       edgeOptions,
+      routeGroups: view.routeGroupCounts(),
       onEdgeOptions: (o) => {
         edgeOptions = o
         saveEdgeOptions(o)
         view.setEdgeMuting(o.opacity)
         view.setHiddenEdgeKinds(o.hiddenKinds)
+        view.setHiddenRouteGroups(o.hiddenRoutes)
+        // Settings apply live and the mini-map is usually on screen while they do.
+        egoMap?.setEdgeOptions(o)
       },
       onToggleTheme: toggleTheme,
       onOpenZones: () => showZoneSettings(),
@@ -1551,7 +1671,6 @@ export function renderApp(
     menuEl.append(item('🩺', 'Health check', showAuditPanel))
     menuEl.append(item('👥', 'Extensions', showExtensionsPanel))
     menuEl.append(item('🗂', 'DID table', showDidTable))
-    menuEl.append(item('🕓', 'Compare snapshot', () => void showSnapshotDiff()))
     // Reports — call-activity reporting.
     menuEl.append(section('Reports'))
     menuEl.append(item('📊', 'Generate report', () => showReportSetup(nameFor, deptFor)))
@@ -1562,6 +1681,8 @@ export function renderApp(
     menuEl.append(item('🖼', 'Export PNG', () => exportPng(view, theme, host)))
     menuEl.append(item('💾', 'Save snapshot', saveSnapshot))
     menuEl.append(item('📂', 'Open snapshot', cb.onOpenSnapshot))
+    // Comparing lives with the snapshots it reads, not with the Analyse tools.
+    menuEl.append(item('🕓', 'Compare snapshot', () => void showSnapshotDiff()))
     // Everything configurable lives in Settings — deliberately not duplicated
     // here, so there's one place to change a setting.
     menuEl.append(section('Settings'))
@@ -1606,7 +1727,7 @@ export function renderApp(
   const searchEl = root.querySelector<HTMLInputElement>('#search')!
   const resultsEl = root.querySelector<HTMLElement>('#results')!
   // Latest results, so Enter can jump straight to the top match.
-  let searchMatches: GraphNode[] = []
+  let searchMatches: SearchHit[] = []
   const pickSearch = (id: string): void => {
     navigate(id, true)
     resultsEl.classList.add('hidden')
@@ -1614,18 +1735,21 @@ export function renderApp(
     searchMatches = []
   }
   searchEl.addEventListener('input', () => {
-    searchMatches = view.search(searchEl.value).slice(0, 12)
+    searchMatches = view.searchDetailed(searchEl.value).slice(0, 12)
     if (!searchMatches.length) {
       resultsEl.classList.add('hidden')
       return
     }
     resultsEl.innerHTML = searchMatches
       .map(
-        (m: GraphNode) => `
+        ({ node: m, via }) => `
         <button data-id="${esc(m.id)}" class="w-full text-left flex items-center gap-2 px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm">
-          <span class="w-2.5 h-2.5 rounded-full" style="background:${NODE_KIND_META[m.kind].color}"></span>
-          <span class="flex-1 truncate">${esc(m.label)}</span>
-          ${m.number ? `<span class="text-xs text-slate-400 font-mono">${esc(m.number)}</span>` : ''}
+          <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${NODE_KIND_META[m.kind].color}"></span>
+          <span class="flex-1 min-w-0">
+            <span class="block truncate">${esc(m.label)}</span>
+            ${via ? `<span class="block truncate text-[10px] text-slate-400">${esc(via)}</span>` : ''}
+          </span>
+          ${m.number ? `<span class="text-xs text-slate-400 font-mono shrink-0">${esc(m.number)}</span>` : ''}
         </button>`
       )
       .join('')
@@ -1638,7 +1762,7 @@ export function renderApp(
   searchEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && searchMatches.length) {
       e.preventDefault()
-      pickSearch(searchMatches[0].id)
+      pickSearch(searchMatches[0].node.id)
     }
   })
   searchEl.addEventListener('blur', () => setTimeout(() => resultsEl.classList.add('hidden'), 150))

@@ -11,8 +11,17 @@ export type UndoEntry =
    *  graph, no focus) view. */
   | { type: 'nav'; from: string | null; to: string | null }
   /** Nodes and/or edges being hidden or restored. `hidden: true` means the action
-   *  hid them, so undoing restores them (and vice versa for "show all"). */
-  | { type: 'hide'; nodeIds: string[]; edgeIds: string[]; edgeKinds: string[]; hidden: boolean }
+   *  hid them, so undoing restores them (and vice versa for "show all").
+   *  `edgeKinds` is whole link types; `routeGroups` is the finer per-route
+   *  granularity (e.g. only out-of-hours destinations). */
+  | {
+      type: 'hide'
+      nodeIds: string[]
+      edgeIds: string[]
+      edgeKinds: string[]
+      routeGroups?: string[]
+      hidden: boolean
+    }
 
 export class UndoManager {
   private undoStack: UndoEntry[] = []

@@ -4,7 +4,7 @@
 import cytoscape from 'cytoscape'
 import type { Core, ElementDefinition } from 'cytoscape'
 import { NODE_KIND_META, type GraphNode } from '../graph/model'
-import type { ThemeName } from '../graph/view'
+import { pressFeedbackStyle, type ThemeName } from '../graph/view'
 
 export class Minimap {
   private mini: Core
@@ -215,5 +215,9 @@ function miniStyle(theme: ThemeName): cytoscape.StylesheetJson {
   for (const [kind, meta] of Object.entries(NODE_KIND_META)) {
     style.push({ selector: `node.${kind}`, style: { 'background-color': meta.color } })
   }
+  // The map is click-and-drag to recentre, so the press feedback fires on every
+  // use. At this scale Cytoscape's default 30px blob covers a good part of the
+  // map — smallest setting of the three views.
+  style.push(...pressFeedbackStyle(0.4))
   return style
 }
