@@ -9,6 +9,7 @@
 
 import { canonicalCountry, matchTariff, tariffCountryTypes, type LineType } from '../report/tariff'
 import { parseInternational } from '../../../shared/phone'
+import { playExit } from './motion'
 
 export interface ZoneEntry {
   country: string // canonical uppercase country
@@ -33,12 +34,15 @@ const esc = (s: unknown): string =>
 
 function flash(message: string, isError = false): void {
   const el = document.createElement('div')
-  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[130] px-3 py-1.5 rounded-md text-sm shadow-lg ${
+  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[130] px-3 py-1.5 rounded-md text-sm shadow-lg esp-toast-in ${
     isError ? 'bg-red-600 text-white' : 'bg-slate-800 text-slate-100 dark:bg-slate-700'
   }`
   el.textContent = message
   document.body.appendChild(el)
-  setTimeout(() => el.remove(), 2800)
+  setTimeout(() => {
+    el.classList.remove('esp-toast-in')
+    playExit(el, 'esp-toast-out', () => el.remove())
+  }, 2800)
 }
 
 // --- Line-type normalisation -------------------------------------------------
@@ -48,10 +52,6 @@ function normalizeType(raw: string): LineType {
   if (/mobile/.test(t)) return 'Mobile'
   if (/landline|fixed/.test(t)) return 'Landline'
   return 'Other'
-}
-
-export function lineTypeLabel(t: LineType): string {
-  return t
 }
 
 // --- Default seed (operator-supplied zone list) ------------------------------
@@ -551,6 +551,15 @@ function normalizeConfig(c: ZoneConfig): ZoneConfig {
   }
 }
 
+let zoneRevision = 0
+
+/** Bumped every time the zone configuration is edited. Anything that caches a
+ *  result derived from zones (the report's call classification) keys off this so
+ *  an edit can't leave stale zones on screen. */
+export function getZoneRevision(): number {
+  return zoneRevision
+}
+
 function saveZoneConfig(c: ZoneConfig): void {
   try {
     localStorage.setItem(ZONE_KEY, JSON.stringify(c))
@@ -558,6 +567,7 @@ function saveZoneConfig(c: ZoneConfig): void {
     /* storage unavailable — non-fatal */
   }
   lookupCache = null // invalidate the derived lookup
+  zoneRevision++
 }
 
 // --- Call → zone lookup ------------------------------------------------------
@@ -703,7 +713,7 @@ export function showZoneSettings(): void {
           <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
         </div>
       </div>
-      <div id="zBody" class="overflow-y-auto p-4 space-y-4"></div>
+      <div id="zBody" class="esp-scroll overflow-y-auto p-4 space-y-4"></div>
       <div class="shrink-0 flex items-center justify-between gap-2 px-4 py-3 border-t border-slate-200 dark:border-slate-700">
         <button id="zAddZone" class="${btn} bg-slate-500 hover:bg-slate-400">+ Add zone</button>
         <div class="flex gap-2">
@@ -715,9 +725,6 @@ export function showZoneSettings(): void {
     </div>`
   document.body.appendChild(overlay)
   const close = (): void => overlay.remove()
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close()
-  })
   overlay
     .querySelectorAll<HTMLElement>('[data-close]')
     .forEach((b) => b.addEventListener('click', close))

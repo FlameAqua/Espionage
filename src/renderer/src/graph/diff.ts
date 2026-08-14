@@ -31,7 +31,7 @@ export interface EdgeChange {
   details: string[]
 }
 
-export interface TopologyDiff {
+interface TopologyDiff {
   nodes: NodeChange[]
   edges: EdgeChange[]
   counts: { added: number; removed: number; changed: number }
@@ -122,7 +122,7 @@ export function diffTopologies(before: TopologyGraph, after: TopologyGraph): Top
     }
     const bl = labelsOf(b)
     const al = labelsOf(a)
-    if (bl !== al) edges.push(edgeEntry(a, 'changed', [`${bl || '—'} → ${al || '—'}`]))
+    if (bl !== al) edges.push(edgeEntry(a, 'changed', [`${bl || '-'} → ${al || '-'}`]))
   }
   for (const [id, b] of beforeEdges) {
     if (afterEdges.has(id)) continue

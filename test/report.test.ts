@@ -1,10 +1,17 @@
 import { describe, it, expect } from 'vitest'
 import {
+  callDirection,
+  dedupeEntries,
+  filterEntriesByDirection,
+  filterEntriesByDn,
   normalizeCallEntry,
+  odataDateTime,
   rollupByExtension,
+  splitIntoWindows,
   parseDuration,
   isExtensionLike,
-  guessHomeCountry
+  guessHomeCountry,
+  trimToPeriod
 } from '../src/main/threecx/client'
 
 describe('parseDuration', () => {
@@ -143,6 +150,180 @@ describe('normalizeCallEntry', () => {
   })
 })
 
+// The two legs 3CX writes for one queued inbound call: trunk → queue, then
+// queue → agent. The second looks internal on its own, which is why every filter
+// below reasons about whole calls rather than individual legs.
+function queuedInboundCall(callId: string, start: string, agent = '0202'): ReturnType<typeof normalizeCallEntry>[] {
+  return [
+    normalizeCallEntry({
+      MainCallHistoryId: callId,
+      StartTime: start,
+      SourceDn: '10000',
+      SourceCallerId: '+353873962669',
+      DestinationDn: '8000',
+      Direction: 'Inbound',
+      Answered: true
+    }),
+    normalizeCallEntry({
+      MainCallHistoryId: callId,
+      // The handling leg always starts a moment after the call itself.
+      StartTime: new Date(Date.parse(start) + 12_000).toISOString(),
+      SourceDn: '8000',
+      DestinationDn: agent,
+      Answered: true
+    })
+  ]
+}
+
+describe('odataDateTime', () => {
+  // These values sit in the URL path of an OData function call. A 3CX build that
+  // can't parse them doesn't complain — it ignores the period and answers with
+  // its default window, which reads as "no calls in this period".
+  it('drops the milliseconds toISOString adds', () => {
+    expect(odataDateTime('2026-06-29T23:00:00.000Z')).toBe('2026-06-29T23:00:00Z')
+    expect(odataDateTime('2026-08-01T22:59:59.999Z')).toBe('2026-08-01T22:59:59Z')
+  })
+
+  it('leaves the value unencoded — it must not arrive as %3A', () => {
+    expect(odataDateTime('2026-07-01T00:00:00.000Z')).not.toContain('%')
+    expect(odataDateTime('2026-07-01T00:00:00.000Z')).toContain(':')
+  })
+})
+
+describe('splitIntoWindows', () => {
+  // Deep $skip is what made long reports crawl, so the period is read in
+  // day-sized windows instead of one long paged run.
+  it('covers the whole period in abutting, non-overlapping windows', () => {
+    const windows = splitIntoWindows('2026-07-01T00:00:00Z', '2026-07-04T23:59:59.999Z')
+    expect(windows).toHaveLength(4)
+    expect(windows[0].from).toBe('2026-07-01T00:00:00.000Z')
+    expect(windows[3].to).toBe('2026-07-04T23:59:59.999Z')
+    for (let i = 1; i < windows.length; i++) {
+      // Each window starts 1ms after the previous ended — no gap, no overlap.
+      expect(Date.parse(windows[i].from) - Date.parse(windows[i - 1].to)).toBe(1)
+    }
+  })
+
+  it('handles a period shorter than one window', () => {
+    const windows = splitIntoWindows('2026-07-01T09:00:00Z', '2026-07-01T17:00:00Z')
+    expect(windows).toHaveLength(1)
+  })
+
+  it('falls back to a single window on an unparseable or inverted period', () => {
+    expect(splitIntoWindows('nonsense', 'also nonsense')).toHaveLength(1)
+    expect(splitIntoWindows('2026-07-31T00:00:00Z', '2026-07-01T00:00:00Z')).toHaveLength(1)
+  })
+})
+
+describe('dedupeEntries', () => {
+  it('drops a boundary row returned by two adjacent windows', () => {
+    const row = {
+      MainCallHistoryId: 'c1',
+      StartTime: '2026-07-01T23:59:59.900Z',
+      SourceDn: '10000',
+      DestinationDn: '0202',
+      Direction: 'Inbound',
+      TalkingDuration: 'PT10S'
+    }
+    const entries = [normalizeCallEntry(row), normalizeCallEntry(row)]
+    expect(dedupeEntries(entries)).toHaveLength(1)
+  })
+
+  it('keeps the separate legs of one call', () => {
+    const legs = queuedInboundCall('c2', '2026-07-02T09:00:00.000Z')
+    expect(dedupeEntries(legs)).toHaveLength(2)
+  })
+
+  it('keeps rows it cannot safely compare', () => {
+    const undated = [normalizeCallEntry({ From: '2001', To: '8000' }), normalizeCallEntry({ From: '2001', To: '8000' })]
+    expect(dedupeEntries(undated)).toHaveLength(2)
+  })
+})
+
+describe('trimToPeriod', () => {
+  const from = '2026-07-01T00:00:00.000Z'
+  const to = '2026-07-31T23:59:59.999Z'
+
+  it('includes calls on the first and last day, right to the boundary', () => {
+    const entries = [
+      ...queuedInboundCall('a', '2026-07-01T00:00:00.000Z'),
+      ...queuedInboundCall('b', '2026-07-31T23:59:59.000Z')
+    ]
+    expect(trimToPeriod(entries, from, to)).toHaveLength(4)
+  })
+
+  it('drops calls just outside either end', () => {
+    const entries = [
+      ...queuedInboundCall('early', '2026-06-30T23:59:59.000Z'),
+      ...queuedInboundCall('inside', '2026-07-15T10:00:00.000Z'),
+      ...queuedInboundCall('late', '2026-08-01T00:00:00.500Z')
+    ]
+    const kept = trimToPeriod(entries, from, to)
+    expect(new Set(kept.map((e) => e.callId))).toEqual(new Set(['inside']))
+  })
+
+  it('keeps every leg of a call that started inside, even one straddling midnight', () => {
+    const entries = queuedInboundCall('straddle', '2026-07-31T23:59:55.000Z')
+    // Second leg lands on 1 August — the call is still July's.
+    expect(Date.parse(entries[1].startTime!)).toBeGreaterThan(Date.parse(to))
+    expect(trimToPeriod(entries, from, to)).toHaveLength(2)
+  })
+
+  it('keeps undated rows rather than guessing', () => {
+    const entries = [normalizeCallEntry({ From: '2001', To: '8000' })]
+    expect(trimToPeriod(entries, from, to)).toHaveLength(1)
+  })
+})
+
+describe('filterEntriesByDn', () => {
+  const entries = [
+    ...queuedInboundCall('q1', '2026-07-02T09:00:00.000Z', '0202'),
+    ...queuedInboundCall('q2', '2026-07-02T10:00:00.000Z', '0303')
+  ]
+
+  it('keeps a whole call when any of its legs touched the chosen DN', () => {
+    // 0202 only appears on the second leg — the leg carrying the caller's number
+    // must come with it, or the report loses who called.
+    const kept = filterEntriesByDn(entries, ['0202'])
+    expect(kept).toHaveLength(2)
+    expect(kept.every((e) => e.callId === 'q1')).toBe(true)
+    expect(kept.some((e) => e.external === '+353873962669')).toBe(true)
+  })
+
+  it('matches a queue DN, which both calls share', () => {
+    expect(filterEntriesByDn(entries, ['8000'])).toHaveLength(4)
+  })
+
+  it('drops everything when nothing matches, and filters nothing on an empty list', () => {
+    expect(filterEntriesByDn(entries, ['9999'])).toHaveLength(0)
+    expect(filterEntriesByDn(entries, [])).toHaveLength(4)
+  })
+})
+
+describe('filterEntriesByDirection', () => {
+  const inbound = queuedInboundCall('in', '2026-07-02T09:00:00.000Z')
+  const internal = [
+    normalizeCallEntry({ MainCallHistoryId: 'int', SourceDn: '0202', DestinationDn: '0303' })
+  ]
+
+  it('reads a queued call as inbound despite its internal-looking second leg', () => {
+    expect(inbound[1].directionNorm).toBe('internal')
+    expect(callDirection(inbound)).toBe('inbound')
+  })
+
+  it('keeps whole inbound calls and drops the internal one', () => {
+    const kept = filterEntriesByDirection([...inbound, ...internal], ['inbound'])
+    expect(kept).toHaveLength(2)
+    expect(kept.every((e) => e.callId === 'in')).toBe(true)
+  })
+
+  it('filters nothing when every direction is chosen', () => {
+    const all = [...inbound, ...internal]
+    expect(filterEntriesByDirection(all, ['inbound', 'outbound', 'internal'])).toHaveLength(3)
+    expect(filterEntriesByDirection(all, [])).toHaveLength(3)
+  })
+})
+
 describe('rollupByExtension', () => {
   it('counts received / answered / missed / placed per extension', () => {
     const entries = [
@@ -160,5 +341,58 @@ describe('rollupByExtension', () => {
     expect(ext.active).toBe(true)
     // External numbers are not extensions, so they don't get their own rollup row.
     expect(roll.some((a) => a.extension === '5551234')).toBe(false)
+  })
+})
+
+describe('normalizeCallEntry — answered vs merely rung', () => {
+  it('does not read a ring as talk time, nor as an answer', () => {
+    // RingingDuration used to sit in the talk-duration fallback, so a leg that
+    // only rang reported the ring as its duration — and the last-resort answered
+    // test is "did it have any duration".
+    const e = normalizeCallEntry({
+      SourceDn: '10000',
+      DestinationDn: '0202',
+      Direction: 'Inbound',
+      RingingDuration: 'PT14S',
+      Status: 'Routing'
+    })
+    expect(e.durationSec).toBeUndefined()
+    expect(e.answered).toBe(false)
+  })
+
+  it('flags a leg that voicemail picked up', () => {
+    const e = normalizeCallEntry({
+      SourceDn: '10000',
+      DestinationDn: '1017',
+      Direction: 'Inbound',
+      Callee: 'Voicemail Box (1017)',
+      TalkingDuration: 'PT30S',
+      Answered: true
+    })
+    expect(e.toVoicemail).toBe(true)
+    expect(e.answered).toBe(true)
+  })
+
+  it('reads the reason when the destination name says nothing', () => {
+    const e = normalizeCallEntry({
+      SourceDn: '2056',
+      DestinationDn: '1017',
+      Reason: 'No answer, call forwarded to Voicemail Box (1017)'
+    })
+    expect(e.toVoicemail).toBe(true)
+  })
+
+  it('leaves an ordinary answered call alone', () => {
+    const e = normalizeCallEntry({
+      SourceDn: '10000',
+      DestinationDn: '0202',
+      Direction: 'Inbound',
+      TalkingDuration: 'PT1M',
+      RingingDuration: 'PT5S',
+      Status: 'Answered'
+    })
+    expect(e.toVoicemail).toBeUndefined()
+    expect(e.durationSec).toBe(60)
+    expect(e.answered).toBe(true)
   })
 })

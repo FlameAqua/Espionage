@@ -27,7 +27,7 @@ export interface PaletteTarget {
   colour: string
 }
 
-export interface PaletteOptions {
+interface PaletteOptions {
   commands: PaletteCommand[]
   /** Resolve node matches for the current query (empty query = no results). */
   findNodes: (query: string) => PaletteTarget[]

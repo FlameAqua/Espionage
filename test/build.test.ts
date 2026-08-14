@@ -204,3 +204,37 @@ describe('buildTopology — DID names', () => {
     expect(terms.map((t) => t.value)).toContain('35318899104')
   })
 })
+
+// Working back from a call log you often have only the number the call presented,
+// not the extension that made it.
+describe('buildTopology — extension contact details', () => {
+  const g = buildTopology({
+    ...topo,
+    users: {
+      path: '',
+      value: [
+        {
+          Number: '2001',
+          FirstName: 'Alice',
+          Id: '1',
+          Email: 'alice@example.com',
+          OutboundCallerID: '35318899101'
+        }
+      ]
+    }
+  })
+  const terms = g.nodes.find((n) => n.id === 'user:2001')?.searchTerms ?? []
+
+  it('makes an extension findable by its outbound caller ID', () => {
+    expect(terms).toContainEqual({ label: 'Outbound caller ID', value: '35318899101' })
+  })
+
+  it('keeps the other contact details searchable', () => {
+    expect(terms).toContainEqual({ label: 'Email', value: 'alice@example.com' })
+  })
+
+  it('adds nothing when the fields are absent', () => {
+    const bare = buildTopology(topo).nodes.find((n) => n.id === 'user:2001')
+    expect(bare?.searchTerms ?? []).toHaveLength(0)
+  })
+})

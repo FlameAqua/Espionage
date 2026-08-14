@@ -17,6 +17,7 @@ import {
   departmentLabel,
   presenceOf,
   routeGroupOf,
+  SHARED_DEPARTMENT,
   type GraphEdge,
   type GraphNode,
   type TopologyGraph
@@ -33,6 +34,8 @@ import {
   themePalette,
   type ThemeName
 } from '../graph/view'
+import { applyEdgeRoutes } from '../graph/routing'
+import { readEdgeRouting } from './prefs'
 
 const DEPTH_KEY = '3cx-spy.egoDepth'
 const LAYOUT_KEY = '3cx-spy.egoLayout'
@@ -72,6 +75,8 @@ export class EgoMap {
   private layout: EgoLayout
   private theme: ThemeName
   private edgeOptions: EgoMapEdgeOptions
+  /** Link routing, mirroring the main canvas so the two read the same way. */
+  private edgeRouting = readEdgeRouting()
 
   constructor(
     container: HTMLElement,
@@ -234,6 +239,12 @@ export class EgoMap {
 
   /** Follow a live change to the link settings (Settings applies immediately, and
    *  the mini-map is already on screen when it does). */
+  setEdgeRouting(on: boolean): void {
+    if (this.destroyed || this.edgeRouting === on) return
+    this.edgeRouting = on
+    applyEdgeRoutes(this.cy, on, { radius: 7 })
+  }
+
   setEdgeOptions(o: EgoMapEdgeOptions): void {
     if (this.destroyed) return
     this.edgeOptions = o
@@ -248,11 +259,15 @@ export class EgoMap {
     const bar = document.createElement('div')
     bar.className =
       'absolute top-1 right-1 z-20 flex items-center gap-0.5 opacity-30 hover:opacity-100 focus-within:opacity-100 transition-opacity'
+    // One skin for every control in the bar. The arrangement picker is a
+    // <select>, which the browser draws taller than a button unless its native
+    // appearance is dropped and its padding matched exactly.
+    const control =
+      'h-5 px-1.5 rounded text-[10px] leading-none bg-white/90 dark:bg-slate-700/90 border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-200 shadow-sm'
     const mk = (label: string, title: string, fn: () => void): HTMLButtonElement => {
       const b = document.createElement('button')
       b.type = 'button'
-      b.className =
-        'px-1.5 py-0.5 rounded text-[10px] leading-none bg-white/90 dark:bg-slate-700/90 border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-600 shadow-sm'
+      b.className = `${control} hover:bg-slate-100 dark:hover:bg-slate-600`
       b.textContent = label
       b.title = title
       // The map sits inside a scrollable panel; stop clicks reaching Cytoscape.
@@ -273,21 +288,26 @@ export class EgoMap {
       depthBtn.textContent = this.depth === 1 ? '1 hop' : '2 hops'
       depthBtn.title =
         this.depth === 1
-          ? 'Showing direct neighbours — click for two hops'
-          : 'Showing two hops out — click for direct neighbours only'
+          ? 'Showing direct neighbours - click for two hops'
+          : 'Showing two hops out - click for direct neighbours only'
     }
     syncDepth()
 
-    // Same three modes as the main View Mode. A select rather than a cycling
-    // button: three states is one too many to cycle blind in a corner.
+    // The same modes as the main View Mode, in the same order. A select rather
+    // than a cycling button: three states is one too many to cycle blind in a
+    // corner. Department is offered only when the graph has any.
+    const hasDepartments = this.graph.nodes.some(
+      (n) => n.deptGroup && n.deptGroup !== SHARED_DEPARTMENT
+    )
     const modes: Array<[EgoLayout, string]> = [
       ['flow', 'Flow'],
-      ['compact', 'Compact'],
-      ['department', 'Dept']
+      ...((hasDepartments ? [['department', 'Dept']] : []) as Array<[EgoLayout, string]>),
+      ['compact', 'Compact']
     ]
+    // A remembered Department layout is meaningless on a system without any.
+    if (!hasDepartments && this.layout === 'department') this.layout = 'flow'
     const sel = document.createElement('select')
-    sel.className =
-      'px-1 py-0.5 rounded text-[10px] leading-none bg-white/90 dark:bg-slate-700/90 border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-200 shadow-sm'
+    sel.className = `${control} appearance-none cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-600`
     sel.title = 'How the mini-map is arranged'
     sel.innerHTML = modes
       .map(
@@ -394,6 +414,9 @@ export class EgoMap {
         // Fall through to fit — the nodes still render, just un-arranged.
       }
     }
+    // Same rule as the main canvas, on the same code. A smaller corner radius:
+    // the elbows here are a third of the size.
+    applyEdgeRoutes(this.cy, this.edgeRouting, { radius: 7 })
     this.fit()
   }
 

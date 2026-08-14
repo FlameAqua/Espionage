@@ -1,20 +1,18 @@
 // The connection screen: collects the 3CX URL + credentials and reports back.
 import type { ConnectRequest } from '../../../shared/types'
 import { logoSvg } from './logo'
-
-const LS_KEY = '3cx-spy.connection'
-
-interface SavedConn {
-  baseUrl: string
-  username: string
-}
+import { forgetSystem, loadSystems, rememberSystem } from './systems'
 
 export function renderLogin(
   root: HTMLElement,
   onConnect: (req: ConnectRequest) => Promise<string | null>,
-  onOpenSnapshot?: () => void
+  onOpenSnapshot?: () => void,
+  /** Pre-fill for "add another system" and for switching to one that isn't
+   *  connected — the password is never remembered, so it's asked for again. */
+  prefill?: { baseUrl?: string; username?: string }
 ): void {
-  const saved: Partial<SavedConn> = readSaved()
+  const known = loadSystems()
+  const saved = { baseUrl: prefill?.baseUrl ?? known[0]?.baseUrl, username: prefill?.username ?? known[0]?.username }
 
   root.innerHTML = `
     <div class="relative min-h-screen flex items-center justify-center overflow-hidden bg-slate-900 text-slate-100">
@@ -29,8 +27,14 @@ export function renderLogin(
         </div>
         <label class="block text-xs font-medium text-slate-300">3CX URL
           <input name="baseUrl" type="text" required placeholder="https://pbx.example.com"
-            value="${attr(saved.baseUrl ?? '')}"
+            list="knownSystems" autocomplete="off" value="${attr(saved.baseUrl ?? '')}"
             class="mt-1 w-full px-3 py-2 rounded-md bg-slate-900 border border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" />
+          <datalist id="knownSystems">
+            ${known.map((k) => `<option value="${attr(k.baseUrl)}">${attr(k.username)}</option>`).join('')}
+          </datalist>
+          <div id="forgetRow" class="hidden mt-1 text-right">
+            <button id="forget" type="button" class="text-[11px] text-slate-500 hover:text-red-400">Forget this system</button>
+          </div>
         </label>
         <label class="block text-xs font-medium text-slate-300">Username
           <input name="username" type="text" required placeholder="0000"
@@ -69,6 +73,26 @@ export function renderLogin(
   if (onOpenSnapshot) openSnap.addEventListener('click', onOpenSnapshot)
   else openSnap.classList.add('hidden')
 
+  const urlEl = form.querySelector<HTMLInputElement>('[name=baseUrl]')!
+  const userEl = form.querySelector<HTMLInputElement>('[name=username]')!
+  const forgetRow = root.querySelector<HTMLElement>('#forgetRow')!
+
+  /** Picking a remembered system fills in its username; the password is never
+   *  stored, so that is always typed. "Forget" appears only for one we know,
+   *  since the URL dropdown itself offers no way to remove an entry. */
+  const syncKnown = (): void => {
+    const hit = known.find((k) => k.baseUrl === urlEl.value.trim().replace(/\/+$/, ''))
+    forgetRow.classList.toggle('hidden', !hit)
+    if (hit && !userEl.value) userEl.value = hit.username
+  }
+  urlEl.addEventListener('change', syncKnown)
+  urlEl.addEventListener('input', syncKnown)
+  syncKnown()
+  root.querySelector('#forget')!.addEventListener('click', () => {
+    forgetSystem(urlEl.value.trim().replace(/\/+$/, ''))
+    renderLogin(root, onConnect, onOpenSnapshot, { baseUrl: '', username: '' })
+  })
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
     const data = new FormData(form)
@@ -90,25 +114,9 @@ export function renderLogin(
       submit.disabled = false
       submit.textContent = 'Connect'
     } else {
-      writeSaved({ baseUrl: req.baseUrl, username: req.username })
+      rememberSystem(req.baseUrl, req.username)
     }
   })
-}
-
-function readSaved(): Partial<SavedConn> {
-  try {
-    return JSON.parse(localStorage.getItem(LS_KEY) ?? '{}')
-  } catch {
-    return {}
-  }
-}
-
-function writeSaved(c: SavedConn): void {
-  try {
-    localStorage.setItem(LS_KEY, JSON.stringify(c))
-  } catch {
-    /* ignore */
-  }
 }
 
 function attr(s: string): string {

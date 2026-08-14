@@ -19,10 +19,20 @@ import {
   callingCodeForIso,
   classifyDirection,
   classifyScope,
+  isExtensionLike,
   parseInternational,
   pickParties
 } from '../../../shared/phone'
-import { getZoneLookup, zoneForNumber } from './zones'
+import { getZoneLookup, getZoneRevision, zoneForNumber } from './zones'
+import { hidePopover, playExit, showPopover } from './motion'
+import { ICONS } from './icons'
+import {
+  buildDirectory,
+  contextForReport,
+  isInfrastructureDn,
+  type DnKind,
+  type ReportContext
+} from './report-context'
 import {
   defaultReportCustomize,
   loadReportCustomize,
@@ -35,178 +45,103 @@ import {
   type SectionId
 } from './report-customize'
 
-const esc = (s: unknown): string =>
+export const esc = (s: unknown): string =>
   String(s ?? '').replace(
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!
   )
 
-const btn = 'px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm text-slate-100'
+export const btn = 'px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm text-slate-100'
 const HOME_KEY = 'espionage.homeCountry'
 
 /** Transient toast, matching the app's flash style. */
-function flash(message: string, isError = false): void {
+export function flash(message: string, isError = false): void {
   const el = document.createElement('div')
-  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[120] px-3 py-1.5 rounded-md text-sm shadow-lg ${
+  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[120] px-3 py-1.5 rounded-md text-sm shadow-lg esp-toast-in ${
     isError ? 'bg-red-600 text-white' : 'bg-slate-800 text-slate-100 dark:bg-slate-700'
   }`
   el.textContent = message
   document.body.appendChild(el)
-  setTimeout(() => el.remove(), 2800)
+  setTimeout(() => {
+    el.classList.remove('esp-toast-in')
+    playExit(el, 'esp-toast-out', () => el.remove())
+  }, 2800)
 }
 
 /** Mount an overlay modal on document.body and return {overlay, close}. */
-function openOverlay(
+export function openOverlay(
   inner: string,
-  width = 'w-[960px]'
+  width = 'w-[960px]',
+  opts: { onClose?: () => void } = {}
 ): { overlay: HTMLElement; close: () => void } {
   const overlay = document.createElement('div')
-  overlay.className = 'fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4'
+  overlay.className =
+    'fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4 esp-fade-in'
   overlay.innerHTML = `
-    <div class="${width} max-w-full max-h-[88vh] flex flex-col bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+    <div class="${width} max-w-full max-h-[88vh] flex flex-col bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden esp-card-in">
       ${inner}
     </div>`
   document.body.appendChild(overlay)
-  const close = (): void => overlay.remove()
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close()
-  })
+  const card = overlay.firstElementChild!
+  // The overlay stays in the DOM while it animates out, so `isConnected` alone
+  // would let a second close() re-trigger the exit.
+  let closing = false
+  const close = (): void => {
+    if (closing || !overlay.isConnected) return
+    closing = true
+    card.classList.remove('esp-card-in')
+    overlay.classList.remove('esp-fade-in')
+    overlay.classList.add('esp-fade-out')
+    playExit(card, 'esp-card-out', () => {
+      overlay.remove()
+      opts.onClose?.()
+    })
+  }
+  // No close-on-backdrop: a stray click outside a report or a half-filled form
+  // shouldn't discard it. The ✕ is the way out.
   return { overlay, close }
 }
 
-/** Period picker → generate a historical report, then show it. */
-export function showReportSetup(
-  nameFor: (ext: string) => string | undefined,
-  deptFor: (ext: string) => string | undefined
-): void {
-  const { overlay, close } = openOverlay(
-    `
-    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
-      <h2 class="font-semibold text-slate-800 dark:text-slate-100">Generate report</h2>
-      <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
-    </div>
-    <div class="p-4 space-y-4 text-sm">
-      <div>
-        <label class="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Period</label>
-        <div class="flex flex-wrap gap-1.5" id="periodPresets">
-          <button data-days="7" class="${btn}">Last 7 days</button>
-          <button data-days="30" class="${btn} bg-sky-700 hover:bg-sky-600">Last 30 days</button>
-          <button data-days="90" class="${btn}">Last 90 days</button>
-        </div>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs text-slate-500 mb-1">From</label>
-          <input id="fromDate" type="date" class="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm" />
-        </div>
-        <div>
-          <label class="block text-xs text-slate-500 mb-1">To</label>
-          <input id="toDate" type="date" class="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-sm" />
-        </div>
-      </div>
-      <div>
-        <label class="block text-xs text-slate-500 mb-1">Home country
-          <span class="text-slate-400 normal-case">— baseline for national vs international</span>
-        </label>
-        ${countrySelect('setupHome', readHomeCountry(), true)}
-      </div>
-      <p class="text-xs text-slate-400">A call-log snapshot for this period is fetched from 3CX and saved to your reports folder.</p>
-      <div class="flex justify-end gap-2 pt-1">
-        <button data-close class="${btn} bg-slate-500 hover:bg-slate-400">Cancel</button>
-        <button id="genBtn" class="${btn} bg-emerald-600 hover:bg-emerald-500">Generate</button>
-      </div>
-    </div>`,
-    'w-[460px]'
-  )
-  overlay
-    .querySelectorAll<HTMLElement>('[data-close]')
-    .forEach((b) => b.addEventListener('click', close))
-
-  const fromEl = overlay.querySelector<HTMLInputElement>('#fromDate')!
-  const toEl = overlay.querySelector<HTMLInputElement>('#toDate')!
-  const iso = (d: Date): string => d.toISOString().slice(0, 10)
-  const today = iso(new Date())
-  // Keep the two pickers consistent: "To" can't precede "From", neither can be in
-  // the future. Enforced via the inputs' own min/max (so the browser blocks bad
-  // picks) and re-validated on Generate as a backstop.
-  const syncDateBounds = (): void => {
-    fromEl.max = toEl.value || today
-    toEl.min = fromEl.value || ''
-    toEl.max = today
-  }
-  const setRange = (days: number): void => {
-    const to = new Date()
-    const from = new Date()
-    from.setDate(from.getDate() - days)
-    fromEl.value = iso(from)
-    toEl.value = iso(to)
-    syncDateBounds()
-  }
-  setRange(30)
-  fromEl.addEventListener('change', syncDateBounds)
-  toEl.addEventListener('change', syncDateBounds)
-  overlay.querySelectorAll<HTMLElement>('#periodPresets [data-days]').forEach((b) => {
-    b.addEventListener('click', () => setRange(Number(b.dataset.days)))
-  })
-
-  // Remember the home-country choice so classification is meaningful next time.
-  const homeSel = overlay.querySelector<HTMLSelectElement>('#setupHome')!
-  homeSel.addEventListener('change', () => writeHomeCountry(homeSel.value))
-
-  overlay.querySelector('#genBtn')!.addEventListener('click', async () => {
-    const from = fromEl.value ? new Date(fromEl.value + 'T00:00:00Z').toISOString() : ''
-    const to = toEl.value ? new Date(toEl.value + 'T23:59:59Z').toISOString() : ''
-    if (!from || !to) {
-      flash('Pick a from and to date.', true)
-      return
-    }
-    if (fromEl.value > toEl.value) {
-      flash('“To” can’t be earlier than “From”.', true)
-      return
-    }
-    const genBtn = overlay.querySelector<HTMLButtonElement>('#genBtn')!
-    genBtn.disabled = true
-    genBtn.textContent = 'Generating…'
-    const res = await window.api.report.generate(from, to)
-    close()
-    if (res.error && !res.report) {
-      flash(res.error, true)
-      return
-    }
-    if (res.report) showReport(res.report, nameFor, deptFor)
-  })
-}
-
 /** Fetch + show a live active-calls report. */
-export async function showLiveReport(
-  nameFor: (ext: string) => string | undefined,
-  deptFor: (ext: string) => string | undefined
-): Promise<void> {
+export async function showLiveReport(ctx: ReportContext): Promise<void> {
   const res = await window.api.report.live()
   if (res.error && !res.report) {
     flash(res.error, true)
     return
   }
-  if (res.report) showReport(res.report, nameFor, deptFor)
+  if (res.report) {
+    // A live snapshot is generated in the moment, so stamp the connected
+    // system's directory onto it — saved and reopened later, possibly against
+    // another system, it still knows who its extensions were.
+    res.report.directory = buildDirectory(ctx)
+    showReport(res.report, ctx)
+  }
 }
 
 /** Open a previously-saved report from disk and show it. */
-export async function openReport(
-  nameFor: (ext: string) => string | undefined,
-  deptFor: (ext: string) => string | undefined
-): Promise<void> {
+export async function openReport(ctx: ReportContext): Promise<void> {
   const res = await window.api.report.open()
   if (res.canceled) return
   if (res.error || !res.report) {
     flash(res.error ?? 'Could not open report.', true)
     return
   }
-  showReport(res.report, nameFor, deptFor)
+  showReport(res.report, ctx)
+}
+
+/** Load a saved report by path (the reports tray) and show it. */
+export async function openReportPath(path: string, ctx: ReportContext): Promise<void> {
+  const res = await window.api.report.load(path)
+  if (res.error || !res.report) {
+    flash(res.error ?? 'Could not open report.', true)
+    return
+  }
+  showReport(res.report, ctx)
 }
 
 // --- Classification ---------------------------------------------------------
 
-interface ClassifiedCall {
+export interface ClassifiedCall {
   callId?: string
   ts?: string
   day?: string
@@ -226,8 +161,23 @@ interface ClassifiedCall {
   /** Tariff destination this call matched, e.g. "IRELAND · Mobile". Shown as each
    *  zone's makeup so a zone total can be traced back to its destinations. */
   destLabel?: string
-  /** Department the attributed extension belongs to (for multi-tenant grouping). */
+  /** Department the attributed extension is grouped under (for the rollup). */
   dept?: string
+  /** Every department it belongs to — the department filter matches any of them,
+   *  since an extension can serve more than one. */
+  depts?: string[]
+  /** Logged as internal but dialled to something not on the system — a misdial,
+   *  not a call to a colleague. */
+  misdial?: boolean
+  /** What `extension` actually is — a person, or a queue / ring group / IVR /
+   *  trunk the call merely passed through. */
+  dnKind?: DnKind
+  /** The DNs on each end of the leg. Neither is always `extension`: an internal
+   *  call is attributed to its caller, so only `dstDn` says who it rang. */
+  srcDn?: string
+  dstDn?: string
+  /** This leg was picked up by voicemail, not by the person it rang. */
+  toVoicemail?: boolean
 }
 
 interface Home {
@@ -241,13 +191,28 @@ function resolveHome(iso2: string): Home {
   return { iso2, code: c?.code ?? '', name: c?.country ?? '' }
 }
 
+/** Is this DN absent from the system the report describes?
+ *
+ *  The topology directory is the authority when we have one: a DN it doesn't
+ *  list isn't on the system, however much it looks like an extension. That
+ *  matters because `isExtensionLike` accepts any 2–6 digit string, so half-dialled
+ *  numbers — "20", "01", "101", "01404" — sail straight through it and earn a row
+ *  each. Without a directory (a report saved before Beta 9, opened on a system
+ *  that doesn't know these numbers) fall back to the shape test rather than
+ *  discarding everything. */
+export function isOffSystemDn(ctx: ReportContext, dn: string | undefined): boolean {
+  if (!dn) return false
+  if (ctx.kindFor(dn) !== undefined) return false
+  return ctx.targets.length > 0 ? true : !isExtensionLike(dn)
+}
+
 /** Re-derive every call from the raw entries under the chosen home country. Done
  *  in the renderer (not read from the file) so the dropdowns can reclassify live
  *  and older saved reports without the enrichment fields still work. */
-function classify(
+export function classify(
   report: CallReport,
   home: Home,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): ClassifiedCall[] {
   const zoneLookup = getZoneLookup()
   return report.entries.map((e) => {
@@ -284,16 +249,44 @@ function classify(
       rate: zr?.rate,
       destLabel:
         zr && zr.country ? `${cap(zr.country.toLowerCase())} · ${zr.lineType}` : undefined,
-      dept: extension ? deptFor(extension) : undefined
+      dept: extension ? ctx.deptFor(extension) : undefined,
+      depts: extension ? ctx.deptsFor(extension) : undefined,
+      // A dial that never reached a trunk is logged as "internal" whatever was
+      // dialled, so a mistyped or half-dialled number arrives looking like a call
+      // to a colleague. 3CX leaves these out; so does every section here, or the
+      // internal figures disagree with the per-extension table.
+      //
+      // "Not on the system" alone isn't enough to discard, though: park, paging
+      // and other service DNs are missing from the topology too, and they really
+      // do answer calls and hold real talk time. A misdial is one that was NEVER
+      // answered — nothing was there to answer it.
+      misdial: direction === 'internal' && !e.answered && isOffSystemDn(ctx, e.dstDn),
+      dnKind: extension ? ctx.kindFor(extension) : undefined,
+      srcDn: e.srcDn,
+      dstDn: e.dstDn,
+      toVoicemail: e.toVoicemail
     }
   })
 }
 
+/** How good a candidate a leg is for representing its whole call. 3CX stamps the
+ *  queue leg and the agent leg with the same time, so ranking by timestamp alone
+ *  credited the queue about half the time — and recorded its hold music as the
+ *  talk time. Answering at a real extension is what makes a leg the handling one. */
+function legRank(c: ClassifiedCall): number {
+  if (!c.extension) return 0
+  const person = !isInfrastructureDn(c.dnKind)
+  if (person && c.answered) return 4
+  if (person) return 3
+  if (c.answered) return 2
+  return 1
+}
+
 /** Collapse the routing legs of each call (queue → IVR → extension) into one
- *  logical call: the terminating leg (latest, reaching an extension) represents
- *  it, the call counts as answered if any leg was, and talk time is the handling
- *  leg's. Legs without a call id (older reports, other endpoints) pass through. */
-function collapseToCalls(calls: ClassifiedCall[]): ClassifiedCall[] {
+ *  logical call: the handling leg represents it (see legRank), the call counts as
+ *  answered if any leg was, and talk time is the handling leg's. Legs without a
+ *  call id (older reports, other endpoints) pass through. */
+export function collapseToCalls(calls: ClassifiedCall[]): ClassifiedCall[] {
   const groups = new Map<string, ClassifiedCall[]>()
   const out: ClassifiedCall[] = []
   for (const c of calls) {
@@ -310,9 +303,14 @@ function collapseToCalls(calls: ClassifiedCall[]): ClassifiedCall[] {
       out.push(legs[0])
       continue
     }
-    const withExt = legs.filter((l) => l.extension)
-    const pool = withExt.length ? withExt : legs
-    const rep = pool.reduce((a, b) => ((a.ts ?? '') >= (b.ts ?? '') ? a : b))
+    const rep = legs.reduce((a, b) => {
+      const ra = legRank(a)
+      const rb = legRank(b)
+      if (ra !== rb) return ra > rb ? a : b
+      // Same calibre of leg: the later one is the one further down the routing
+      // path, so it's still the better representative.
+      return (a.ts ?? '') >= (b.ts ?? '') ? a : b
+    })
     out.push({ ...rep, answered: legs.some((l) => l.answered) })
   }
   return out
@@ -323,7 +321,10 @@ function collapseToCalls(calls: ClassifiedCall[]): ClassifiedCall[] {
 interface ViewState {
   home: string // ISO2, '' = not set
   detail: 'call' | 'leg' // composite call vs per routing-leg
-  direction: CallDirection | 'all'
+  /** 'external' is every call that left or entered the system — inbound and
+   *  outbound together — which is how 3CX's own reports slice it and the
+   *  question people actually ask ("how much real phone traffic?"). */
+  direction: CallDirection | 'all' | 'external'
   scope: CallScope | 'all'
   country: string // 'all' or a country label
   department: string // 'all' or a department name
@@ -331,34 +332,85 @@ interface ViewState {
   search: string
 }
 
+/** Classification is pure and depends only on the report + home country, but it
+ *  walks every call-log row — on a month of a busy system that's hundreds of
+ *  thousands of rows, and it used to run three or four times per re-render (body,
+ *  country options, department options, search). Cached per report + home so a
+ *  filter change is instant. */
+const classifyCache = new WeakMap<CallReport, Map<string, ClassifiedCall[]>>()
+
+function classifyCached(
+  report: CallReport,
+  home: Home,
+  detail: ViewState['detail'],
+  ctx: ReportContext
+): ClassifiedCall[] {
+  let byKey = classifyCache.get(report)
+  if (!byKey) {
+    byKey = new Map()
+    classifyCache.set(report, byKey)
+  }
+  // The zone revision is part of the key: editing call zones changes what
+  // classification produces, and a cached answer would otherwise outlive the edit.
+  const stem = `${home.iso2}|${getZoneRevision()}`
+  const key = `${stem}|${detail}`
+  const hit = byKey.get(key)
+  if (hit) return hit
+  const all = byKey.get(`${stem}|leg`) ?? classify(report, home, ctx)
+  byKey.set(`${stem}|leg`, all)
+  const out = detail === 'call' ? collapseToCalls(all) : all
+  byKey.set(key, out)
+  return out
+}
+
 /** The classified calls at the chosen granularity (composite vs per-leg). */
 function callsFor(
   report: CallReport,
   state: ViewState,
   home: Home,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): ClassifiedCall[] {
-  const all = classify(report, home, deptFor)
-  return state.detail === 'call' ? collapseToCalls(all) : all
+  return classifyCached(report, home, state.detail, ctx)
 }
 
 /** Render a report into an interactive modal. */
-export function showReport(
-  report: CallReport,
-  nameFor: (ext: string) => string | undefined,
-  deptFor: (ext: string) => string | undefined
-): void {
-  const title = report.live
-    ? 'Live report — active calls'
-    : `Report — ${fmtDate(report.from)} → ${fmtDate(report.to)}`
+export function showReport(report: CallReport, liveCtx: ReportContext): void {
+  // A report names its extensions from the snapshot it recorded, not from
+  // whichever system is currently open.
+  const ctx = contextForReport(report, liveCtx)
+  const title = report.name
+    ? report.name
+    : report.live
+      ? 'Live report - active calls'
+      : `Report - ${fmtDate(report.from)} → ${fmtDate(report.to)}`
+  // The period and any scope belong under the title: a named report otherwise
+  // says nothing about what it actually covers.
+  const subtitle = [
+    `Generated ${fmtDateTime(report.generatedAt)}`,
+    report.live ? 'active calls' : `${fmtDate(report.from)} → ${fmtDate(report.to)} (inclusive)`,
+    report.scope?.label,
+    report.baseUrl ? report.baseUrl.replace(/^https?:\/\//, '') : ''
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
+  // The filters open on whatever the report was generated for, rather than
+  // making the user re-pick the department and directions they already chose.
+  const scopedDirections = report.scope?.directions ?? []
   const state: ViewState = {
     home: report.homeCountry || readHomeCountry(),
     detail: report.live ? 'leg' : 'call',
-    direction: 'all',
+    direction:
+      scopedDirections.length === 1
+        ? scopedDirections[0]
+        : scopedDirections.length === 2 &&
+            scopedDirections.includes('inbound') &&
+            scopedDirections.includes('outbound')
+          ? 'external'
+          : 'all',
     scope: 'all',
     country: 'all',
-    department: 'all',
+    department: report.scope?.departments?.length === 1 ? report.scope.departments[0] : 'all',
     status: 'all',
     search: ''
   }
@@ -368,7 +420,7 @@ export function showReport(
     <div class="flex items-center justify-between gap-2 px-4 py-3 border-b border-slate-200 dark:border-slate-700 shrink-0">
       <div class="min-w-0">
         <h2 class="font-semibold text-slate-800 dark:text-slate-100 truncate">${esc(title)}</h2>
-        <p class="text-[11px] text-slate-400">Generated ${esc(fmtDateTime(report.generatedAt))}${report.baseUrl ? ` · ${esc(report.baseUrl.replace(/^https?:\/\//, ''))}` : ''}</p>
+        <p class="text-[11px] text-slate-400 truncate" title="${esc(subtitle)}">${esc(subtitle)}</p>
       </div>
       <div class="flex items-center gap-2 shrink-0">
         <div class="relative">
@@ -379,13 +431,13 @@ export function showReport(
             <button data-export="pdf" class="block w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700">Report → PDF</button>
           </div>
         </div>
-        <button id="customizeBtn" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs">Customise ⚙</button>
+        <button id="customizeBtn" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs">${ICONS.gear}<span class="ml-1">Customise</span></button>
         <button id="saveReport" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs">Save</button>
         <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
       </div>
     </div>
-    <div id="controlsBar">${controlsBar(report, state, deptFor)}</div>
-    <div id="reportBody" class="overflow-y-auto p-4 space-y-4"></div>`)
+    <div id="controlsBar">${controlsBar(report, state, ctx)}</div>
+    <div id="reportBody" class="esp-scroll overflow-y-auto p-4 space-y-4"></div>`)
 
   overlay
     .querySelectorAll<HTMLElement>('[data-close]')
@@ -401,14 +453,15 @@ export function showReport(
   const exportMenu = overlay.querySelector<HTMLElement>('#exportMenu')!
   exportBtn.addEventListener('click', (e) => {
     e.stopPropagation()
-    exportMenu.classList.toggle('hidden')
+    if (exportMenu.classList.contains('hidden')) showPopover(exportMenu)
+    else hidePopover(exportMenu)
   })
-  overlay.addEventListener('click', () => exportMenu.classList.add('hidden'))
+  overlay.addEventListener('click', () => hidePopover(exportMenu))
   exportMenu.addEventListener('click', (e) => e.stopPropagation())
   for (const item of exportMenu.querySelectorAll<HTMLButtonElement>('[data-export]')) {
     item.addEventListener('click', () => {
-      exportMenu.classList.add('hidden')
-      void runExport(item.dataset.export as ExportKind, report, state, nameFor, customize, deptFor)
+      hidePopover(exportMenu)
+      void runExport(item.dataset.export as ExportKind, report, state, customize, ctx)
     })
   }
 
@@ -418,13 +471,16 @@ export function showReport(
     const home = resolveHome(state.home)
     bodyEl.innerHTML = renderBody(
       report,
-      callsFor(report, state, home, deptFor),
+      callsFor(report, state, home, ctx),
+      // Per-leg data as well: unanswered rings and queue arrivals only exist at
+      // leg level, whichever granularity the rest of the report is showing.
+      classifyCached(report, home, 'leg', ctx),
       state,
       home,
-      nameFor,
-      customize
+      customize,
+      ctx
     )
-    wireSearch(bodyEl, report, state, nameFor, home, deptFor)
+    wireSearch(bodyEl, report, state, home, ctx)
   }
 
   overlay.querySelector('#customizeBtn')!.addEventListener('click', () => {
@@ -474,7 +530,7 @@ export function showReport(
         state.country = 'all'
       }
       rerender()
-      if (key === 'home' || key === 'detail') refreshFilterOptions(overlay, report, state, deptFor)
+      if (key === 'home' || key === 'detail') refreshFilterOptions(overlay, report, state, ctx)
     })
   }
 
@@ -486,7 +542,7 @@ export function showReport(
 function controlsBar(
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): string {
   return `
     <div class="shrink-0 flex flex-wrap items-end gap-x-3 gap-y-2 px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 text-xs">
@@ -502,6 +558,7 @@ function controlsBar(
         'Direction',
         select('ctlDir', 'direction', state.direction, [
           ['all', 'All'],
+          ['external', 'External (in + out)'],
           ['inbound', 'Inbound'],
           ['outbound', 'Outbound'],
           ['internal', 'Internal']
@@ -516,8 +573,8 @@ function controlsBar(
           ['internal', 'Internal']
         ])
       )}
-      ${field('Department', departmentFilterSelect(report, state, deptFor))}
-      ${field('Country', countryFilterSelect(report, state, deptFor))}
+      ${field('Department', departmentFilterSelect(report, state, ctx))}
+      ${field('Country', countryFilterSelect(report, state, ctx))}
       ${field(
         'Status',
         select('ctlStatus', 'status', state.status, [
@@ -556,7 +613,7 @@ function showCustomizePanel(
       </div>
       <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
     </div>
-    <div id="czBody" class="overflow-y-auto p-4 space-y-1.5"></div>
+    <div id="czBody" class="esp-scroll overflow-y-auto p-4 space-y-1.5"></div>
     <div class="shrink-0 flex items-center justify-between gap-3 px-4 py-3 border-t border-slate-200 dark:border-slate-700">
       <div class="flex flex-col gap-1.5">
         <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
@@ -648,7 +705,7 @@ function showCustomizePanel(
   render()
 }
 
-const selCls =
+export const selCls =
   'px-2 py-1 rounded bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-200'
 
 function select(
@@ -666,8 +723,8 @@ function select(
 }
 
 /** A full country picker (used for the home-country baseline). */
-function countrySelect(id: string, value: string, includeNone: boolean, control?: string): string {
-  const none = includeNone ? `<option value=""${value ? '' : ' selected'}>— none —</option>` : ''
+export function countrySelect(id: string, value: string, includeNone: boolean, control?: string): string {
+  const none = includeNone ? `<option value=""${value ? '' : ' selected'}>None</option>` : ''
   const opts = CALLING_CODES.map(
     (c) =>
       `<option value="${esc(c.iso2)}"${c.iso2 === value ? ' selected' : ''}>${esc(c.country)} (+${esc(c.code)})</option>`
@@ -681,11 +738,11 @@ function countrySelect(id: string, value: string, includeNone: boolean, control?
 function countryFilterOptions(
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): string {
   const home = resolveHome(state.home)
   const counts = new Map<string, number>()
-  for (const c of callsFor(report, state, home, deptFor))
+  for (const c of callsFor(report, state, home, ctx))
     counts.set(c.country, (counts.get(c.country) ?? 0) + 1)
   const options: Array<[string, string]> = [['all', 'All']]
   for (const [country, n] of [...counts.entries()].sort((a, b) => b[1] - a[1]))
@@ -701,9 +758,9 @@ function countryFilterOptions(
 function countryFilterSelect(
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): string {
-  return `<select id="ctlCountry" data-control="country" class="${selCls} max-w-[200px]">${countryFilterOptions(report, state, deptFor)}</select>`
+  return `<select id="ctlCountry" data-control="country" class="${selCls} max-w-[200px]">${countryFilterOptions(report, state, ctx)}</select>`
 }
 
 /** Options for the Department *filter* — the departments present in this report
@@ -711,12 +768,13 @@ function countryFilterSelect(
 function departmentFilterOptions(
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): string {
   const home = resolveHome(state.home)
   const counts = new Map<string, number>()
-  for (const c of callsFor(report, state, home, deptFor))
-    if (c.dept) counts.set(c.dept, (counts.get(c.dept) ?? 0) + 1)
+  for (const c of callsFor(report, state, home, ctx))
+    for (const d of c.depts?.length ? c.depts : c.dept ? [c.dept] : [])
+      counts.set(d, (counts.get(d) ?? 0) + 1)
   const options: Array<[string, string]> = [['all', 'All departments']]
   for (const [dept, n] of [...counts.entries()].sort((a, b) => b[1] - a[1]))
     options.push([dept, `${dept} (${n})`])
@@ -731,9 +789,9 @@ function departmentFilterOptions(
 function departmentFilterSelect(
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): string {
-  return `<select id="ctlDepartment" data-control="department" class="${selCls} max-w-[200px]">${departmentFilterOptions(report, state, deptFor)}</select>`
+  return `<select id="ctlDepartment" data-control="department" class="${selCls} max-w-[200px]">${departmentFilterOptions(report, state, ctx)}</select>`
 }
 
 /** After home/granularity changes, swap the Country + Department dropdown options
@@ -742,21 +800,35 @@ function refreshFilterOptions(
   overlay: HTMLElement,
   report: CallReport,
   state: ViewState,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): void {
   const country = overlay.querySelector<HTMLSelectElement>('#ctlCountry')
-  if (country) country.innerHTML = countryFilterOptions(report, state, deptFor)
+  if (country) country.innerHTML = countryFilterOptions(report, state, ctx)
   const dept = overlay.querySelector<HTMLSelectElement>('#ctlDepartment')
-  if (dept) dept.innerHTML = departmentFilterOptions(report, state, deptFor)
+  if (dept) dept.innerHTML = departmentFilterOptions(report, state, ctx)
 }
 
 /** Apply the active dropdown filters (everything except the free-text search). */
-function applyFilters(calls: ClassifiedCall[], state: ViewState): ClassifiedCall[] {
+export function applyFilters(
+  calls: ClassifiedCall[],
+  state: ViewState,
+  opts: { ignoreDepartment?: boolean; keepMisdials?: boolean } = {}
+): ClassifiedCall[] {
   return calls.filter((c) => {
-    if (state.direction !== 'all' && c.direction !== state.direction) return false
+    // Dropped report-wide rather than per section, so the summary, the charts
+    // and the per-extension table can't disagree about what counts as a call.
+    if (c.misdial && !opts.keepMisdials) return false
+    if (state.direction === 'external') {
+      if (c.direction === 'internal') return false
+    } else if (state.direction !== 'all' && c.direction !== state.direction) return false
     if (state.scope !== 'all' && c.scope !== state.scope) return false
     if (state.country !== 'all' && c.country !== state.country) return false
-    if (state.department !== 'all' && c.dept !== state.department) return false
+    if (
+      !opts.ignoreDepartment &&
+      state.department !== 'all' &&
+      !(c.depts?.length ? c.depts.includes(state.department) : c.dept === state.department)
+    )
+      return false
     if (state.status === 'answered' && !c.answered) return false
     if (state.status === 'missed' && c.answered) return false
     return true
@@ -766,27 +838,59 @@ function applyFilters(calls: ClassifiedCall[], state: ViewState): ClassifiedCall
 function renderBody(
   report: CallReport,
   all: ClassifiedCall[],
+  allLegs: ClassifiedCall[],
   state: ViewState,
   home: Home,
-  nameFor: (ext: string) => string | undefined,
-  customize: ReportCustomize
+  customize: ReportCustomize,
+  ctx: ReportContext
 ): string {
   const calls = applyFilters(all, state)
+  const legs = applyFilters(allLegs, state)
+  // Unanswered rings belong to the extension that rang, whose department may
+  // differ from the one the leg is attributed to — so the department filter is
+  // left to perExtension, which knows which extension it's crediting.
+  const ringLegs = applyFilters(allLegs, state, { ignoreDepartment: true })
   const homeNote = home.iso2
     ? ''
     : `<div class="px-3 py-2 rounded bg-sky-50 text-sky-700 dark:bg-sky-900/30 dark:text-sky-200 text-xs">Pick a <strong>home country</strong> above to split calls into national vs international.</div>`
 
   const parts: string[] = [
     report.error
-      ? `<div class="px-3 py-2 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-xs">${esc(report.error)}</div>`
+      ? `<div class="px-3 py-2 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-xs">
+          ${esc(report.error)}
+          ${diagnosticsBlock(report)}
+        </div>`
       : '',
     homeNote
   ]
   for (const s of customize.sections) {
     if (!s.visible) continue
-    parts.push(renderSection(s.id, report, calls, state, nameFor, customize))
+    parts.push(renderSection(s.id, report, calls, legs, ringLegs, state, customize, ctx))
   }
   return parts.join('')
+}
+
+/** What actually happened when the call log was read, folded away under the
+ *  error banner. An empty report is otherwise unexplainable from the outside —
+ *  the endpoint that answered and the count at each step are what tell apart
+ *  "the system has no calls" from "we asked the wrong way". */
+function diagnosticsBlock(report: CallReport): string {
+  const d = report.diagnostics
+  if (!d) return ''
+  const rows: Array<[string, string]> = [
+    ['Endpoint', d.endpoint ?? '-'],
+    ['Window asked of 3CX', d.window ? `${fmtDateTime(d.window.from)} → ${fmtDateTime(d.window.to)}` : '-'],
+    ['Records returned', d.fetched.toLocaleString()],
+    ['…inside the period', d.inPeriod.toLocaleString()],
+    ['…after the scope filter', d.kept.toLocaleString()]
+  ]
+  if (d.failures?.length) rows.push(['Endpoints that failed', d.failures.join(' · ')])
+  return `<details class="mt-1.5">
+    <summary class="cursor-pointer select-none text-[11px] opacity-80 hover:opacity-100">What was fetched</summary>
+    <dl class="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px] font-mono">
+      ${rows.map(([k, v]) => `<dt class="opacity-70 whitespace-nowrap">${esc(k)}</dt><dd class="break-all">${esc(v)}</dd>`).join('')}
+    </dl>
+  </details>`
 }
 
 /** A titled report section wrapper (empty string collapses the section). */
@@ -798,10 +902,13 @@ function renderSection(
   id: SectionId,
   report: CallReport,
   calls: ClassifiedCall[],
+  legs: ClassifiedCall[],
+  ringLegs: ClassifiedCall[],
   state: ViewState,
-  nameFor: (ext: string) => string | undefined,
-  customize: ReportCustomize
+  customize: ReportCustomize,
+  ctx: ReportContext
 ): string {
+  const nameFor = ctx.nameFor
   switch (id) {
     case 'summary':
       return summaryTiles(totals(calls))
@@ -809,13 +916,13 @@ function renderSection(
       return breakdownSection(calls, customize.charts, nameFor, report.live)
     case 'callTime':
       return sectionBlock(
-        'Call time — national vs international',
+        'Call time - national vs international',
         callTimeSection(totals(calls), customize.styles.callTime ?? 'donut')
       )
     case 'perDay':
       return report.live
         ? ''
-        : sectionBlock('Calls per day — inbound vs outbound', stackedDayChart(calls))
+        : sectionBlock('Calls per day - inbound vs outbound', stackedDayChart(calls))
     case 'zones':
       return zonesSection(calls, customize.styles.zones ?? 'bar', customize.showZoneCost)
     case 'departments':
@@ -824,6 +931,12 @@ function renderSection(
       return sectionBlock('Top countries', countryTable(calls))
     case 'trunks':
       return calls.some((c) => c.trunk) ? sectionBlock('By trunk', trunkTable(calls)) : ''
+    case 'queues':
+      return sectionBlock(
+        'Queues, ring groups & IVRs',
+        `<div class="overflow-x-auto">${queueTable(queueRollup(legs), nameFor)}</div>
+         <p class="text-[10px] text-slate-400 mt-1">Calls that passed through each, not who handled them.</p>`
+      )
     case 'extensions':
       return `
     <div>
@@ -831,7 +944,8 @@ function renderSection(
         <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Per-extension activity</h3>
         <input id="extFilter" type="text" value="${esc(state.search)}" placeholder="Find extension…" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs w-48" />
       </div>
-      <div id="extTableWrap" class="overflow-x-auto">${extTable(perExtension(calls, report.perExtension, state.search, nameFor), nameFor)}</div>
+      <div id="extTableWrap" class="overflow-x-auto">${extTable(perExtension(ringLegs, report.perExtension, state.search, ctx, state.department), nameFor, state.direction)}</div>
+      <p class="text-[10px] text-slate-400 mt-1">Click a row for the call-log entries behind it. An internal call counts for both the caller and the person they rang.</p>
     </div>`
     default:
       return ''
@@ -910,10 +1024,7 @@ function breakdownSection(
 /** Per-department rollup — for multi-tenant systems where each customer is a
  *  department. */
 function departmentsSection(calls: ClassifiedCall[]): string {
-  const rows = groupAgg(
-    calls.filter((c) => c.dept),
-    (c) => c.dept as string
-  )
+  const rows = groupAgg(calls, (c) => (c.depts?.length ? c.depts : c.dept ? [c.dept] : []))
   if (!rows.length)
     return sectionBlock('By department', emptyNote('No department data for these calls.'))
   const body = rows
@@ -1042,7 +1153,7 @@ function zonesSection(calls: ClassifiedCall[], style: ChartStyle, showCost: bool
         <td class="py-1 pr-2 text-slate-500 dark:text-slate-400">${esc(makeup(r))}</td>
         <td class="py-1 pr-2 text-right tabular-nums">${r.calls}</td>
         <td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(r.talkSec)}</td>
-        ${anyRate ? `<td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${r.hasRate ? `€${r.cost.toFixed(2)}` : '—'}</td>` : ''}
+        ${anyRate ? `<td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${r.hasRate ? `€${r.cost.toFixed(2)}` : '-'}</td>` : ''}
       </tr>`
     )
     .join('')
@@ -1057,7 +1168,7 @@ function zonesSection(calls: ClassifiedCall[], style: ChartStyle, showCost: bool
     <tbody>${body}</tbody>
   </table></div>`
   const note = anyRate
-    ? '<p class="text-[10px] text-slate-400 mt-1">Estimated cost from the bundled tariff (EUR/min) — indicative only.</p>'
+    ? '<p class="text-[10px] text-slate-400 mt-1">Estimated cost from the bundled tariff (EUR/min) - indicative only.</p>'
     : ''
   return sectionBlock('Call zones', chart + table + note)
 }
@@ -1068,21 +1179,112 @@ function wireSearch(
   bodyEl: HTMLElement,
   report: CallReport,
   state: ViewState,
-  nameFor: (ext: string) => string | undefined,
   home: Home,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): void {
   const filterEl = bodyEl.querySelector<HTMLInputElement>('#extFilter')
   const wrap = bodyEl.querySelector<HTMLElement>('#extTableWrap')
   if (!filterEl || !wrap) return
+  const ringLegs = (): ClassifiedCall[] =>
+    applyFilters(classifyCached(report, home, 'leg', ctx), state, { ignoreDepartment: true })
+  /** Same rows, plus the ones the report discards — the drill-down exists to
+   *  explain the figures, so it has to show what was left out and why. */
+  const allLegs = (): ClassifiedCall[] =>
+    applyFilters(classifyCached(report, home, 'leg', ctx), state, {
+      ignoreDepartment: true,
+      keepMisdials: true
+    })
+  const draw = (): void => {
+    wrap.innerHTML = extTable(
+      perExtension(ringLegs(), report.perExtension, state.search, ctx, state.department),
+      ctx.nameFor,
+      state.direction
+    )
+  }
   filterEl.addEventListener('input', () => {
     state.search = filterEl.value
-    const calls = applyFilters(callsFor(report, state, home, deptFor), state)
-    wrap.innerHTML = extTable(
-      perExtension(calls, report.perExtension, state.search, nameFor),
-      nameFor
-    )
+    draw()
   })
+
+  // Clicking an extension opens the call-log rows its numbers were built from —
+  // the only way to check which segments were credited to whom.
+  wrap.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-ext-row]')
+    if (!row) return
+    const ext = row.dataset.extRow!
+    const open = row.nextElementSibling
+    if (open?.hasAttribute('data-ext-detail')) {
+      open.remove()
+      return
+    }
+    for (const el of wrap.querySelectorAll('[data-ext-detail]')) el.remove()
+    const detail = document.createElement('tr')
+    detail.setAttribute('data-ext-detail', ext)
+    const cells = row.children.length
+    detail.innerHTML = `<td colspan="${cells}" class="p-0">${extSegments(allLegs(), ext, ctx)}</td>`
+    row.after(detail)
+  })
+}
+
+/** The individual call-log rows behind one extension's figures. */
+function extSegments(legs: ClassifiedCall[], ext: string, ctx: ReportContext): string {
+  const mine = legs.filter((l) => l.srcDn === ext || l.dstDn === ext || l.extension === ext)
+  if (!mine.length) return emptyNote(`No call-log rows for ${ext} under the current filters.`)
+  const sorted = [...mine].sort((a, b) => (a.ts ?? '').localeCompare(b.ts ?? ''))
+  const shown = sorted.slice(0, 300)
+  // Several rows of one call fold into a single call, so say which opened it.
+  const seen = new Set<string>()
+  const role = (l: ClassifiedCall): string => {
+    if (l.misdial) return 'not counted - dialled off-system'
+    const rang = l.dstDn ?? (l.direction === 'inbound' ? l.extension : undefined)
+    const placed = l.direction === 'outbound' || l.direction === 'internal'
+    let label: string
+    if (rang === ext) label = l.direction === 'internal' ? 'rang (internal)' : 'rang'
+    else if (placed) label = 'placed'
+    else return 'not counted'
+    if (!l.callId) return label
+    const key = `${label}|${l.callId}`
+    if (seen.has(key)) return `${label} - same call, folded in`
+    seen.add(key)
+    return label
+  }
+  const body = shown
+    .map(
+      (l) => `<tr class="border-t border-slate-100 dark:border-slate-700/40">
+        <td class="py-0.5 pr-2 whitespace-nowrap">${esc(fmtDateTime(l.ts))}</td>
+        <td class="py-0.5 pr-2 font-mono text-slate-400">${esc(l.callId ?? '-')}</td>
+        <td class="py-0.5 pr-2">${esc(l.direction)}</td>
+        <td class="py-0.5 pr-2 font-mono">${esc(l.srcDn ?? '-')} → ${esc(l.dstDn ?? '-')}</td>
+        <td class="py-0.5 pr-2">${esc(l.external ?? '')}</td>
+        <td class="py-0.5 pr-2 ${l.answered ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}">${l.answered ? 'answered' : 'no answer'}</td>
+        <td class="py-0.5 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(l.durationSec)}</td>
+        <td class="py-0.5 pr-2 text-slate-400">${esc(role(l))}</td>
+      </tr>`
+    )
+    .join('')
+  const more =
+    sorted.length > shown.length
+      ? `<p class="text-[10px] text-slate-400 px-2 py-1">Showing the first ${shown.length} of ${sorted.length} rows.</p>`
+      : ''
+  return `<div class="bg-slate-50 dark:bg-slate-900/40 px-3 py-2 border-y border-slate-200 dark:border-slate-700">
+    <p class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+      Call-log rows for ${esc(ext)}${ctx.nameFor(ext) ? ` · ${esc(ctx.nameFor(ext)!)}` : ''} — ${sorted.length} row${sorted.length === 1 ? '' : 's'}
+    </p>
+    <div class="overflow-x-auto"><table class="w-full text-[10px]">
+      <thead><tr class="text-left text-slate-400">
+        <th class="pr-2 pb-1 font-medium">Time</th>
+        <th class="pr-2 pb-1 font-medium">Call ID</th>
+        <th class="pr-2 pb-1 font-medium">Direction</th>
+        <th class="pr-2 pb-1 font-medium">DN → DN</th>
+        <th class="pr-2 pb-1 font-medium">Outside party</th>
+        <th class="pr-2 pb-1 font-medium">Result</th>
+        <th class="pr-2 pb-1 font-medium text-right">Talk</th>
+        <th class="pr-2 pb-1 font-medium">Counted as</th>
+      </tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+    ${more}
+  </div>`
 }
 
 // --- Export -----------------------------------------------------------------
@@ -1093,23 +1295,27 @@ async function runExport(
   kind: ExportKind,
   report: CallReport,
   state: ViewState,
-  nameFor: (ext: string) => string | undefined,
   customize: ReportCustomize,
-  deptFor: (ext: string) => string | undefined
+  ctx: ReportContext
 ): Promise<void> {
+  const nameFor = ctx.nameFor
   const home = resolveHome(state.home)
-  const calls = applyFilters(callsFor(report, state, home, deptFor), state)
+  const calls = applyFilters(callsFor(report, state, home, ctx), state)
+  const legs = applyFilters(classifyCached(report, home, 'leg', ctx), state)
+  const ringLegs = applyFilters(classifyCached(report, home, 'leg', ctx), state, {
+    ignoreDepartment: true
+  })
   const base = exportBaseName(report)
   let res: { canceled?: boolean; path?: string; error?: string }
   if (kind === 'calls-csv') {
     res = await window.api.report.exportCsv(`${base}-calls.csv`, buildCallsCsv(calls, nameFor))
   } else if (kind === 'ext-csv') {
-    const rows = perExtension(calls, report.perExtension, '', nameFor)
+    const rows = perExtension(ringLegs, report.perExtension, '', ctx, state.department)
     res = await window.api.report.exportCsv(`${base}-extensions.csv`, buildExtCsv(rows, nameFor))
   } else {
     res = await window.api.report.exportPdf(
       `${base}.pdf`,
-      buildPrintHtml(report, calls, state, home, nameFor, customize)
+      buildPrintHtml(report, calls, legs, ringLegs, state, home, customize, ctx)
     )
   }
   if (res?.canceled) return
@@ -1118,6 +1324,7 @@ async function runExport(
 }
 
 function exportBaseName(report: CallReport): string {
+  if (report.name) return report.name.replace(/[^\w.\- ]/g, '_').slice(0, 80)
   const host = (report.baseUrl || 'system')
     .replace(/^https?:\/\//, '')
     .replace(/[^\w.-]/g, '_')
@@ -1173,24 +1380,48 @@ function buildExtCsv(rows: ExtRow[], nameFor: (ext: string) => string | undefine
   const header = [
     'Extension',
     'Name',
+    'Calls',
     'Inbound',
+    'Inbound answered',
+    'Inbound no answer',
     'Outbound',
+    'Outbound answered',
+    'Outbound no answer',
+    'Internal',
+    'Internal answered',
+    'Internal no answer',
+    'Internal received',
+    'Internal received answered',
+    'Internal received no answer',
+    'Internal placed',
+    'Internal placed answered',
+    'Internal placed no answer',
     'National',
     'International',
-    'Answered',
-    'Missed',
     'Talk (s)',
     'Talk'
   ]
   const body = rows.map((a) => [
     a.extension,
     nameFor(a.extension) ?? '',
-    a.inbound,
-    a.outbound,
+    a.calls,
+    a.in.calls,
+    a.in.answered,
+    a.in.missed,
+    a.out.calls,
+    a.out.answered,
+    a.out.missed,
+    a.int.calls,
+    a.int.answered,
+    a.int.missed,
+    a.intIn.calls,
+    a.intIn.answered,
+    a.intIn.missed,
+    a.intOut.calls,
+    a.intOut.answered,
+    a.intOut.missed,
     a.national,
     a.international,
-    a.answered,
-    a.missed,
     Math.round(a.talkSec),
     fmtDuration(a.talkSec)
   ])
@@ -1229,15 +1460,19 @@ function pdfBars(segs: Segment[]): string {
 function buildPrintHtml(
   report: CallReport,
   calls: ClassifiedCall[],
+  legs: ClassifiedCall[],
+  ringLegs: ClassifiedCall[],
   state: ViewState,
   home: Home,
-  nameFor: (ext: string) => string | undefined,
-  customize: ReportCustomize
+  customize: ReportCustomize,
+  ctx: ReportContext
 ): string {
+  const nameFor = ctx.nameFor
   const t = totals(calls)
-  const title = report.live
-    ? 'Live report — active calls'
-    : `Report — ${fmtDate(report.from)} → ${fmtDate(report.to)}`
+  const period = report.live
+    ? 'Live report - active calls'
+    : `${fmtDate(report.from)} → ${fmtDate(report.to)} (inclusive)`
+  const title = report.name || (report.live ? 'Live report - active calls' : `Report - ${period}`)
   const kpi = (label: string, value: string): string =>
     `<div class="kpi"><div class="v">${esc(value)}</div><div class="l">${esc(label)}</div></div>`
 
@@ -1283,7 +1518,7 @@ function buildPrintHtml(
           <div style="margin-top:6px">${pdfBars(segs.filter((s) => s.value > 0))}</div>`
       }
       case 'perDay':
-        return report.live ? '' : `<h2>Calls per day — inbound vs outbound</h2>${pdfDayChart(calls)}`
+        return report.live ? '' : `<h2>Calls per day - inbound vs outbound</h2>${pdfDayChart(calls)}`
       case 'zones': {
         const rows = zoneAggregate(calls)
         if (!rows.length) return ''
@@ -1293,7 +1528,7 @@ function buildPrintHtml(
           anyRate ? [false, true, true, true] : [false, true, true],
           rows.map((r) =>
             anyRate
-              ? [r.zone, r.calls, fmtDuration(r.talkSec), r.hasRate ? `€${r.cost.toFixed(2)}` : '—']
+              ? [r.zone, r.calls, fmtDuration(r.talkSec), r.hasRate ? `€${r.cost.toFixed(2)}` : '-']
               : [r.zone, r.calls, fmtDuration(r.talkSec)]
           )
         )
@@ -1309,9 +1544,8 @@ function buildPrintHtml(
         return `<h2>Call zones</h2>${segs.length ? pdfBars(segs) : ''}${table}`
       }
       case 'departments': {
-        const deptAgg = groupAgg(
-          calls.filter((c) => c.dept),
-          (c) => c.dept as string
+        const deptAgg = groupAgg(calls, (c) =>
+          c.depts?.length ? c.depts : c.dept ? [c.dept] : []
         )
         return deptAgg.length
           ? `<h2>By department</h2>${pdfTable(
@@ -1325,7 +1559,7 @@ function buildPrintHtml(
         return `<h2>Top countries</h2>${pdfTable(
           ['Country', 'Calls', 'In', 'Out', 'Talk'],
           [false, true, true, true, true],
-          groupAgg(calls, (c) => c.country).map((r) => [
+          groupAgg(calls, (c) => [c.country]).map((r) => [
             r.key,
             r.calls,
             r.inbound,
@@ -1336,7 +1570,7 @@ function buildPrintHtml(
       case 'trunks': {
         const trunkAgg = groupAgg(
           calls.filter((c) => c.trunk),
-          (c) => c.trunk as string
+          (c) => [c.trunk as string]
         )
         return trunkAgg.length
           ? `<h2>By trunk</h2>${pdfTable(
@@ -1346,20 +1580,63 @@ function buildPrintHtml(
             )}`
           : ''
       }
+      case 'queues': {
+        const rows = queueRollup(legs)
+        return rows.length
+          ? `<h2>Queues, ring groups &amp; IVRs</h2>${pdfTable(
+              ['DN', 'Name', 'Type', 'Calls', 'Answered', 'Abandoned', 'Time here'],
+              [false, false, false, true, true, true, true],
+              rows.map((r) => [
+                r.dn,
+                nameFor(r.dn) ?? '',
+                DN_KIND_LABEL[r.kind],
+                r.calls,
+                r.answered,
+                r.abandoned,
+                fmtDuration(r.talkSec)
+              ])
+            )}`
+          : ''
+      }
       case 'extensions': {
-        const extRows = perExtension(calls, report.perExtension, '', nameFor)
+        const extRows = perExtension(ringLegs, report.perExtension, '', ctx, state.department)
+        const show = visibleColumns(state.direction)
+        const heads = ['Ext', 'Name', 'Calls']
+        const numeric = [false, false, true]
+        for (const [on, label] of [
+          [show.in, 'In'],
+          [show.out, 'Out'],
+          [show.int, 'Int']
+        ] as Array<[boolean, string]>) {
+          if (!on) continue
+          heads.push(`${label} ans`, `${label} miss`)
+          numeric.push(true, true)
+        }
+        if (show.scope) {
+          heads.push('Nat', 'Intl')
+          numeric.push(true, true)
+        }
+        heads.push('Talk')
+        numeric.push(true)
         return `<h2>Per-extension activity</h2>${pdfTable(
-          ['Ext', 'Name', 'In', 'Out', 'Nat', 'Intl', 'Ans', 'Miss', 'Talk'],
-          [false, false, true, true, true, true, true, true, true],
+          heads,
+          numeric,
           extRows.map((a) => [
             a.extension,
             nameFor(a.extension) ?? '',
-            a.inbound,
-            a.outbound,
-            a.national,
-            a.international,
-            a.answered,
-            a.missed,
+            a.calls,
+            ...(show.in
+              ? state.direction === 'internal'
+                ? [a.intIn.answered, a.intIn.missed]
+                : [a.in.answered, a.in.missed]
+              : []),
+            ...(show.out
+              ? state.direction === 'internal'
+                ? [a.intOut.answered, a.intOut.missed]
+                : [a.out.answered, a.out.missed]
+              : []),
+            ...(show.int ? [a.int.answered, a.int.missed] : []),
+            ...(show.scope ? [a.national, a.international] : []),
             fmtDuration(a.talkSec)
           ])
         )}`
@@ -1400,7 +1677,8 @@ function buildPrintHtml(
   .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
 </style></head><body>
   <h1>${esc(title)}</h1>
-  <p class="sub">Generated ${esc(fmtDateTime(report.generatedAt))}${report.baseUrl ? ` · ${esc(report.baseUrl.replace(/^https?:\/\//, ''))}` : ''}</p>
+  <p class="sub">${esc(period)} · Generated ${esc(fmtDateTime(report.generatedAt))}${report.baseUrl ? ` · ${esc(report.baseUrl.replace(/^https?:\/\//, ''))}` : ''}</p>
+  ${report.scope?.label ? `<p class="sub">Scope: ${esc(report.scope.label)}</p>` : ''}
   <p class="filters">${esc(filtersSummary(state, home))}</p>
   ${body}
 </body></html>`
@@ -1413,19 +1691,23 @@ interface AggRow {
   outbound: number
   talkSec: number
 }
-function groupAgg(calls: ClassifiedCall[], keyOf: (c: ClassifiedCall) => string): AggRow[] {
+/** `keysOf` may return several keys — a call counts under each. Departments need
+ *  that: an extension can serve more than one and the filter matches any of them,
+ *  so rows can sum to more than the total. */
+function groupAgg(calls: ClassifiedCall[], keysOf: (c: ClassifiedCall) => string[]): AggRow[] {
   const map = new Map<string, AggRow>()
   for (const c of calls) {
-    const k = keyOf(c)
-    let r = map.get(k)
-    if (!r) {
-      r = { key: k, calls: 0, inbound: 0, outbound: 0, talkSec: 0 }
-      map.set(k, r)
+    for (const k of keysOf(c)) {
+      let r = map.get(k)
+      if (!r) {
+        r = { key: k, calls: 0, inbound: 0, outbound: 0, talkSec: 0 }
+        map.set(k, r)
+      }
+      r.calls++
+      if (c.direction === 'inbound') r.inbound++
+      else if (c.direction === 'outbound') r.outbound++
+      r.talkSec += c.durationSec
     }
-    r.calls++
-    if (c.direction === 'inbound') r.inbound++
-    else if (c.direction === 'outbound') r.outbound++
-    r.talkSec += c.durationSec
   }
   return [...map.values()].sort((a, b) => b.calls - a.calls).slice(0, 25)
 }
@@ -1509,7 +1791,7 @@ interface Totals {
   internalSec: number
 }
 
-function totals(calls: ClassifiedCall[]): Totals {
+export function totals(calls: ClassifiedCall[]): Totals {
   const exts = new Set<string>()
   let answered = 0
   let inbound = 0
@@ -1523,6 +1805,7 @@ function totals(calls: ClassifiedCall[]): Totals {
   let internalSec = 0
   for (const c of calls) {
     if (c.answered) answered++
+
     if (c.direction === 'inbound') inbound++
     else if (c.direction === 'outbound') outbound++
     else if (c.direction === 'internal') internal++
@@ -1536,7 +1819,9 @@ function totals(calls: ClassifiedCall[]): Totals {
       internalSec += c.durationSec
     }
     talkSec += c.durationSec
-    if (c.extension) exts.add(c.extension)
+    // People, not queues or trunk pseudo-DNs — the same rule the per-extension
+    // table follows.
+    if (c.extension && !isInfrastructureDn(c.dnKind)) exts.add(c.extension)
   }
   return {
     calls: calls.length,
@@ -1555,25 +1840,49 @@ function totals(calls: ClassifiedCall[]): Totals {
   }
 }
 
-interface ExtRow {
-  extension: string
-  inbound: number
-  outbound: number
-  national: number
-  international: number
+export interface DirectionTally {
+  /** Attempts in this direction — answered + missed. */
+  calls: number
   answered: number
   missed: number
+}
+
+export interface ExtRow {
+  extension: string
+  /** Every attempt involving this extension, in any direction. */
+  calls: number
+  /** Calls that rang this extension from outside. */
+  in: DirectionTally
+  /** Calls this extension placed to the outside. */
+  out: DirectionTally
+  /** Extension-to-extension, counted for both parties — the one who dialled and
+   *  the one who was rung, exactly as 3CX's own per-extension report does.
+   *  `int` is the two below added together. */
+  int: DirectionTally
+  /** Internal calls this extension received. */
+  intIn: DirectionTally
+  /** Internal calls this extension placed. */
+  intOut: DirectionTally
+  national: number
+  international: number
   talkSec: number
   active: boolean
 }
 
-/** Per-extension rollup from the filtered calls, joined to the report's own
- *  active-state so the live "on a call now" dot survives filtering. */
-function perExtension(
-  calls: ClassifiedCall[],
+const emptyTally = (): DirectionTally => ({ calls: 0, answered: 0, missed: 0 })
+
+/** Per-extension activity, built from the individual call legs — the same shape
+ *  as 3CX's Extension Statistics, so the two can be read side by side. Not built
+ *  from the collapsed calls: those belong to whoever answered, which folds away
+ *  anything that rang elsewhere first. Queues, ring groups, IVRs and trunk
+ *  pseudo-DNs are left out; they get their own section. */
+export function perExtension(
+  legs: ClassifiedCall[],
   base: ExtensionActivity[],
   search: string,
-  nameFor: (ext: string) => string | undefined
+  ctx: ReportContext,
+  /** The department currently filtered to, or 'all'. */
+  deptFilter = 'all'
 ): ExtRow[] {
   const activeSet = new Set(base.filter((a) => a.active).map((a) => a.extension))
   const map = new Map<string, ExtRow>()
@@ -1582,12 +1891,14 @@ function perExtension(
     if (!r) {
       r = {
         extension: ext,
-        inbound: 0,
-        outbound: 0,
+        calls: 0,
+        in: emptyTally(),
+        out: emptyTally(),
+        int: emptyTally(),
+        intIn: emptyTally(),
+        intOut: emptyTally(),
         national: 0,
         international: 0,
-        answered: 0,
-        missed: 0,
         talkSec: 0,
         active: activeSet.has(ext)
       }
@@ -1595,26 +1906,105 @@ function perExtension(
     }
     return r
   }
-  for (const c of calls) {
-    if (!c.extension) continue
-    const r = get(c.extension)
-    if (c.direction === 'inbound') {
-      r.inbound++
-      if (c.answered) r.answered++
-      else r.missed++
-    } else if (c.direction === 'outbound') {
-      r.outbound++
+  /** A DN only earns a row if it's a person on this system and passes whatever
+   *  department is being filtered to. The department has to be judged on the
+   *  extension being credited, not on the one the leg is attributed to. */
+  const eligible = (dn: string | undefined): dn is string => {
+    if (!dn || isInfrastructureDn(ctx.kindFor(dn))) return false
+    if (deptFilter === 'all') return true
+    const depts = ctx.deptsFor(dn)
+    return depts.length ? depts.includes(deptFilter) : ctx.deptFor(dn) === deptFilter
+  }
+
+  // Matched against 3CX's Extension Statistics: ONE call per extension per
+  // direction, however many segments the log writes for it (a ring then
+  // voicemail; an outbound call retried down three trunks). "Answered" is judged
+  // oppositely by direction, and both ways round are right:
+  //   · RECEIVED — answered only if nothing rang unanswered. That gets voicemail
+  //     right without identifying it: the ring is what was missed.
+  //   · PLACED — answered if any attempt connected.
+  // `toVoicemail` is deliberately unused: it also matches the ring itself, and
+  // calls genuinely answered before being passed on later.
+  type Bucket = {
+    ext: string
+    /** 'intIn'/'intOut' keep the two sides of an internal call apart. */
+    role: 'in' | 'out' | 'intIn' | 'intOut'
+    anyAnswered: boolean
+    anyUnanswered: boolean
+    scope: ClassifiedCall['scope']
+  }
+  const buckets = new Map<string, Bucket>()
+  let loose = 0
+  const note = (ext: string, role: Bucket['role'], l: ClassifiedCall): void => {
+    // Talk time is summed over every segment — that is what matches 3CX's
+    // "Total Talking", so it sits outside the one-row-per-call accounting.
+    get(ext).talkSec += l.durationSec
+    const key = `${ext}|${role}|${l.callId ?? `#${loose++}`}`
+    const b = buckets.get(key)
+    if (b) {
+      if (l.answered) b.anyAnswered = true
+      else b.anyUnanswered = true
+      return
     }
-    if (c.scope === 'national') r.national++
-    else if (c.scope === 'international') r.international++
-    r.talkSec += c.durationSec
+    buckets.set(key, {
+      ext,
+      role,
+      anyAnswered: !!l.answered,
+      anyUnanswered: !l.answered,
+      scope: l.scope
+    })
+  }
+
+  // A dial that never reached a trunk is logged as "internal" whatever was
+  // dialled, so 2069 → 10960997 and 2069 → +353872337329 both arrive here as
+  // internal calls. They're misdials, not calls to a colleague, and 3CX leaves
+  // them out of its internal figures — counting them added four phantom missed
+  // calls to that one extension alone.
+  for (const l of legs) {
+    // Who was rung. `extension` is the caller on an internal leg, so only the
+    // destination DN says who the call actually reached.
+    const rang = l.dstDn ?? (l.direction === 'inbound' ? l.extension : undefined)
+    const placed = l.srcDn ?? l.extension
+    // Belt and braces: `classify` already flags these, but perExtension is
+    // exported and called directly by tests.
+    if (l.direction === 'internal' && !l.answered && isOffSystemDn(ctx, rang)) continue
+    if (eligible(rang)) note(rang, l.direction === 'internal' ? 'intIn' : 'in', l)
+    // Who placed it. Both sides of an internal call are counted, which is why an
+    // internal call appears once for the caller and once for the callee.
+    if (l.direction === 'outbound' || l.direction === 'internal') {
+      if (eligible(placed) && placed !== rang)
+        note(placed, l.direction === 'internal' ? 'intOut' : 'out', l)
+    }
+  }
+
+  for (const b of buckets.values()) {
+    const tally = b.role
+    const received = b.role === 'in' || b.role === 'intIn'
+    const answered = received ? !b.anyUnanswered : b.anyAnswered
+    const r = get(b.ext)
+    r.calls++
+    r[tally].calls++
+    if (answered) r[tally].answered++
+    else r[tally].missed++
+    if (b.scope === 'national') r.national++
+    else if (b.scope === 'international') r.international++
+  }
+
+  // The two halves of internal, added up for the combined column.
+  for (const r of map.values()) {
+    r.int = {
+      calls: r.intIn.calls + r.intOut.calls,
+      answered: r.intIn.answered + r.intOut.answered,
+      missed: r.intIn.missed + r.intOut.missed
+    }
   }
   const t = search.trim().toLowerCase()
   return [...map.values()]
     .filter(
-      (r) => !t || r.extension.includes(t) || (nameFor(r.extension) ?? '').toLowerCase().includes(t)
+      (r) =>
+        !t || r.extension.includes(t) || (ctx.nameFor(r.extension) ?? '').toLowerCase().includes(t)
     )
-    .sort((a, b) => b.inbound + b.outbound - (a.inbound + a.outbound))
+    .sort((a, b) => b.calls - a.calls || b.talkSec - a.talkSec)
 }
 
 interface Bar {
@@ -1624,7 +2014,7 @@ interface Bar {
 }
 
 /** Group filtered calls into {label, value} buckets for the main chart. */
-function groupCounts(
+export function groupCounts(
   calls: ClassifiedCall[],
   groupBy: GroupBy,
   nameFor: (ext: string) => string | undefined
@@ -1642,7 +2032,7 @@ function groupCounts(
   const keyOf = (c: ClassifiedCall): string => {
     switch (groupBy) {
       case 'extension':
-        return c.extension ?? '—'
+        return c.extension ?? '-'
       case 'country':
         return c.country
       case 'trunk':
@@ -1656,12 +2046,20 @@ function groupCounts(
       case 'day':
         return c.day ?? 'unknown'
       default:
-        return '—'
+        return '-'
     }
   }
   for (const c of calls) {
-    if (groupBy === 'extension' && !c.extension) continue
-    if (groupBy === 'department' && !c.dept) continue
+    // "Breakdown by extension" was listing the queue and the trunk alongside
+    // people, which is the same thing that padded the per-extension table.
+    if (groupBy === 'extension' && (!c.extension || isInfrastructureDn(c.dnKind))) continue
+    if (groupBy === 'department') {
+      // An extension can serve several departments; count it under each, the way
+      // the department filter matches each.
+      const depts = c.depts?.length ? c.depts : c.dept ? [c.dept] : []
+      for (const d of depts) map.set(d, (map.get(d) ?? 0) + 1)
+      continue
+    }
     const k = keyOf(c)
     map.set(k, (map.get(k) ?? 0) + 1)
   }
@@ -1865,7 +2263,7 @@ function stackedDayChart(calls: ClassifiedCall[]): string {
         const h = (n / max) * 100
         yTop -= h
         parts.push(
-          `<rect x="${x}" y="${yTop.toFixed(2)}" width="${w}" height="${h.toFixed(2)}" fill="${color}"><title>${esc(day)} — ${name}: ${n}</title></rect>`
+          `<rect x="${x}" y="${yTop.toFixed(2)}" width="${w}" height="${h.toFixed(2)}" fill="${color}"><title>${esc(day)} - ${name}: ${n}</title></rect>`
         )
       }
       push(d.internal, '#94a3b8', 'internal')
@@ -1971,32 +2369,185 @@ function trunkTable(calls: ClassifiedCall[]): string {
   </table>`
 }
 
-function extTable(rows: ExtRow[], nameFor: (ext: string) => string | undefined): string {
+/** Which column groups can hold anything for the direction being viewed. */
+export function visibleColumns(direction: ViewState['direction']): {
+  in: boolean
+  out: boolean
+  int: boolean
+  scope: boolean
+} {
+  // Internal on its own is split into received and placed under the Inbound /
+  // Outbound headings, which is how 3CX presents it — hence 'internal' turning
+  // both of those on.
+  return {
+    in:
+      direction === 'all' ||
+      direction === 'external' ||
+      direction === 'inbound' ||
+      direction === 'internal',
+    out:
+      direction === 'all' ||
+      direction === 'external' ||
+      direction === 'outbound' ||
+      direction === 'internal',
+    // The combined internal column only earns its place alongside the others.
+    int: direction === 'all',
+    // National vs international is a property of the outside party, so it says
+    // nothing about a purely internal call.
+    scope: direction !== 'internal'
+  }
+}
+
+function extTable(
+  rows: ExtRow[],
+  nameFor: (ext: string) => string | undefined,
+  direction: ViewState['direction']
+): string {
   if (!rows.length) return emptyNote('No matching extensions.')
+  const show = visibleColumns(direction)
+  const internalOnly = direction === 'internal'
+  const inbound = (a: ExtRow): DirectionTally => (internalOnly ? a.intIn : a.in)
+  const outbound = (a: ExtRow): DirectionTally => (internalOnly ? a.intOut : a.out)
+  const num = (v: number, cls = ''): string =>
+    `<td class="py-1 pr-2 text-right tabular-nums ${cls}">${v}</td>`
+  const pair = (t: DirectionTally): string =>
+    `${num(t.answered, 'text-emerald-600 dark:text-emerald-400')}${num(t.missed, t.missed ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400')}`
+
   const body = rows
     .map((a) => {
       const name = nameFor(a.extension)
-      return `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+      return `<tr data-ext-row="${esc(a.extension)}" class="border-t border-slate-100 dark:border-slate-700/50 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700/40" title="Show the call-log rows behind these numbers">
         <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(a.extension)}</td>
         <td class="py-1 pr-2 truncate max-w-[150px]">${esc(name ?? '')}</td>
-        <td class="py-1 pr-2 text-right tabular-nums">${a.inbound}</td>
-        <td class="py-1 pr-2 text-right tabular-nums">${a.outbound}</td>
-        <td class="py-1 pr-2 text-right tabular-nums">${a.national}</td>
-        <td class="py-1 pr-2 text-right tabular-nums text-violet-600 dark:text-violet-400">${a.international}</td>
-        <td class="py-1 pr-2 text-right tabular-nums text-emerald-600 dark:text-emerald-400">${a.answered}</td>
-        <td class="py-1 pr-2 text-right tabular-nums text-amber-600 dark:text-amber-400">${a.missed}</td>
+        ${num(a.calls, 'font-medium')}
+        ${show.in ? pair(inbound(a)) : ''}
+        ${show.out ? pair(outbound(a)) : ''}
+        ${show.int ? pair(a.int) : ''}
+        ${show.scope ? num(a.national) + num(a.international, 'text-violet-600 dark:text-violet-400') : ''}
         <td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(a.talkSec)}</td>
         <td class="py-1 text-center">${a.active ? '<span class="text-emerald-500">●</span>' : '<span class="text-slate-300 dark:text-slate-600">○</span>'}</td>
       </tr>`
     })
     .join('')
+
+  // Two header rows, grouping answered/unanswered under each direction the same
+  // way 3CX's Extension Statistics does, so the two read the same.
+  const group = (label: string, title: string): string =>
+    `<th colspan="2" class="pb-0.5 px-2 font-medium text-center border-b border-slate-200 dark:border-slate-700" title="${esc(title)}">${esc(label)}</th>`
+  const stacked = (label: string, title = ''): string =>
+    `<th rowspan="2" class="pr-2 pb-1 font-medium align-bottom ${label === 'Ext' || label === 'Name' ? 'text-left' : 'text-right'}"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</th>`
+  const sub = (label: string, title: string): string =>
+    `<th class="pr-2 pb-1 font-medium text-right" title="${esc(title)}">${esc(label)}</th>`
+
+  return `<table class="w-full text-[11px]">
+    <thead class="text-slate-400">
+      <tr class="text-left">
+        ${stacked('Ext')}${stacked('Name')}
+        ${stacked('Calls', 'Every attempt involving this extension, in any direction')}
+        ${show.in ? group('Inbound', internalOnly ? 'Internal calls that rang this extension' : 'Calls that rang this extension from outside') : ''}
+        ${show.out ? group('Outbound', internalOnly ? 'Internal calls this extension placed' : 'Calls this extension placed to the outside') : ''}
+        ${show.int ? group('Internal', 'Extension to extension - counted for both the caller and the person they rang') : ''}
+        ${show.scope ? stacked('Nat', 'Calls to or from this country') + stacked('Intl', 'Calls to or from abroad') : ''}
+        ${stacked('Talk')}${stacked('Active')}
+      </tr>
+      <tr class="text-left">
+        ${show.in ? sub('Ans', 'Answered at this extension') + sub('Miss', "Rang here and wasn't answered here") : ''}
+        ${show.out ? sub('Ans', 'The far end picked up') + sub('Miss', 'No answer at the far end') : ''}
+        ${show.int ? sub('Ans', 'Answered') + sub('Miss', 'No answer') : ''}
+      </tr>
+    </thead>
+    <tbody>${body}</tbody>
+  </table>`
+}
+
+interface QueueRow {
+  dn: string
+  kind: DnKind
+  calls: number
+  answered: number
+  abandoned: number
+  talkSec: number
+}
+
+/** Queues, ring groups and IVRs, rolled up by the calls that passed THROUGH
+ *  them — which is a different question from "who handled the call" and can only
+ *  be answered from the individual legs, since the collapsed call belongs to the
+ *  agent. A call counts as answered here if it was answered anywhere after
+ *  arriving, and abandoned if it never was. */
+export function queueRollup(legs: ClassifiedCall[]): QueueRow[] {
+  const answeredCalls = new Set<string>()
+  for (const l of legs) if (l.answered && l.callId) answeredCalls.add(l.callId)
+  const map = new Map<string, QueueRow & { seen: Set<string> }>()
+  for (const l of legs) {
+    if (!l.extension || !isInfrastructureDn(l.dnKind) || l.dnKind === 'trunk') continue
+    let r = map.get(l.extension)
+    if (!r) {
+      r = {
+        dn: l.extension,
+        kind: l.dnKind!,
+        calls: 0,
+        answered: 0,
+        abandoned: 0,
+        talkSec: 0,
+        seen: new Set()
+      }
+      map.set(l.extension, r)
+    }
+    // One row per call that entered, not per leg — a call can hit the same queue
+    // more than once (overflow, re-queue).
+    const key = l.callId ?? `${l.ts}|${l.external}`
+    if (r.seen.has(key)) continue
+    r.seen.add(key)
+    r.calls++
+    if (l.callId ? answeredCalls.has(l.callId) : l.answered) r.answered++
+    else r.abandoned++
+    r.talkSec += l.durationSec
+  }
+  return [...map.values()]
+    .map((r): QueueRow => ({
+      dn: r.dn,
+      kind: r.kind,
+      calls: r.calls,
+      answered: r.answered,
+      abandoned: r.abandoned,
+      talkSec: r.talkSec
+    }))
+    .sort((a, b) => b.calls - a.calls)
+}
+
+const DN_KIND_LABEL: Record<DnKind, string> = {
+  user: 'Extension',
+  queue: 'Queue',
+  ringGroup: 'Ring group',
+  ivr: 'IVR',
+  trunk: 'Trunk',
+  other: 'Other'
+}
+
+function queueTable(rows: QueueRow[], nameFor: (dn: string) => string | undefined): string {
+  if (!rows.length)
+    return emptyNote('No calls went through a queue, ring group or IVR in this report.')
+  const body = rows
+    .map(
+      (r) => `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+        <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(r.dn)}</td>
+        <td class="py-1 pr-2 truncate max-w-[180px]">${esc(nameFor(r.dn) ?? '')}</td>
+        <td class="py-1 pr-2 text-slate-400 whitespace-nowrap">${esc(DN_KIND_LABEL[r.kind])}</td>
+        <td class="py-1 pr-2 text-right tabular-nums">${r.calls}</td>
+        <td class="py-1 pr-2 text-right tabular-nums text-emerald-600 dark:text-emerald-400">${r.answered}</td>
+        <td class="py-1 pr-2 text-right tabular-nums text-amber-600 dark:text-amber-400">${r.abandoned}</td>
+        <td class="py-1 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(r.talkSec)}</td>
+      </tr>`
+    )
+    .join('')
   return `<table class="w-full text-[11px]">
     <thead><tr class="text-left text-slate-400">
-      <th class="pr-2 font-medium">Ext</th><th class="pr-2 font-medium">Name</th>
-      <th class="pr-2 font-medium text-right">In</th><th class="pr-2 font-medium text-right">Out</th>
-      <th class="pr-2 font-medium text-right">Nat</th><th class="pr-2 font-medium text-right">Intl</th>
-      <th class="pr-2 font-medium text-right">Ans</th><th class="pr-2 font-medium text-right">Miss</th>
-      <th class="pr-2 font-medium text-right">Talk</th><th class="font-medium text-center">Active</th>
+      <th class="pr-2 font-medium">DN</th><th class="pr-2 font-medium">Name</th>
+      <th class="pr-2 font-medium">Type</th>
+      <th class="pr-2 font-medium text-right" title="Calls that arrived here">Calls</th>
+      <th class="pr-2 font-medium text-right" title="Answered somewhere after arriving here">Answered</th>
+      <th class="pr-2 font-medium text-right" title="Never answered by anyone">Abandoned</th>
+      <th class="pr-2 font-medium text-right" title="Time spent on this leg - queue wait, IVR prompts">Time here</th>
     </tr></thead>
     <tbody>${body}</tbody>
   </table>`
@@ -2045,12 +2596,18 @@ export function writeHomeCountry(iso2: string): void {
 function cap(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 }
+/** The calendar day of an ISO instant, in the viewer's own time zone. A report's
+ *  bounds are stored as instants (local midnight, converted to UTC), so slicing
+ *  the ISO string showed the day before for anyone east of UTC — a 1–31 July
+ *  report announced itself as starting on 30 June. */
 function fmtDate(iso?: string): string {
-  if (!iso) return '—'
-  return iso.slice(0, 10)
+  if (!iso) return '-'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 function fmtDateTime(iso?: string): string {
-  if (!iso) return '—'
+  if (!iso) return '-'
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
 }

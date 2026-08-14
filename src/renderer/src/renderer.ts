@@ -4,6 +4,9 @@
 import './index.css'
 import type { ConnectRequest, Topology } from '../../shared/types'
 import { renderLogin } from './ui/login'
+import { loadSystems } from './ui/systems'
+import { playExit } from './ui/motion'
+import { readQueueLogins } from './ui/prefs'
 import { renderApp, type ViewState, type AppCallbacks } from './ui/app'
 import { initUpdates } from './ui/updates'
 
@@ -59,7 +62,7 @@ function showError(err: unknown): void {
   root.querySelector('#back')!.addEventListener('click', () => showLogin())
 }
 
-function showLogin(): void {
+function showLogin(prefill?: { baseUrl?: string; username?: string }): void {
   renderLogin(
     root,
     async (req: ConnectRequest): Promise<string | null> => {
@@ -68,8 +71,20 @@ function showLogin(): void {
       void loadAndShow()
       return null
     },
-    () => void openSnapshot()
+    () => void openSnapshot(),
+    prefill
   )
+}
+
+/** Show another system: switch to it if it's already connected, otherwise take
+ *  the user to the login screen with its details filled in. Passwords are never
+ *  stored, so an unconnected system always needs one. */
+async function switchSystem(baseUrl: string): Promise<void> {
+  if (await window.api.threecx.switchTo(baseUrl)) {
+    await loadAndShow()
+    return
+  }
+  showLogin({ baseUrl, username: loadSystems().find((s) => s.baseUrl === baseUrl)?.username })
 }
 
 /** Callbacks for a live (connected) session. */
@@ -78,7 +93,9 @@ function liveCallbacks(): AppCallbacks {
     onReload: () => void loadAndShow(true), // hard refresh → full rebuild
     onDisconnect: () => void disconnect(),
     onOpenSnapshot: () => void openSnapshot(),
-    onRefresh: (state) => softRefresh(state) // soft refresh → keep view
+    onRefresh: (state) => softRefresh(state), // soft refresh → keep view
+    onSwitchSystem: (baseUrl) => void switchSystem(baseUrl),
+    onAddSystem: () => showLogin({ baseUrl: '', username: '' })
   }
 }
 
@@ -89,7 +106,7 @@ async function loadAndShow(reauth = false): Promise<void> {
     // On a hard refresh, re-authenticate first so a stale/expired token can't
     // silently return old data — the refetch then reflects the latest config.
     if (reauth) await window.api.threecx.refresh()
-    topology = await window.api.threecx.fetchTopology()
+    topology = await window.api.threecx.fetchTopology({ includeQueueLogins: readQueueLogins() })
   } catch (err) {
     stop()
     showError(err)
@@ -104,7 +121,9 @@ async function loadAndShow(reauth = false): Promise<void> {
 async function softRefresh(state: ViewState): Promise<void> {
   try {
     await window.api.threecx.refresh()
-    const topology = await window.api.threecx.fetchTopology()
+    const topology = await window.api.threecx.fetchTopology({
+      includeQueueLogins: readQueueLogins()
+    })
     renderApp(root, topology, liveCallbacks(), undefined, state)
   } catch (err) {
     notify(`Refresh failed: ${(err as Error).message}`, true)
@@ -140,17 +159,28 @@ async function openSnapshot(): Promise<void> {
 /** Non-destructive transient toast (snapshot errors, etc.). */
 function notify(message: string, isError = false): void {
   const el = document.createElement('div')
-  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] px-3 py-1.5 rounded-md text-sm shadow-lg ${
+  el.className = `fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] px-3 py-1.5 rounded-md text-sm shadow-lg esp-toast-in ${
     isError ? 'bg-red-600 text-white' : 'bg-slate-800 text-slate-100'
   }`
   el.textContent = message
   document.body.appendChild(el)
-  setTimeout(() => el.remove(), 3000)
+  setTimeout(() => {
+    el.classList.remove('esp-toast-in')
+    playExit(el, 'esp-toast-out', () => el.remove())
+  }, 3000)
 }
 
 async function disconnect(): Promise<void> {
-  await window.api.threecx.disconnect()
+  // Sign out of the system in front; if others are still connected, show one of
+  // those rather than dropping the user back to the login screen.
+  const sessions = await window.api.threecx.sessions()
+  const active = sessions.find((s) => s.active)
+  await window.api.threecx.disconnect(active?.baseUrl)
   window.location.hash = ''
+  if (await window.api.threecx.isConnected()) {
+    await loadAndShow()
+    return
+  }
   showLogin()
 }
 

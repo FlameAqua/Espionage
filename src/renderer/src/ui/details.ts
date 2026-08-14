@@ -43,7 +43,7 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
     container.innerHTML = `
       <div class="flex flex-col h-full">
         ${panelHeader({ title: 'Details', side: 'right', hideId: 'hide' })}
-        <div class="p-6 text-sm text-slate-400">Select a node to inspect it.</div>
+        <div class="p-6 text-sm text-slate-400">Select a node or link to inspect it.</div>
       </div>`
     container.querySelector('#hide')?.addEventListener('click', ctx.onHide)
     return
@@ -349,7 +349,7 @@ export function renderDepartmentDetails(
   if (back && ctx.canGoBack) back.addEventListener('click', ctx.onBack)
 }
 
-export interface EdgeDetail {
+interface EdgeDetail {
   sourceId: string
   targetId: string
   kind: string
@@ -506,7 +506,7 @@ function loginBadge(raw: Record<string, unknown>, perQueue?: boolean): string {
     reason ??
     (perQueue === undefined
       ? 'The extension&apos;s queue login status'
-      : 'This queue only — the agent may differ in other queues')
+      : 'This queue only - the agent may differ in other queues')
   return `<span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold shrink-0 ${cls}" title="${esc(title)}">${state.loggedIn ? 'logged in' : 'logged out'}${reason ? ' ⓘ' : ''}</span>`
 }
 
@@ -544,7 +544,7 @@ function queueMembershipSection(
   const summary = perQueue.length
     ? `<p class="text-[10px] text-slate-400 mb-1">Logged in to ${loggedIn} of ${perQueue.length} queue${perQueue.length === 1 ? '' : 's'}.</p>`
     : queueLoginState(node.raw)
-      ? `<p class="text-[10px] text-slate-400 mb-1">Status shown is extension-wide — the configuration API reports one value, so a per-queue logout set by a supervisor won't appear here.</p>`
+      ? `<p class="text-[10px] text-slate-400 mb-1">Status shown is extension-wide - the configuration API reports one value, so a per-queue logout set by a supervisor won't appear here.</p>`
       : ''
   return `
     <div>
@@ -643,12 +643,15 @@ function keyFacts(node: GraphNode, agentEdges: GraphEdge[] = []): string {
         if (st) {
           rows.push([
             'Logged into queues',
-            st.loggedIn ? 'Yes' : st.reason ? 'No — auto logged out' : 'No'
+            st.loggedIn ? 'Yes' : st.reason ? 'No - auto logged out' : 'No'
           ])
         }
       }
       add('Current Ext Status', 'CurrentProfileName')
       add('Email', 'Email', 'EmailAddress')
+      // What the outside world sees when this extension dials out — the number
+      // people call back on, so it belongs beside the contact details.
+      add('Outbound caller ID', 'OutboundCallerID', 'OutboundCallerId', 'OutboundCallerNumber')
       add('Mobile', 'Mobile')
       break
     }

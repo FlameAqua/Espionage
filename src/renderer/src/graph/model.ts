@@ -234,7 +234,7 @@ function currentProfileOf(raw: Record<string, unknown>): Record<string, unknown>
   return null
 }
 
-export interface QueueLoginState {
+interface QueueLoginState {
   loggedIn: boolean
   /** Set when the state isn't simply QueueStatus, so the UI can explain itself. */
   reason?: string

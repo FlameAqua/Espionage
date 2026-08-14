@@ -171,7 +171,7 @@ function explain(d: Diagnosis | null): string {
   if (!d.agentsHost)
     return `The Switchboard agent list never rendered (url ${d.url}, route "${d.routeTitle}"). Page text began: "${d.text}".`
   if (!d.tiles && d.tilesLoose)
-    return `Agent rows exist but not as "li.queue-tile" (${d.tilesLoose} loose matches) — this 3CX build changed the markup.`
+    return `Agent rows exist but not as "li.queue-tile" (${d.tilesLoose} loose matches) - this 3CX build changed the markup.`
   return `No agent rows found (url ${d.url}, route "${d.routeTitle}", agents host present). Page text began: "${d.text}".`
 }
 
@@ -422,7 +422,7 @@ export async function scrapeQueueAgentLogins(
       console.warn('[switchboard] per-queue login read found nothing:', diag)
       return {
         byQueue,
-        error: `Per-queue logins unavailable — ${explain(diag)} Falling back to the extension-wide status.`
+        error: `Per-queue logins unavailable - ${explain(diag)} Falling back to the extension-wide status.`
       }
     }
     if (ranOut) {

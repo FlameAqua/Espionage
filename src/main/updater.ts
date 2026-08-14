@@ -99,7 +99,7 @@ export function initUpdater(): void {
 
   if (!app.isPackaged) return
   if (!UPDATE_TOKEN) {
-    console.warn('[updater] No MAIN_VITE_UPDATE_TOKEN embedded — private-repo updates disabled.')
+    console.warn('[updater] No MAIN_VITE_UPDATE_TOKEN embedded - private-repo updates disabled.')
     return
   }
 

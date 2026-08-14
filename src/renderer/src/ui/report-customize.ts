@@ -26,9 +26,10 @@ export type SectionId =
   | 'departments'
   | 'countries'
   | 'trunks'
+  | 'queues'
   | 'extensions'
 
-export interface SectionMeta {
+interface SectionMeta {
   id: SectionId
   label: string
   /** Chart styles this section supports (absent = not a styleable chart). */
@@ -49,6 +50,7 @@ export const REPORT_SECTIONS: SectionMeta[] = [
   { id: 'departments', label: 'By department' },
   { id: 'countries', label: 'Top countries' },
   { id: 'trunks', label: 'By trunk' },
+  { id: 'queues', label: 'Queues, ring groups & IVRs' },
   { id: 'extensions', label: 'Per-extension activity' }
 ]
 
@@ -80,7 +82,7 @@ export interface ReportCustomize {
 const KEY = 'espionage.reportCustomize'
 
 /** Bump when the default section ORDER changes (see ReportCustomize.version). */
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 export function defaultReportCustomize(): ReportCustomize {
   return {

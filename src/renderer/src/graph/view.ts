@@ -16,6 +16,8 @@ import {
   type NodeKind,
   type TopologyGraph
 } from './model'
+import { rankSearchHits, type SearchHit } from './search'
+import { applyEdgeRoutes } from './routing'
 
 cytoscape.use(dagre)
 
@@ -46,13 +48,7 @@ export interface EdgeContextInfo extends EdgeTapInfo {
   routeGroups: string[]
 }
 
-/** A search result: the node, plus what matched when it wasn't the node's own
- *  name or number (e.g. "DID 35318899103"), so an otherwise baffling hit
- *  explains itself. */
-export interface SearchHit {
-  node: GraphNode
-  via?: string
-}
+export type { SearchHit }
 
 /** One node's position change from a drag, for the undo/redo timeline. */
 export interface NodeMove {
@@ -82,6 +78,9 @@ interface ViewCallbacks {
   onDepartmentContext: (bucket: string, x: number, y: number) => void
   /** One or more nodes finished being dragged to a new position. */
   onNodesMoved: (moves: NodeMove[]) => void
+  /** What's on screen changed — a filter, a focus, a department, a hide. Lets the
+   *  legend report the counts actually visible rather than the whole system's. */
+  onVisibilityChange?: () => void
   /** The empty background was right-clicked (not a box-select drag); coords are
    *  viewport (client) pixels. */
   onBackgroundContext: (x: number, y: number) => void
@@ -103,6 +102,8 @@ export class GraphView {
   private focusDepth = 1
   private hideUnconnected = false
   private deptFilter: string | null = null
+  /** Node whose whole call corridor is the current view (see focusTrace). */
+  private traceId: string | null = null
   private deptParentsActive = false
   private boxEl!: HTMLElement
   /** Nodes the user explicitly hid via the context menu. Wins over every filter. */
@@ -293,7 +294,10 @@ export class GraphView {
           moves.push({ id, from, to: { x: to.x, y: to.y } })
       })
       grabStart = new Map()
-      if (moves.length) this.cb.onNodesMoved(moves)
+      if (moves.length) {
+        this.cb.onNodesMoved(moves)
+        this.routeEdges() // a moved node is a new obstacle for everything else
+      }
     })
 
     this.setupBoxSelect(container)
@@ -443,7 +447,30 @@ export class GraphView {
     const eles = this.cy.elements(':visible')
     if (eles.empty()) return
     eles.layout(this.layoutOptions()).run()
+    this.routeEdges()
     this.frameView(animate)
+  }
+
+  // --- Link routing -------------------------------------------------------
+
+  private edgeRouting = true
+
+  /** Route links along the flow instead of straight through whatever is in the
+   *  way. See graph/routing.ts for the rule. */
+  setEdgeRouting(on: boolean): void {
+    if (this.edgeRouting === on) return
+    this.edgeRouting = on
+    this.routeEdges()
+  }
+
+  getEdgeRouting(): boolean {
+    return this.edgeRouting
+  }
+
+  /** Recompute every visible link's route. Called after a layout and after a
+   *  drag, which are the only two things that move a node. */
+  private routeEdges(): void {
+    applyEdgeRoutes(this.cy, this.edgeRouting)
   }
 
   private layoutOptions(): cytoscape.LayoutOptions {
@@ -486,20 +513,20 @@ export class GraphView {
         } as cytoscape.LayoutOptions
       }
       case 'department':
-        // Same dagre (LR flow) engine as Flow, but compound-aware:
-        // cytoscape-dagre lays each department box's members out internally in
-        // call-flow order AND arranges the boxes themselves along the flow, with
-        // shared / department-less nodes flowing between them. Spacing is a touch
-        // looser than Flow so the box padding + titles have room to breathe.
+        // Same dagre (LR flow) engine as Flow, but compound-aware: each box's
+        // members are laid out internally in call-flow order and the boxes
+        // themselves arranged along the flow, with shared / department-less nodes
+        // between them. Only nodeSep is loosened over Flow, and only enough to
+        // clear the boxes' outside top labels — matching Flow's rank spacing
+        // keeps the two views the same size, rather than Department reading as a
+        // sparser copy of the same graph.
         return {
           name: 'dagre',
-          // @ts-ignore dagre options — larger nodeSep gives vertically-stacked
-          // sibling department boxes clearance for their outside top labels, so
-          // adjacent boxes (and their titles) don't overlap.
+          // @ts-ignore dagre options
           rankDir: 'LR',
-          nodeSep: 42,
-          rankSep: 150,
-          edgeSep: 10,
+          nodeSep: 22,
+          rankSep: 160,
+          edgeSep: 6,
           ranker: 'tight-tree',
           ...base
         }
@@ -519,30 +546,72 @@ export class GraphView {
     }
   }
 
+  // --- Viewport insets ----------------------------------------------------
+  // The canvas spans the whole window and the side panels float over it, so the
+  // part of it the user can actually see is inset by their widths. Every camera
+  // move frames into THAT rectangle rather than the raw canvas, otherwise fit
+  // and centre would park content underneath a panel.
+
+  private insetLeft = 0
+  private insetRight = 0
+
+  setViewportInsets(left: number, right: number): void {
+    this.insetLeft = Math.max(0, left)
+    this.insetRight = Math.max(0, right)
+  }
+
+  /** The visible rectangle in rendered (screen) pixels. */
+  private viewBox(): { x: number; y: number; w: number; h: number } {
+    return {
+      x: this.insetLeft,
+      y: 0,
+      // Floors, so a container that is momentarily unsized (mid-mount, or
+      // hidden) can't turn into a negative or absurd zoom.
+      w: Math.max(80, this.cy.width() - this.insetLeft - this.insetRight),
+      h: Math.max(80, this.cy.height())
+    }
+  }
+
+  /** Pan that puts the centre of `bb` in the centre of the visible rectangle. */
+  private centreOn(eles: cytoscape.Collection, zoom: number): { x: number; y: number } {
+    const bb = eles.boundingBox({})
+    const v = this.viewBox()
+    return {
+      x: v.x + v.w / 2 - zoom * (bb.x1 + bb.w / 2),
+      y: v.y + v.h / 2 - zoom * (bb.y1 + bb.h / 2)
+    }
+  }
+
+  /** Zoom + pan that frames `eles` inside the visible rectangle. */
+  private fitTarget(
+    eles: cytoscape.Collection,
+    padding: number
+  ): { zoom: number; pan: { x: number; y: number } } {
+    const zoom = this.fitZoom(eles, padding)
+    return { zoom, pan: this.centreOn(eles, zoom) }
+  }
+
   /** Move the camera to frame the visible graph. When focused, always end
    *  centred on the focus node at a zoom that fits its neighbourhood. */
   private frameView(animate: boolean): void {
     const eles = this.cy.elements(':visible')
     if (eles.empty()) return
+    const target = this.focusId
+      ? (() => {
+          const zoom = this.fitZoomAroundFocus(eles, 55)
+          return { zoom, pan: this.centreOn(this.cy.getElementById(this.focusId!), zoom) }
+        })()
+      : this.fitTarget(eles, 45)
     if (!animate) {
-      if (this.focusId) {
-        this.cy.zoom(this.fitZoomAroundFocus(eles, 55))
-        this.cy.center(this.cy.getElementById(this.focusId))
-      } else {
-        this.cy.fit(eles, 45)
-      }
+      this.cy.zoom(target.zoom)
+      this.cy.pan(target.pan)
       return
     }
     this.cy.stop()
-    if (this.focusId) {
-      const node = this.cy.getElementById(this.focusId)
-      this.cy.animate(
-        { center: { eles: node }, zoom: this.fitZoomAroundFocus(eles, 55) },
-        { duration: 400, easing: 'ease-in-out' }
-      )
-    } else {
-      this.cy.animate({ fit: { eles, padding: 45 } }, { duration: 400, easing: 'ease-in-out' })
-    }
+    this.cy.animate(
+      { zoom: target.zoom, pan: target.pan },
+      { duration: 400, easing: 'ease-in-out' }
+    )
   }
 
   /** Zoom that fits the visible elements while the FOCUS node stays dead centre.
@@ -560,38 +629,46 @@ export class GraphView {
     const halfW = Math.max(p.x - bb.x1, bb.x2 - p.x)
     const halfH = Math.max(p.y - bb.y1, bb.y2 - p.y)
     if (halfW <= 0 || halfH <= 0) return this.fitZoom(eles, padding)
-    const z = Math.min(
-      (this.cy.width() / 2 - padding) / halfW,
-      (this.cy.height() / 2 - padding) / halfH
-    )
+    const v = this.viewBox()
+    const z = Math.min((v.w / 2 - padding) / halfW, (v.h / 2 - padding) / halfH)
     return Math.max(this.cy.minZoom(), Math.min(this.cy.maxZoom(), z))
   }
 
   /** Zoom level that fits the given elements within the viewport. */
   private fitZoom(eles: cytoscape.Collection, padding: number): number {
     const bb = eles.boundingBox({})
-    const w = this.cy.width()
-    const h = this.cy.height()
+    const v = this.viewBox()
     if (bb.w === 0 || bb.h === 0) return this.cy.zoom()
-    const z = Math.min((w - 2 * padding) / bb.w, (h - 2 * padding) / bb.h)
+    const usableW = v.w - 2 * padding
+    const usableH = v.h - 2 * padding
+    if (usableW <= 0 || usableH <= 0) return this.cy.zoom()
+    const z = Math.min(usableW / bb.w, usableH / bb.h)
     return Math.max(this.cy.minZoom(), Math.min(this.cy.maxZoom(), z))
   }
 
   // --- Zoom / pan ---------------------------------------------------------
 
   fit(): void {
-    this.cy.fit(this.cy.elements(':visible'), 45)
+    const eles = this.cy.elements(':visible')
+    if (eles.empty()) return
+    const t = this.fitTarget(eles, 45)
+    this.cy.zoom(t.zoom)
+    this.cy.pan(t.pan)
+  }
+
+  /** Zoom about the middle of the visible rectangle, so the point the user is
+   *  looking at stays put rather than drifting under a panel. */
+  private zoomAnchor(): { x: number; y: number } {
+    const v = this.viewBox()
+    return { x: v.x + v.w / 2, y: v.y + v.h / 2 }
   }
 
   zoomBy(factor: number): void {
-    this.cy.zoom({
-      level: this.cy.zoom() * factor,
-      renderedPosition: { x: this.cy.width() / 2, y: this.cy.height() / 2 }
-    })
+    this.cy.zoom({ level: this.cy.zoom() * factor, renderedPosition: this.zoomAnchor() })
   }
 
   setZoom(level: number): void {
-    this.cy.zoom({ level, renderedPosition: { x: this.cy.width() / 2, y: this.cy.height() / 2 } })
+    this.cy.zoom({ level, renderedPosition: this.zoomAnchor() })
   }
 
   getZoom(): number {
@@ -602,18 +679,6 @@ export class GraphView {
   }
   getMaxZoom(): number {
     return this.cy.maxZoom()
-  }
-
-  /** Resize the canvas to its container without re-fitting (preserves view). */
-  /** Nudge the camera by a pixel delta. Used to cancel out the visual jump when
-   *  the canvas's LEFT edge moves (collapsing / resizing the left panel): pan is
-   *  relative to the container, so content would otherwise slide with the edge. */
-  panBy(x: number, y = 0): void {
-    this.cy.panBy({ x, y })
-  }
-
-  resize(): void {
-    this.cy.resize()
   }
 
   /** The currently focused node id (null when showing the whole graph) — used to
@@ -672,7 +737,7 @@ export class GraphView {
     if (node.empty()) return
     if (this.focusId) this.emphasizeFocus(id)
     else this.highlightNeighbourhood(node as NodeSingular)
-    this.cy.animate({ center: { eles: node } }, { duration: 300 })
+    this.cy.animate({ pan: this.centreOn(node, this.cy.zoom()) }, { duration: 300 })
   }
 
   /** The set of elements kept visible when focused on `id`: the focus node grown
@@ -697,6 +762,7 @@ export class GraphView {
     if (layout) this.layoutName = layout
     this.focusId = id
     this.deptFilter = null // mutually exclusive with the department filter
+    this.traceId = null
     this.applyVisibility()
     this.emphasizeFocus(id)
     requestAnimationFrame(() => this.runLayout(true))
@@ -757,6 +823,7 @@ export class GraphView {
     if (layout) this.layoutName = layout
     this.focusId = null
     this.deptFilter = null
+    this.traceId = null
     this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
     requestAnimationFrame(() => this.runLayout(true))
@@ -771,6 +838,7 @@ export class GraphView {
    *  null to clear. Mutually exclusive with node-focus mode. */
   setDepartmentFilter(bucket: string | null): void {
     this.focusId = null
+    this.traceId = null
     this.deptFilter = bucket
     this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
@@ -785,6 +853,28 @@ export class GraphView {
    *  Both are "focused views", so both are governed by the Focus Reach setting. */
   isFocusedView(): boolean {
     return this.focusId !== null || this.deptFilter !== null
+  }
+
+  /** Narrow the view to one node's whole call corridor and lay it out on its
+   *  own. traceFlow only highlights the corridor in place, which on a busy
+   *  system leaves the path threaded through everything else; this drops the
+   *  rest so the path is all that's drawn. */
+  focusTrace(id: string): { sources: GraphNode[]; terminals: GraphNode[] } {
+    this.cy.stop()
+    this.focusId = null
+    this.deptFilter = null
+    this.traceId = id
+    const ends = this.traceFlow(id)
+    // traceFlow fades everything outside the corridor; here it is hidden
+    // outright, so the fade would only mute the path itself.
+    this.cy.elements().removeClass('faded')
+    this.applyVisibility()
+    requestAnimationFrame(() => this.runLayout(true))
+    return ends
+  }
+
+  getTraceId(): string | null {
+    return this.traceId
   }
 
   /** Every node assigned to a department bucket. */
@@ -1049,6 +1139,17 @@ export class GraphView {
     const focusSet = this.focusId ? this.focusNeighbourhoodSet(this.focusId) : null
     const focusIds = focusSet ? new Set(focusSet.map((e) => e.id())) : null
 
+    // Trace view: everything that can reach the traced node, plus everything it
+    // can reach. Unlike focus reach this isn't hop-limited — a call path is only
+    // meaningful end to end.
+    let traceIds: Set<string> | null = null
+    if (this.traceId) {
+      const start = this.cy.getElementById(this.traceId)
+      traceIds = start.empty()
+        ? new Set<string>()
+        : new Set(start.successors().union(start.predecessors()).union(start).map((e) => e.id()))
+    }
+
     let deptIds: Set<string> | null = null
     if (this.deptFilter) {
       const members = this.cy.nodes().filter((n) => {
@@ -1095,12 +1196,13 @@ export class GraphView {
         const byKind = this.visibleKinds.has(model.kind)
         let visible: boolean
         if (focusIds) visible = n.id() === this.focusId || (focusIds.has(n.id()) && byKind)
+        else if (traceIds) visible = n.id() === this.traceId || (traceIds.has(n.id()) && byKind)
         else if (deptIds) visible = deptIds.has(n.id()) && byKind
         else visible = byKind
         n.toggleClass('hidden', !visible)
       })
       // Optionally drop nodes with no edge to another currently-visible node.
-      if (this.hideUnconnected && !focusIds) {
+      if (this.hideUnconnected && !focusIds && !traceIds) {
         this.cy.nodes(':visible').forEach((n) => {
           if (!n.data('model')) return
           const connected = n
@@ -1131,6 +1233,17 @@ export class GraphView {
         })
       }
     })
+    this.cb.onVisibilityChange?.()
+  }
+
+  /** The nodes currently on screen. */
+  visibleNodes(): GraphNode[] {
+    const out: GraphNode[] = []
+    this.cy.nodes(':visible').forEach((n) => {
+      const model = n.data('model') as GraphNode | undefined
+      if (model) out.push(model)
+    })
+    return out
   }
 
   setTheme(theme: ThemeName): void {
@@ -1159,7 +1272,7 @@ export class GraphView {
     // Keep links between two highlighted nodes visible so a routing change reads
     // as a path rather than two unrelated boxes.
     matched.edgesWith(matched).removeClass('faded').addClass('lit')
-    if (!matched.empty()) this.cy.animate({ fit: { eles: matched, padding: 60 } }, { duration: 400 })
+    if (!matched.empty()) this.cy.animate(this.fitTarget(matched, 60), { duration: 400 })
   }
 
   /** Dim everything except nodes of the given kind (null clears the highlight). */
@@ -1239,51 +1352,11 @@ export class GraphView {
    *  point — a DID is not a node of its own, so typing one used to find nothing
    *  even though a rule answers it and a trunk carries it. */
   searchDetailed(term: string): SearchHit[] {
-    const t = term.trim().toLowerCase()
-    if (!t) return []
     const models = this.cy
       .nodes()
       .map((n) => n.data('model') as GraphNode | undefined)
       .filter((m): m is GraphNode => !!m)
-
-    const hits: Array<SearchHit & { rank: number }> = []
-    const seen = new Set<string>()
-    const take = (node: GraphNode, rank: number, via?: string): void => {
-      if (seen.has(node.id)) return
-      seen.add(node.id)
-      hits.push({ node, via, rank })
-    }
-
-    for (const m of models) {
-      const label = m.label.toLowerCase()
-      // Exact name beats a name that merely contains the term, which beats the
-      // extension number — otherwise searching "800" surfaces every DID ending
-      // in 800 above the queue actually numbered 800.
-      if (label === t) take(m, 0)
-      else if (label.startsWith(t)) take(m, 1)
-      else if (label.includes(t)) take(m, 2)
-      else if (m.number === term.trim()) take(m, 3)
-      else if ((m.number ?? '').includes(t)) take(m, 4)
-    }
-    // The broad matches below are gated on a few characters: one digit matches
-    // most of a trunk's DID block, and one letter matches most category names,
-    // either of which would bury the name match the user is actually after.
-    if (t.length >= 3) {
-      for (const m of models) {
-        if (seen.has(m.id)) continue
-        for (const s of m.searchTerms ?? []) {
-          if (!s.value.toLowerCase().includes(t)) continue
-          take(m, s.value.toLowerCase() === t ? 5 : 6, `${s.label} ${s.value}`)
-          break
-        }
-      }
-      // "queue", "trunk", "external" … list that whole category last.
-      for (const [kind, meta] of Object.entries(NODE_KIND_META)) {
-        if (!meta.label.toLowerCase().includes(t)) continue
-        for (const m of models) if (m.kind === kind) take(m, 7, meta.label)
-      }
-    }
-    return hits.sort((a, b) => a.rank - b.rank).map(({ node, via }) => ({ node, via }))
+    return rankSearchHits(models, term)
   }
 
   private highlightNeighbourhood(node: NodeSingular): void {

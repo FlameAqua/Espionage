@@ -22,7 +22,7 @@ export interface TariffEntry {
   lineType: LineType
 }
 
-export interface TariffMatch {
+interface TariffMatch {
   entry: TariffEntry
   country: string
   lineType: LineType

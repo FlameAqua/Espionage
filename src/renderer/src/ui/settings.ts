@@ -8,6 +8,19 @@
 import { EDGE_KIND_META, type EdgeKind } from '../graph/model'
 import { DEFAULT_EDGE_OPACITY, type ThemeName } from '../graph/view'
 import { CALLING_CODES } from '../../../shared/phone'
+import { ICONS } from './icons'
+import {
+  readEdgeRouting,
+  readDefaultLayout,
+  readMotionPref,
+  readQueueLogins,
+  writeStraightLinks,
+  writeDefaultLayout,
+  writeMotionPref,
+  writeQueueLogins,
+  type DefaultLayout,
+  type MotionPref
+} from './prefs'
 
 const esc = (s: unknown): string =>
   String(s ?? '').replace(
@@ -81,29 +94,79 @@ export function writeSnapshotDir(dir: string): void {
 // --- Styling shorthands ------------------------------------------------------
 
 const smallBtn =
-  'px-2 py-1 rounded text-xs bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-100'
+  'inline-flex items-center justify-center h-7 px-2.5 rounded-md text-xs leading-none bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-slate-100'
 const selCls =
-  'px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-xs text-slate-700 dark:text-slate-200'
+  'h-7 px-2 rounded-md bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-xs leading-none text-slate-700 dark:text-slate-200'
 
-/** A labelled settings row: description on the left, control on the right. */
+/** A labelled settings row: name on the left, control on the right.
+ *
+ *  The explanation is a tooltip rather than a permanent second line. Every row
+ *  carrying its own paragraph turned the dialog into a wall of text you had to
+ *  read past to reach the control you came for; the dotted underline marks the
+ *  ones that have more to say. */
 function row(label: string, control: string, hint = ''): string {
-  return `<div class="flex items-center justify-between gap-3 py-1.5">
-    <div class="min-w-0">
-      <div class="text-slate-700 dark:text-slate-200">${esc(label)}</div>
-      ${hint ? `<div class="text-[11px] text-slate-400">${esc(hint)}</div>` : ''}
-    </div>
+  const name = hint
+    ? `<span class="cursor-help border-b border-dotted border-slate-300 dark:border-slate-600" title="${esc(hint)}">${esc(label)}</span>`
+    : esc(label)
+  return `<div class="flex items-center justify-between gap-3 py-2">
+    <div class="min-w-0 text-slate-700 dark:text-slate-200">${name}</div>
     <div class="shrink-0 flex items-center gap-1.5">${control}</div>
   </div>`
 }
 
+/** A plain on/off box, sized so it lines up with the other controls' right
+ *  edge. No text beside it: what it does is the row's own label, and any nuance
+ *  is in that label's tooltip. */
+function toggle(id: string): string {
+  return `<input id="${id}" type="checkbox" class="h-4 w-4 accent-sky-500 cursor-pointer" />`
+}
+
 function group(title: string, inner: string): string {
   return `<section>
-    <h3 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">${esc(title)}</h3>
-    <div class="rounded-lg border border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-700/60 px-3">${inner}</div>
+    <h3 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">${esc(title)}</h3>
+    <div class="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-900/30 divide-y divide-slate-200/70 dark:divide-slate-700/50 px-3">${inner}</div>
   </section>`
 }
 
-export interface SettingsCallbacks {
+/** A segmented control: a few exclusive choices, shown as one pill. Reads faster
+ *  than a dropdown for two or three options and takes one click, not two. */
+function segmented(id: string, value: string, options: Array<[string, string]>): string {
+  return `<div id="${id}" class="inline-flex rounded-md bg-slate-200 dark:bg-slate-700 p-0.5">
+    ${options
+      .map(
+        ([v, label]) =>
+          `<button data-seg="${esc(v)}" class="h-6 px-2 rounded text-xs leading-none ${
+            v === value
+              ? 'bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 shadow-sm'
+              : 'text-slate-500 dark:text-slate-300'
+          }">${esc(label)}</button>`
+      )
+      .join('')}
+  </div>`
+}
+
+/** Wire a segmented control; `onPick` fires with the chosen value. */
+function wireSegmented(root: HTMLElement, id: string, onPick: (value: string) => void): void {
+  const host = root.querySelector<HTMLElement>(`#${id}`)
+  if (!host) return
+  for (const b of host.querySelectorAll<HTMLElement>('[data-seg]')) {
+    b.addEventListener('click', () => {
+      for (const other of host.querySelectorAll<HTMLElement>('[data-seg]')) {
+        const on = other === b
+        other.classList.toggle('bg-white', on)
+        other.classList.toggle('dark:bg-slate-900', on)
+        other.classList.toggle('text-slate-800', on)
+        other.classList.toggle('dark:text-slate-100', on)
+        other.classList.toggle('shadow-sm', on)
+        other.classList.toggle('text-slate-500', !on)
+        other.classList.toggle('dark:text-slate-300', !on)
+      }
+      onPick(b.dataset.seg!)
+    })
+  }
+}
+
+interface SettingsCallbacks {
   theme: ThemeName
   edgeOptions: EdgeOptions
   /** Every route type present on the current graph, with how many links carry it
@@ -120,6 +183,8 @@ export interface SettingsCallbacks {
   /** Panel/minimap sizing. */
   onRestoreLayout: () => void
   onSaveLayoutDefault: () => void
+  /** Link routing on/off — applied to all three views at once. */
+  onEdgeRouting: (on: boolean) => void
   /** Report default home country (ISO2). */
   homeCountry: string
   onHomeCountry: (iso2: string) => void
@@ -135,7 +200,7 @@ export function showSettings(cb: SettingsCallbacks): void {
   let theme = cb.theme
 
   const countryOpts = [
-    `<option value=""${cb.homeCountry ? '' : ' selected'}>— none —</option>`,
+    `<option value=""${cb.homeCountry ? '' : ' selected'}>None</option>`,
     ...CALLING_CODES.map(
       (c) =>
         `<option value="${esc(c.iso2)}"${c.iso2 === cb.homeCountry ? ' selected' : ''}>${esc(c.country)} (+${esc(c.code)})</option>`
@@ -182,7 +247,7 @@ export function showSettings(cb: SettingsCallbacks): void {
         <h2 class="font-semibold text-slate-800 dark:text-slate-100">Settings</h2>
         <button data-close class="text-slate-400 hover:text-slate-700 dark:hover:text-slate-100 text-lg leading-none">✕</button>
       </div>
-      <div class="overflow-y-auto p-4 space-y-3 text-sm">
+      <div class="esp-scroll overflow-y-auto p-4 space-y-4 text-sm">
 
         ${group(
           'Links',
@@ -193,7 +258,7 @@ export function showSettings(cb: SettingsCallbacks): void {
             'Lower keeps links in the background so nodes stand out.'
           ) +
             `<div class="py-2">
-              <div class="text-slate-700 dark:text-slate-200 mb-1">Visible link types</div>
+              <div class="text-slate-700 dark:text-slate-200 mb-1.5">Visible link types</div>
               <div class="grid grid-cols-2 gap-x-4">${linkTypes}</div>
               <div id="stEdgeRestoreWrap" class="mt-2 ${cb.individuallyHiddenEdges ? '' : 'hidden'}">
                 <button id="stEdgeRestore" class="${smallBtn}">Restore ${cb.individuallyHiddenEdges} individually hidden link${cb.individuallyHiddenEdges === 1 ? '' : 's'}</button>
@@ -215,10 +280,43 @@ export function showSettings(cb: SettingsCallbacks): void {
             'Applies to the whole window.'
           ) +
             row(
-              'Panels & minimap',
-              `<button id="stLayoutSave" class="${smallBtn}">Set current as default</button>
-               <button id="stLayoutRestore" class="${smallBtn}">Restore default</button>`,
-              'Drag the inner edge of a side panel, or the minimap corner, to resize.'
+              'Interface animation',
+              segmented('stMotion', readMotionPref(), [
+                ['system', 'System'],
+                ['on', 'On'],
+                ['off', 'Off']
+              ]),
+              'Menus, panels and dialogs slide and fade. System follows your operating system’s reduce-motion setting.'
+            ) +
+            row(
+              'Panels and minimap',
+              `<button id="stLayoutSave" class="${smallBtn}">Save current</button>
+               <button id="stLayoutRestore" class="${smallBtn}">Restore</button>`,
+              'Drag the inner edge of a side panel, or the minimap corner, to resize. Save keeps the current sizes as your default.'
+            )
+        )}
+
+        ${group(
+          'Graph',
+          row(
+            'Open in view mode',
+            `<select id="stDefaultLayout" class="${selCls} max-w-[160px]">
+               <option value="last">Last used</option>
+               <option value="flow">Flow</option>
+               <option value="department">Department</option>
+               <option value="compact">Compact</option>
+             </select>`,
+            'Which arrangement the graph starts in when you connect.'
+          ) +
+            row(
+              'Read per-queue logins',
+              toggle('stQueueLogins'),
+              'Shows which agents are logged in to each queue individually. It has to be read from the web client, which makes connecting noticeably slower. Takes effect on the next connect or hard refresh.'
+            ) +
+            row(
+              'Straight links',
+              toggle('stStraightLinks'),
+              'Normally a link leaves the side of its node facing the destination, turns once in the gap between them, and comes back in horizontally, taking a turn that clears the nodes in the way. Tick this to draw every link as a direct line instead, as older versions did.'
             )
         )}
 
@@ -263,9 +361,6 @@ export function showSettings(cb: SettingsCallbacks): void {
     </div>`
   document.body.appendChild(overlay)
   const close = (): void => overlay.remove()
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close()
-  })
   overlay
     .querySelectorAll<HTMLElement>('[data-close]')
     .forEach((b) => b.addEventListener('click', close))
@@ -320,13 +415,34 @@ export function showSettings(cb: SettingsCallbacks): void {
   // --- Appearance: toggling the theme keeps the dialog open ---
   const themeBtn = overlay.querySelector<HTMLButtonElement>('#stTheme')!
   const showTheme = (): void => {
-    themeBtn.textContent = theme === 'dark' ? '☀ Light mode' : '🌙 Dark mode'
+    themeBtn.innerHTML =
+      theme === 'dark'
+        ? `${ICONS.sun}<span class="ml-1.5">Light mode</span>`
+        : `${ICONS.moon}<span class="ml-1.5">Dark mode</span>`
   }
   showTheme()
   themeBtn.addEventListener('click', () => {
     cb.onToggleTheme()
     theme = theme === 'dark' ? 'light' : 'dark'
     showTheme()
+  })
+
+  wireSegmented(overlay, 'stMotion', (v) => writeMotionPref(v as MotionPref))
+
+  // --- Graph defaults ---
+  const defLayoutEl = overlay.querySelector<HTMLSelectElement>('#stDefaultLayout')!
+  defLayoutEl.value = readDefaultLayout()
+  defLayoutEl.addEventListener('change', () =>
+    writeDefaultLayout(defLayoutEl.value as DefaultLayout)
+  )
+  const queueLoginsEl = overlay.querySelector<HTMLInputElement>('#stQueueLogins')!
+  queueLoginsEl.checked = readQueueLogins()
+  queueLoginsEl.addEventListener('change', () => writeQueueLogins(queueLoginsEl.checked))
+  const straightEl = overlay.querySelector<HTMLInputElement>('#stStraightLinks')!
+  straightEl.checked = !readEdgeRouting()
+  straightEl.addEventListener('change', () => {
+    writeStraightLinks(straightEl.checked)
+    cb.onEdgeRouting(!straightEl.checked)
   })
 
   overlay.querySelector('#stLayoutSave')!.addEventListener('click', cb.onSaveLayoutDefault)

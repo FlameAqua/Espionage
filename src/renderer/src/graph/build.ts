@@ -543,10 +543,13 @@ export function buildTopology(topo: Topology): TopologyGraph {
     const number = str(pick(raw, 'Number', 'Extension'))
     if (!number) continue
     const node = b.addNode('user', number, displayName(raw) || `#${number}`, raw, number)
-    // People get looked up by the contact detail the searcher happens to have.
+    // People get looked up by the contact detail the searcher happens to have —
+    // including the number their calls present, which is often all you have when
+    // working back from a call log or a missed-call complaint.
     for (const [label, ...keys] of [
       ['Email', 'Email', 'EmailAddress'],
-      ['Mobile', 'Mobile', 'MobileNumber']
+      ['Mobile', 'Mobile', 'MobileNumber'],
+      ['Outbound caller ID', 'OutboundCallerID', 'OutboundCallerId', 'OutboundCallerNumber']
     ] as string[][]) {
       const value = str(pick(raw, ...keys))
       if (value) (node.searchTerms ??= []).push({ label, value })

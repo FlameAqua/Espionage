@@ -22,9 +22,123 @@ body {
     sans-serif;
 }
 
-/* Cytoscape forces the container's position to relative on init, so it must
-   carry its own explicit size rather than rely on absolute positioning. */
+/* The canvas is absolutely positioned and deliberately wider than the column it
+   sits in: it spans the whole window and the side panels float over it, so
+   opening or closing one never resizes cytoscape (see applyLayout). Its left and
+   right edges are set from JS; only the vertical fill belongs here.
+
+   `position` MUST be declared here and not left to Tailwind's `absolute`
+   utility. On init cytoscape injects `.__________cytoscape_container { position:
+   relative }` into <head> and puts that class on its container. Tailwind's
+   utilities live in a @layer, and ANY unlayered rule beats a layered one no
+   matter how specific — so cytoscape's rule won, the container fell back to
+   `position: relative`, and top/bottom/left/right became mere offsets instead of
+   sizing it. With no in-flow children left, its height resolved to 0: a blank
+   canvas and a zero-height viewport box in the minimap. This rule is unlayered
+   too, and an id beats a class. */
 #graph {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Driven from #body rather than from #graph's own style attribute: cytoscape
+     puts a MutationObserver on its container's attributes and re-renders the
+     whole canvas whenever one changes, which is exactly the per-frame work a
+     panel slide must avoid. Custom properties inherit, so nothing touches the
+     container itself. */
+  left: calc(-1 * var(--esp-panel-left, 0px));
+  right: calc(-1 * var(--esp-panel-right, 0px));
+}
+
+/* --- Motion -----------------------------------------------------------------
+   Short, unfussy entrances for the things that appear over the graph: dropdowns,
+   modals and toasts. Every one collapses to an instant change under
+   prefers-reduced-motion. */
+
+@keyframes espFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes espFadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes espPopIn {
+  from { opacity: 0; transform: translateY(-4px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes espPopOut {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateY(-4px) scale(0.97); }
+}
+@keyframes espCardIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes espCardOut {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateY(6px) scale(0.985); }
+}
+/* Toasts keep their own -50% centring inside the transform. */
+@keyframes espToastIn {
+  from { opacity: 0; transform: translate(-50%, 14px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+@keyframes espToastOut {
+  from { opacity: 1; transform: translate(-50%, 0); }
+  to { opacity: 0; transform: translate(-50%, 10px); }
+}
+
+.esp-fade-in { animation: espFadeIn 140ms ease-out both; }
+.esp-fade-out { animation: espFadeOut 120ms ease-in both; }
+.esp-pop-in { animation: espPopIn 130ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.esp-pop-out { animation: espPopOut 100ms ease-in both; }
+.esp-card-in { animation: espCardIn 180ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.esp-card-out { animation: espCardOut 130ms ease-in both; }
+.esp-toast-in { animation: espToastIn 200ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.esp-toast-out { animation: espToastOut 180ms ease-in both; }
+
+/* The minimap's height is tweened in JS so cytoscape can be refitted on each
+   frame; only the fade is left to CSS. */
+#minimap { transition: opacity 140ms ease-out; }
+
+/* Masks the position jump when the view mode changes; node positions are set
+   instantly on purpose (see runLayout). */
+#graph { transition: opacity 160ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .esp-fade-in,
+  .esp-fade-out,
+  .esp-pop-in,
+  .esp-pop-out,
+  .esp-card-in,
+  .esp-card-out,
+  .esp-toast-in,
+  .esp-toast-out {
+    animation-duration: 1ms !important;
+  }
+  #minimap,
+  #graph {
+    transition-duration: 1ms !important;
+  }
+}
+
+/* Modal bodies scroll over a translucent backdrop. Without explicit paint
+   containment the browser can leave a stale fragment behind when a hover
+   repaints one row, which shows up as text that looks nudged a pixel until the
+   next scroll forces a full repaint. */
+.esp-scroll {
+  contain: paint;
+}
+
+/* Chromium paints a picked datalist suggestion with its own near-white autofill
+   background, which lit the dark connection form up. The inset shadow is the
+   only way to repaint it: the background-color rule itself is !important in the
+   UA stylesheet. */
+#login input:-webkit-autofill,
+#login input:-webkit-autofill:hover,
+#login input:-webkit-autofill:focus,
+#login input:-internal-autofill-selected {
+  -webkit-text-fill-color: #e2e8f0;
+  -webkit-box-shadow: 0 0 0 40px #0f172a inset;
+  caret-color: #e2e8f0;
 }

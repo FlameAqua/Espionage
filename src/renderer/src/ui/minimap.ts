@@ -11,13 +11,17 @@ export class Minimap {
   private main: Core
   private host: HTMLElement
   private rect: HTMLElement
-  /** Last applied dot diameter, so viewport events only restyle when it actually
-   *  changes (pan/zoom/render fire constantly). */
-  private lastDotPx = 0
-  private onViewport = (): void => {
-    this.applyScale()
-    this.updateRect()
-  }
+  /** Last applied dot size in model units, so viewport events only restyle when
+   *  it actually changes (pan/zoom/render fire constantly). Tracking the model
+   *  size rather than the pixel size matters: it also captures a change in the
+   *  map's own zoom, which is what left dots styled for one zoom being drawn at
+   *  another — the "sometimes massive, sometimes specks" problem. */
+  private lastNodeSize = 0
+  private theme: ThemeName
+  private routed = true
+  private insetLeft = 0
+  private insetRight = 0
+  private onViewport = (): void => this.updateRect()
   private onLayout = (): void => this.sync()
   private dragging = false
   private onWinMove = (e: MouseEvent): void => {
@@ -27,9 +31,11 @@ export class Minimap {
     this.dragging = false
   }
 
-  constructor(host: HTMLElement, main: Core, theme: ThemeName) {
+  constructor(host: HTMLElement, main: Core, theme: ThemeName, routed = true) {
     this.host = host
     this.main = main
+    this.theme = theme
+    this.routed = routed
     host.innerHTML = ''
 
     const canvas = document.createElement('div')
@@ -48,7 +54,7 @@ export class Minimap {
 
     this.mini = cytoscape({
       container: canvas,
-      style: miniStyle(theme),
+      style: miniStyle(theme, routed),
       userPanningEnabled: false,
       userZoomingEnabled: false,
       boxSelectionEnabled: false,
@@ -74,7 +80,60 @@ export class Minimap {
     })
   }
 
-  /** Rebuild the minimap from the main graph's current visible nodes/positions. */
+  /** Bounds of the node POSITIONS, ignoring how big the dots are drawn.
+   *
+   *  Cytoscape's own fit() measures the styled bounding box, which includes node
+   *  dimensions — and since the dots are then sized from the resulting zoom, each
+   *  fit changed the next one. Fitting to positions breaks that loop, so the same
+   *  graph always lands on the same zoom. */
+  private positionBounds(): { x1: number; y1: number; x2: number; y2: number } | null {
+    const nodes = this.mini.nodes()
+    if (nodes.empty()) return null
+    let x1 = Infinity
+    let y1 = Infinity
+    let x2 = -Infinity
+    let y2 = -Infinity
+    nodes.forEach((n) => {
+      const p = n.position()
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return
+      if (p.x < x1) x1 = p.x
+      if (p.y < y1) y1 = p.y
+      if (p.x > x2) x2 = p.x
+      if (p.y > y2) y2 = p.y
+    })
+    return Number.isFinite(x1) ? { x1, y1, x2, y2 } : null
+  }
+
+  /** Frame the whole graph, deterministically. */
+  private fitToPositions(padding = 8): void {
+    const b = this.positionBounds()
+    const w = this.mini.width()
+    const h = this.mini.height()
+    if (!b || !(w > 0) || !(h > 0)) return
+    const spanX = Math.max(1, b.x2 - b.x1)
+    const spanY = Math.max(1, b.y2 - b.y1)
+    const z = Math.min(Math.max(1, w - padding * 2) / spanX, Math.max(1, h - padding * 2) / spanY)
+    const zoom = Number.isFinite(z) && z > 0 ? z : 1
+    this.mini.zoom(zoom)
+    this.mini.pan({
+      x: w / 2 - ((b.x1 + b.x2) / 2) * zoom,
+      y: h / 2 - ((b.y1 + b.y2) / 2) * zoom
+    })
+  }
+
+  /** Re-frame the existing elements at the container's current size. Cheap enough
+   *  to run every frame while the map is resized or slid open — unlike sync(),
+   *  which rebuilds the whole element set. */
+  refit(): void {
+    this.mini.resize()
+    // Mid-slide the box is a few pixels tall; fitting into that produces a wild
+    // zoom, and there's nothing to see at that size anyway.
+    if (this.mini.height() < 24) return
+    this.fitToPositions()
+    this.applyScale()
+    this.updateRect()
+  }
+
   sync(): void {
     const els: ElementDefinition[] = []
     this.main.nodes(':visible').forEach((n) => {
@@ -92,61 +151,67 @@ export class Minimap {
       // with curve-style haystack, which cannot render a loop and logs "invalid
       // endpoints" for each one. They'd be a dot on a dot at this scale anyway.
       if (e.source().id() === e.target().id()) return
-      els.push({ data: { id: e.id(), source: e.source().id(), target: e.target().id() } })
+      // Which way the link flows, so the stylesheet can point its elbow the
+      // right way without a second pass over the geometry.
+      const back = e.target().position().x < e.source().position().x
+      els.push({
+        data: { id: e.id(), source: e.source().id(), target: e.target().id() },
+        classes: back ? 'back' : undefined
+      })
     })
     this.mini.elements().remove()
     this.mini.add(els)
     this.mini.resize()
-    if (!this.mini.nodes().empty()) {
-      this.mini.fit(undefined, 8)
-      this.lastDotPx = 0 // force a restyle for the new element set
-      this.applyScale()
-    }
+    this.lastNodeSize = 0 // force a restyle for the new element set
+    this.fitToPositions()
+    this.applyScale()
     this.updateRect()
   }
 
-  /** Size the minimap's dots and links for legibility at the current view scale.
+  /** Size the dots and links for legibility at the map's current zoom.
    *
-   *  Two things fight each other: node/edge sizes are in model units, so fitting a
-   *  large graph shrinks them to sub-pixel specks; but drawing them big enough to
-   *  see turns a few hundred nodes into an unreadable blob. So the diameter is
-   *  derived from how much of the graph is currently on screen — zoomed right out
-   *  over a whole system the dots go small and the map stays legible, and as you
-   *  zoom into a corner they grow, because far fewer of them are in play. */
+   *  Node sizes are in model units, so a fitted graph would otherwise draw them
+   *  at whatever the fit happened to produce — sub-pixel specks on a big system.
+   *  The target is a fixed number of screen pixels, chosen once from how many
+   *  nodes there are: dense graphs get smaller dots or they merge into a blob.
+   *  It deliberately does NOT change as you zoom the main graph — that made the
+   *  map restyle constantly and look different every time you glanced at it. */
   private applyScale(): void {
     if (this.mini.nodes().empty()) return
     const z = this.mini.zoom()
-    const bb = this.mini.elements().boundingBox({})
-    const ext = this.main.extent()
-    // Every input here can be non-finite in normal use: an empty or zero-sized
-    // main viewport makes extent() NaN/Infinity, and a not-yet-laid-out minimap
-    // can report a zero bounding box. Unguarded, that produced "width: NaN"
-    // warnings from Cytoscape on every animation frame.
     const usableZoom = Number.isFinite(z) && z > 0 ? z : 1
-    const spanX = ext.x2 - ext.x1
-    const spanY = ext.y2 - ext.y1
-    const fracX = bb.w > 0 && Number.isFinite(spanX) ? spanX / bb.w : 1
-    const fracY = bb.h > 0 && Number.isFinite(spanY) ? spanY / bb.h : 1
-    // Fraction of the graph's extent the main viewport currently covers (1 = all).
-    const shown = clamp(Math.max(fracX, fracY), 0, 1)
-    // Denser graphs start smaller, then everything grows as you zoom in.
     const count = this.mini.nodes().length
-    const base = count > 400 ? 3.5 : count > 150 ? 4.5 : 6
-    const dotPx = base + (1 - shown) * 4
-    if (!Number.isFinite(dotPx) || dotPx <= 0) return
-    if (Math.abs(dotPx - this.lastDotPx) < 0.25) return // avoid restyling every frame
-    this.lastDotPx = dotPx
+    const dotPx = count > 400 ? 4 : count > 150 ? 5 : 6
     const nodeSize = dotPx / usableZoom
     const edgeWidth = Math.max(0.6, dotPx / 7) / usableZoom
-    if (!Number.isFinite(nodeSize) || !Number.isFinite(edgeWidth)) return
+    if (!Number.isFinite(nodeSize) || !Number.isFinite(edgeWidth) || nodeSize <= 0) return
+    // Restyling is only needed when the map's own zoom changes (a refit or a
+    // resize), not on every pan of the main graph.
+    if (Math.abs(nodeSize - this.lastNodeSize) < this.lastNodeSize * 0.02) return
+    this.lastNodeSize = nodeSize
     this.mini.batch(() => {
       this.mini.nodes().style({ width: nodeSize, height: nodeSize })
       this.mini.edges().style({ width: edgeWidth })
     })
   }
 
+  /** Screen-pixel insets hidden behind the side panels, so the viewport
+   *  indicator outlines what is actually on show rather than the full canvas. */
+  setViewportInsets(left: number, right: number): void {
+    this.insetLeft = Math.max(0, left)
+    this.insetRight = Math.max(0, right)
+    this.updateRect()
+  }
+
   private updateRect(): void {
-    const ext = this.main.extent()
+    const raw = this.main.extent()
+    const mz = this.main.zoom()
+    const ext = {
+      x1: raw.x1 + this.insetLeft / mz,
+      x2: raw.x2 - this.insetRight / mz,
+      y1: raw.y1,
+      y2: raw.y2
+    }
     const z = this.mini.zoom()
     const pan = this.mini.pan()
     const hw = this.host.clientWidth
@@ -175,14 +240,20 @@ export class Minimap {
     const modelX = clamp((e.clientX - r.left - pan.x) / z, bb.x1, bb.x2)
     const modelY = clamp((e.clientY - r.top - pan.y) / z, bb.y1, bb.y2)
     const mz = this.main.zoom()
-    this.main.pan({
-      x: this.main.width() / 2 - modelX * mz,
-      y: this.main.height() / 2 - modelY * mz
-    })
+    // Centre on the visible strip between the panels, not the whole canvas.
+    const vx = (this.insetLeft + (this.main.width() - this.insetRight)) / 2
+    this.main.pan({ x: vx - modelX * mz, y: this.main.height() / 2 - modelY * mz })
   }
 
   setTheme(theme: ThemeName): void {
-    this.mini.style(miniStyle(theme))
+    this.theme = theme
+    this.mini.style(miniStyle(theme, this.routed))
+  }
+
+  setEdgeRouting(on: boolean): void {
+    if (this.routed === on) return
+    this.routed = on
+    this.mini.style(miniStyle(this.theme, on))
   }
 
   destroy(): void {
@@ -198,19 +269,32 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
 
-function miniStyle(theme: ThemeName): cytoscape.StylesheetJson {
+function miniStyle(theme: ThemeName, routed: boolean): cytoscape.StylesheetJson {
   const dark = theme === 'dark'
+  const lineColor = dark ? '#334155' : '#cbd5e1'
   const style: cytoscape.StylesheetJson = [
     { selector: 'node', style: { width: 14, height: 14, shape: 'ellipse', 'border-width': 0 } },
     {
       selector: 'edge',
       style: {
         width: 1,
-        'curve-style': 'haystack',
-        'line-color': dark ? '#334155' : '#cbd5e1',
+        // The same elbow shape as the canvas, but from the stylesheet rather
+        // than per link: the map's nodes are drawn as fixed-size dots, not to
+        // scale, so a turn position computed here would not be the canvas's
+        // anyway — and at this size the difference is well under a pixel. A
+        // percentage turn also can't fall into cytoscape's "too close"
+        // fallbacks the way an absolute one could between overlapping dots.
+        // haystack, the fastest style, is what routing-off goes back to.
+        'curve-style': routed ? 'taxi' : 'haystack',
+        'taxi-direction': 'rightward',
+        'taxi-turn': '50%',
+        'taxi-turn-min-distance': 1,
+        'line-color': lineColor,
         opacity: 0.6
       }
-    }
+    },
+    // Links that flow back upstream mirror the rule, exactly as on the canvas.
+    { selector: 'edge.back', style: { 'taxi-direction': 'leftward' } }
   ]
   for (const [kind, meta] of Object.entries(NODE_KIND_META)) {
     style.push({ selector: `node.${kind}`, style: { 'background-color': meta.color } })

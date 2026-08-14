@@ -17,7 +17,7 @@ export function panelTitle(title: string): string {
   return `<span class="text-[11px] font-bold text-slate-400 uppercase tracking-wide">${esc(title)}</span>`
 }
 
-export interface PanelHeaderOptions {
+interface PanelHeaderOptions {
   title: string
   /** Which edge the panel collapses towards — sets the Hide chevron direction. */
   side: 'left' | 'right'
