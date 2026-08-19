@@ -329,7 +329,10 @@ interface ViewState {
   country: string // 'all' or a country label
   department: string // 'all' or a department name
   status: 'all' | 'answered' | 'missed'
+  /** Find-as-you-type over the per-extension table. */
   search: string
+  /** The same, over the queues / ring groups / IVRs table. */
+  queueSearch: string
 }
 
 /** Classification is pure and depends only on the report + home country, but it
@@ -412,7 +415,8 @@ export function showReport(report: CallReport, liveCtx: ReportContext): void {
     country: 'all',
     department: report.scope?.departments?.length === 1 ? report.scope.departments[0] : 'all',
     status: 'all',
-    search: ''
+    search: '',
+    queueSearch: ''
   }
   let customize = loadReportCustomize()
 
@@ -616,13 +620,13 @@ function showCustomizePanel(
     <div id="czBody" class="esp-scroll overflow-y-auto p-4 space-y-1.5"></div>
     <div class="shrink-0 flex items-center justify-between gap-3 px-4 py-3 border-t border-slate-200 dark:border-slate-700">
       <div class="flex flex-col gap-1.5">
-        <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
-          <input id="czAllCharts" type="checkbox" class="accent-sky-500" ${working.includeAllChartsInPdf ? 'checked' : ''} />
-          Include all charts in exported PDF (for customers)
+        <label class="flex items-center gap-2 text-xs cursor-pointer select-none" title="Carries the call-log rows behind each extension and each queue into the exported file.">
+          <input id="czAllDetails" type="checkbox" class="accent-sky-500" ${working.exportAllDetails ? 'checked' : ''} />
+          Export all details
         </label>
         <label class="flex items-center gap-2 text-xs cursor-pointer select-none">
           <input id="czZoneCost" type="checkbox" class="accent-sky-500" ${working.showZoneCost ? 'checked' : ''} />
-          Show estimated call cost (internal — hidden from customers by default)
+          Show estimated call cost
         </label>
       </div>
       <div class="flex gap-2 shrink-0">
@@ -635,7 +639,7 @@ function showCustomizePanel(
   overlay.querySelectorAll<HTMLElement>('[data-close]').forEach((b) => b.addEventListener('click', close))
 
   const bodyEl = overlay.querySelector<HTMLElement>('#czBody')!
-  const allChartsEl = overlay.querySelector<HTMLInputElement>('#czAllCharts')!
+  const allDetailsEl = overlay.querySelector<HTMLInputElement>('#czAllDetails')!
   const zoneCostEl = overlay.querySelector<HTMLInputElement>('#czZoneCost')!
 
   const render = (): void => {
@@ -691,12 +695,12 @@ function showCustomizePanel(
 
   overlay.querySelector('#czReset')!.addEventListener('click', () => {
     working = defaultReportCustomize()
-    allChartsEl.checked = working.includeAllChartsInPdf
+    allDetailsEl.checked = working.exportAllDetails
     zoneCostEl.checked = working.showZoneCost
     render()
   })
   overlay.querySelector('#czApply')!.addEventListener('click', () => {
-    working.includeAllChartsInPdf = allChartsEl.checked
+    working.exportAllDetails = allDetailsEl.checked
     working.showZoneCost = zoneCostEl.checked
     onApply(working)
     close()
@@ -932,11 +936,15 @@ function renderSection(
     case 'trunks':
       return calls.some((c) => c.trunk) ? sectionBlock('By trunk', trunkTable(calls)) : ''
     case 'queues':
-      return sectionBlock(
-        'Queues, ring groups & IVRs',
-        `<div class="overflow-x-auto">${queueTable(queueRollup(legs), nameFor)}</div>
-         <p class="text-[10px] text-slate-400 mt-1">Calls that passed through each, not who handled them.</p>`
-      )
+      return `
+    <div>
+      <div class="flex items-center justify-between mb-1.5 gap-2">
+        <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Queues, ring groups &amp; IVRs</h3>
+        <input id="queueFilter" type="text" value="${esc(state.queueSearch)}" placeholder="Find queue…" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs w-48" />
+      </div>
+      <div id="queueTableWrap" class="overflow-x-auto">${queueTable(queueRollup(legs), nameFor, state.queueSearch)}</div>
+      <p class="text-[10px] text-slate-400 mt-1">Calls that passed through each, not who handled them. Click a row for the call-log entries behind it.</p>
+    </div>`
     case 'extensions':
       return `
     <div>
@@ -1128,13 +1136,12 @@ function zonesSection(calls: ClassifiedCall[], style: ChartStyle, showCost: bool
     return sectionBlock('Call zones', emptyNote('No external calls to place into zones.'))
   // Cost is internal-only; only surface it when explicitly enabled.
   const anyRate = showCost && rows.some((r) => r.hasRate)
-  const zonePalette = ['#0ea5e9', '#10b981', '#8b5cf6', '#f59e0b', '#ec4899', '#14b8a6', '#ef4444']
   const segs: Segment[] = rows
     .filter((r) => r.zone !== 'Unzoned')
     .map((r, i) => ({
       label: r.zone,
       value: r.talkSec,
-      color: zonePalette[i % zonePalette.length],
+      color: CAT_PALETTE[i % CAT_PALETTE.length],
       display: fmtDuration(r.talkSec)
     }))
   const chart = segs.length ? shareChart(segs, style) : ''
@@ -1182,6 +1189,7 @@ function wireSearch(
   home: Home,
   ctx: ReportContext
 ): void {
+  wireQueueSearch(bodyEl, report, state, home, ctx)
   const filterEl = bodyEl.querySelector<HTMLInputElement>('#extFilter')
   const wrap = bodyEl.querySelector<HTMLElement>('#extTableWrap')
   if (!filterEl || !wrap) return
@@ -1222,6 +1230,51 @@ function wireSearch(
     detail.setAttribute('data-ext-detail', ext)
     const cells = row.children.length
     detail.innerHTML = `<td colspan="${cells}" class="p-0">${extSegments(allLegs(), ext, ctx)}</td>`
+    row.after(detail)
+  })
+}
+
+/** The queue table's search box and click-to-expand, wired the same way as the
+ *  per-extension one so the two behave identically. */
+function wireQueueSearch(
+  bodyEl: HTMLElement,
+  report: CallReport,
+  state: ViewState,
+  home: Home,
+  ctx: ReportContext
+): void {
+  const filterEl = bodyEl.querySelector<HTMLInputElement>('#queueFilter')
+  const wrap = bodyEl.querySelector<HTMLElement>('#queueTableWrap')
+  if (!filterEl || !wrap) return
+  // Typing in the search box narrows which rows are shown; it doesn't change
+  // what the rollup says. So the legs are walked once here rather than once per
+  // keystroke — a month of a busy system is a lot of legs to re-add per letter.
+  // Anything that DOES change the figures re-renders the body, which lands back
+  // here with a fresh set.
+  let legs: ClassifiedCall[] | null = null
+  const allLegs = (): ClassifiedCall[] =>
+    (legs ??= applyFilters(classifyCached(report, home, 'leg', ctx), state))
+  let rows: QueueRow[] | null = null
+  const draw = (): void => {
+    wrap.innerHTML = queueTable((rows ??= queueRollup(allLegs())), ctx.nameFor, state.queueSearch)
+  }
+  filterEl.addEventListener('input', () => {
+    state.queueSearch = filterEl.value
+    draw()
+  })
+  wrap.addEventListener('click', (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-queue-row]')
+    if (!row) return
+    const dn = row.dataset.queueRow!
+    const open = row.nextElementSibling
+    if (open?.hasAttribute('data-queue-detail')) {
+      open.remove()
+      return
+    }
+    for (const el of wrap.querySelectorAll('[data-queue-detail]')) el.remove()
+    const detail = document.createElement('tr')
+    detail.setAttribute('data-queue-detail', dn)
+    detail.innerHTML = `<td colspan="${row.children.length}" class="p-0">${queueSegments(allLegs(), dn, ctx)}</td>`
     row.after(detail)
   })
 }
@@ -1279,6 +1332,71 @@ function extSegments(legs: ClassifiedCall[], ext: string, ctx: ReportContext): s
         <th class="pr-2 pb-1 font-medium">Outside party</th>
         <th class="pr-2 pb-1 font-medium">Result</th>
         <th class="pr-2 pb-1 font-medium text-right">Talk</th>
+        <th class="pr-2 pb-1 font-medium">Counted as</th>
+      </tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+    ${more}
+  </div>`
+}
+
+/** The individual call-log rows behind one queue / ring group / IVR's figures —
+ *  the same drill-down the per-extension table has, and for the same reason: the
+ *  rollup counts one call per arrival, and only the rows show which is which. */
+function queueSegments(legs: ClassifiedCall[], dn: string, ctx: ReportContext): string {
+  const mine = legs.filter((l) => l.extension === dn)
+  if (!mine.length) return emptyNote(`No call-log rows for ${dn} under the current filters.`)
+  // Whether the CALL was answered anywhere, which is what the Answered column
+  // counts — a queue leg of its own is nearly always unanswered.
+  const answeredCalls = new Set<string>()
+  for (const l of legs) if (l.answered && l.callId) answeredCalls.add(l.callId)
+  const sorted = [...mine].sort((a, b) => (a.ts ?? '').localeCompare(b.ts ?? ''))
+  const shown = sorted.slice(0, 300)
+  const seen = new Set<string>()
+  const role = (l: ClassifiedCall): string => {
+    // Mirrors queueRollup: one row per call that arrived, however many legs it
+    // took — an overflow or a re-queue hits the same DN twice.
+    const key = l.callId ?? `${l.ts}|${l.external}`
+    if (seen.has(key)) return 'arrived again - same call, folded in'
+    seen.add(key)
+    return (l.callId ? answeredCalls.has(l.callId) : l.answered) ? 'answered' : 'abandoned'
+  }
+  const body = shown
+    .map((l) => {
+      const counted = role(l)
+      const cls =
+        counted === 'answered'
+          ? 'text-emerald-600 dark:text-emerald-400'
+          : counted === 'abandoned'
+            ? 'text-amber-600 dark:text-amber-400'
+            : 'text-slate-400'
+      return `<tr class="border-t border-slate-100 dark:border-slate-700/40">
+        <td class="py-0.5 pr-2 whitespace-nowrap">${esc(fmtDateTime(l.ts))}</td>
+        <td class="py-0.5 pr-2 font-mono text-slate-400">${esc(l.callId ?? '-')}</td>
+        <td class="py-0.5 pr-2">${esc(l.direction)}</td>
+        <td class="py-0.5 pr-2 font-mono">${esc(l.srcDn ?? '-')} → ${esc(l.dstDn ?? '-')}</td>
+        <td class="py-0.5 pr-2">${esc(l.external ?? '')}</td>
+        <td class="py-0.5 pr-2 text-right tabular-nums whitespace-nowrap">${fmtDuration(l.durationSec)}</td>
+        <td class="py-0.5 pr-2 ${cls}">${esc(counted)}</td>
+      </tr>`
+    })
+    .join('')
+  const more =
+    sorted.length > shown.length
+      ? `<p class="text-[10px] text-slate-400 px-2 py-1">Showing the first ${shown.length} of ${sorted.length} rows.</p>`
+      : ''
+  return `<div class="bg-slate-50 dark:bg-slate-900/40 px-3 py-2 border-y border-slate-200 dark:border-slate-700">
+    <p class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+      Call-log rows for ${esc(dn)}${ctx.nameFor(dn) ? ` · ${esc(ctx.nameFor(dn)!)}` : ''} — ${sorted.length} row${sorted.length === 1 ? '' : 's'}
+    </p>
+    <div class="overflow-x-auto"><table class="w-full text-[10px]">
+      <thead><tr class="text-left text-slate-400">
+        <th class="pr-2 pb-1 font-medium">Time</th>
+        <th class="pr-2 pb-1 font-medium">Call ID</th>
+        <th class="pr-2 pb-1 font-medium">Direction</th>
+        <th class="pr-2 pb-1 font-medium">DN → DN</th>
+        <th class="pr-2 pb-1 font-medium">Outside party</th>
+        <th class="pr-2 pb-1 font-medium text-right">Time here</th>
         <th class="pr-2 pb-1 font-medium">Counted as</th>
       </tr></thead>
       <tbody>${body}</tbody>
@@ -1453,10 +1571,76 @@ function pdfBars(segs: Segment[]): string {
     .join('')
 }
 
+/** The PDF's pie / donut: the same geometry as the on-screen one, drawn with
+ *  inline styles so it survives without Tailwind. */
+function pdfPie(segs: Segment[], donut: boolean): string {
+  const total = segs.reduce((a, s) => a + s.value, 0)
+  if (total <= 0) return ''
+  const cx = 50
+  const cy = 50
+  const r = 46
+  const polar = (deg: number): [number, number] => {
+    const a = ((deg - 90) * Math.PI) / 180
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)]
+  }
+  let angle = 0
+  const slices = segs
+    .map((s) => {
+      const frac = s.value / total
+      const start = angle
+      const end = (angle += frac * 360)
+      // A single 100% slice can't be drawn as an arc — render a full circle.
+      if (frac >= 0.9999) return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${s.color}" />`
+      const [x1, y1] = polar(start)
+      const [x2, y2] = polar(end)
+      const large = end - start > 180 ? 1 : 0
+      return `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" fill="${s.color}" />`
+    })
+    .join('')
+  const hole = donut
+    ? `<circle cx="${cx}" cy="${cy}" r="${(r * 0.58).toFixed(1)}" fill="#fff" />`
+    : ''
+  const legend = segs
+    .map(
+      (s) =>
+        `<span><span class="sw" style="background:${s.color}"></span>${esc(s.label)} <span style="color:#94a3b8">${esc(s.display ?? String(s.value))}</span></span>`
+    )
+    .join('')
+  return `<div class="share">
+    <svg viewBox="0 0 100 100" width="128" height="128">${slices}${hole}</svg>
+    <div class="share-legend">${legend}</div>
+  </div>`
+}
+
+/** One set of shares in the PDF, drawn the way the report is configured to draw
+ *  it on screen — the export used to be bars whatever you picked. */
+function pdfShare(segs: Segment[], style: ChartStyle): string {
+  const usable = segs.filter((s) => s.value > 0)
+  if (!usable.length) return ''
+  return style === 'bar' ? pdfBars(usable) : pdfPie(usable, style === 'donut')
+}
+
+/** Ordered column chart for the PDF (days / hours), matching columnChart. */
+function pdfColumns(bars: Bar[]): string {
+  if (!bars.length) return ''
+  const max = Math.max(1, ...bars.map((b) => b.value))
+  const bw = 100 / bars.length
+  const rects = bars
+    .map((b, i) => {
+      const h = (b.value / max) * 100
+      return `<rect x="${(i * bw + bw * 0.15).toFixed(2)}" y="${(100 - h).toFixed(2)}" width="${(bw * 0.7).toFixed(2)}" height="${h.toFixed(2)}" fill="#0ea5e9" />`
+    })
+    .join('')
+  return `<svg viewBox="0 0 100 100" preserveAspectRatio="none" style="width:100%;height:110px">${rects}</svg>
+    <div class="legend"><span>${esc(bars[0].label)}</span><span style="margin-left:auto">${esc(bars[bars.length - 1].label)}</span></div>`
+}
+
 /** A self-contained, inline-styled HTML document rendered to PDF by the main
- *  process. Kept independent of the app's Tailwind styles. Sections honour the
- *  report customisation: the on-screen order/visibility, with every chart
- *  force-included when "include all charts" is set (for customer-facing PDFs). */
+ *  process. Kept independent of the app's Tailwind styles, but not independent
+ *  of what the report says: the same sections in the same order, each chart in
+ *  the style it is drawn in on screen, so the exported file is the report you
+ *  were just looking at. Only "Export all details" adds anything, and only the
+ *  drill-downs the on-screen tables keep folded away. */
 function buildPrintHtml(
   report: CallReport,
   calls: ClassifiedCall[],
@@ -1476,11 +1660,6 @@ function buildPrintHtml(
   const kpi = (label: string, value: string): string =>
     `<div class="kpi"><div class="v">${esc(value)}</div><div class="l">${esc(label)}</div></div>`
 
-  const visible = new Map(customize.sections.map((s) => [s.id, s.visible]))
-  const chartSections = new Set<SectionId>(['mainChart', 'callTime', 'zones', 'perDay'])
-  const want = (id: SectionId): boolean =>
-    (visible.get(id) ?? true) || (customize.includeAllChartsInPdf && chartSections.has(id))
-
   const sectionHtml = (id: SectionId): string => {
     switch (id) {
       case 'summary':
@@ -1493,18 +1672,21 @@ function buildPrintHtml(
         return customize.charts
           .map((c) => {
             const gb: GroupBy = report.live && c.groupBy === 'day' ? 'extension' : c.groupBy
-            const bars = groupCounts(calls, gb, nameFor)
-              .filter((b) => b.value > 0)
-              .slice(0, 14)
-            const segs: Segment[] = bars.map((b) => ({
+            const bars = groupCounts(calls, gb, nameFor).filter((b) => b.value > 0)
+            const head = `<h2>Breakdown by ${esc(groupLabel(gb))}</h2>`
+            if (!bars.length) return `${head}<p class="sub">No calls match the current filters.</p>`
+            // Same choice as the on-screen chart: an ordered column chart for a
+            // time series, a ranked bar chart otherwise, slices for pie/donut.
+            if (c.style === 'bar' && (gb === 'day' || gb === 'hour'))
+              return `${head}${pdfColumns(bars)}`
+            const ranked = bars.slice(0, 14)
+            const segs: Segment[] = ranked.map((b, i) => ({
               label: b.label,
               value: b.value,
-              color: '#0ea5e9',
+              color: c.style === 'bar' ? '#0ea5e9' : CAT_PALETTE[i % CAT_PALETTE.length],
               display: String(b.value)
             }))
-            return `<h2>Breakdown by ${esc(groupLabel(gb))}</h2>${
-              segs.length ? pdfBars(segs) : '<p class="sub">No calls match the current filters.</p>'
-            }`
+            return `${head}${pdfShare(segs, c.style)}`
           })
           .join('')
       case 'callTime': {
@@ -1515,7 +1697,7 @@ function buildPrintHtml(
         ]
         return `<h2>Call time — national vs international</h2>
           <div class="kpis">${kpi('National time', fmtDuration(t.nationalSec))}${kpi('International time', fmtDuration(t.internationalSec))}${kpi('Internal time', fmtDuration(t.internalSec))}</div>
-          <div style="margin-top:6px">${pdfBars(segs.filter((s) => s.value > 0))}</div>`
+          <div style="margin-top:6px">${pdfShare(segs, customize.styles.callTime ?? 'donut')}</div>`
       }
       case 'perDay':
         return report.live ? '' : `<h2>Calls per day - inbound vs outbound</h2>${pdfDayChart(calls)}`
@@ -1532,16 +1714,15 @@ function buildPrintHtml(
               : [r.zone, r.calls, fmtDuration(r.talkSec)]
           )
         )
-        const palette = ['#0ea5e9', '#10b981', '#8b5cf6', '#f59e0b', '#ec4899', '#14b8a6', '#ef4444']
         const segs: Segment[] = rows
           .filter((r) => r.zone !== 'Unzoned')
           .map((r, i) => ({
             label: r.zone,
             value: r.talkSec,
-            color: palette[i % palette.length],
+            color: CAT_PALETTE[i % CAT_PALETTE.length],
             display: fmtDuration(r.talkSec)
           }))
-        return `<h2>Call zones</h2>${segs.length ? pdfBars(segs) : ''}${table}`
+        return `<h2>Call zones</h2>${pdfShare(segs, customize.styles.zones ?? 'bar')}${table}`
       }
       case 'departments': {
         const deptAgg = groupAgg(calls, (c) =>
@@ -1582,21 +1763,43 @@ function buildPrintHtml(
       }
       case 'queues': {
         const rows = queueRollup(legs)
-        return rows.length
-          ? `<h2>Queues, ring groups &amp; IVRs</h2>${pdfTable(
-              ['DN', 'Name', 'Type', 'Calls', 'Answered', 'Abandoned', 'Time here'],
-              [false, false, false, true, true, true, true],
-              rows.map((r) => [
-                r.dn,
-                nameFor(r.dn) ?? '',
-                DN_KIND_LABEL[r.kind],
-                r.calls,
-                r.answered,
-                r.abandoned,
-                fmtDuration(r.talkSec)
-              ])
-            )}`
+        if (!rows.length) return ''
+        const table = pdfTable(
+          ['DN', 'Name', 'Type', 'Calls', 'Answered', 'Abandoned', 'Time here'],
+          [false, false, false, true, true, true, true],
+          rows.map((r) => [
+            r.dn,
+            nameFor(r.dn) ?? '',
+            DN_KIND_LABEL[r.kind],
+            r.calls,
+            r.answered,
+            r.abandoned,
+            fmtDuration(r.talkSec)
+          ])
+        )
+        const detail = customize.exportAllDetails
+          ? rows
+              .map((r) =>
+                pdfDetail(
+                  `${r.dn}${nameFor(r.dn) ? ` · ${nameFor(r.dn)}` : ''}`,
+                  ['Time', 'Call ID', 'Direction', 'DN → DN', 'Outside party', 'Time here'],
+                  [false, false, false, false, false, true],
+                  legs
+                    .filter((l) => l.extension === r.dn)
+                    .sort((a, b) => (a.ts ?? '').localeCompare(b.ts ?? ''))
+                    .map((l) => [
+                      fmtDateTime(l.ts),
+                      l.callId ?? '-',
+                      l.direction,
+                      `${l.srcDn ?? '-'} → ${l.dstDn ?? '-'}`,
+                      l.external ?? '',
+                      fmtDuration(l.durationSec)
+                    ])
+                )
+              )
+              .join('')
           : ''
+        return `<h2>Queues, ring groups &amp; IVRs</h2>${table}${detail}`
       }
       case 'extensions': {
         const extRows = perExtension(ringLegs, report.perExtension, '', ctx, state.department)
@@ -1618,7 +1821,7 @@ function buildPrintHtml(
         }
         heads.push('Talk')
         numeric.push(true)
-        return `<h2>Per-extension activity</h2>${pdfTable(
+        const table = pdfTable(
           heads,
           numeric,
           extRows.map((a) => [
@@ -1639,7 +1842,36 @@ function buildPrintHtml(
             ...(show.scope ? [a.national, a.international] : []),
             fmtDuration(a.talkSec)
           ])
-        )}`
+        )
+        const detail = customize.exportAllDetails
+          ? extRows
+              .map((a) =>
+                pdfDetail(
+                  `${a.extension}${nameFor(a.extension) ? ` · ${nameFor(a.extension)}` : ''}`,
+                  ['Time', 'Call ID', 'Direction', 'DN → DN', 'Outside party', 'Result', 'Talk'],
+                  [false, false, false, false, false, false, true],
+                  ringLegs
+                    .filter(
+                      (l) =>
+                        l.srcDn === a.extension ||
+                        l.dstDn === a.extension ||
+                        l.extension === a.extension
+                    )
+                    .sort((x, y) => (x.ts ?? '').localeCompare(y.ts ?? ''))
+                    .map((l) => [
+                      fmtDateTime(l.ts),
+                      l.callId ?? '-',
+                      l.direction,
+                      `${l.srcDn ?? '-'} → ${l.dstDn ?? '-'}`,
+                      l.external ?? '',
+                      l.answered ? 'answered' : 'no answer',
+                      fmtDuration(l.durationSec)
+                    ])
+                )
+              )
+              .join('')
+          : ''
+        return `<h2>Per-extension activity</h2>${table}${detail}`
       }
       default:
         return ''
@@ -1647,7 +1879,7 @@ function buildPrintHtml(
   }
 
   const body = customize.sections
-    .filter((s) => want(s.id))
+    .filter((s) => s.visible)
     .map((s) => sectionHtml(s.id))
     .join('\n  ')
 
@@ -1675,6 +1907,13 @@ function buildPrintHtml(
   .legend { display: flex; gap: 14px; font-size: 10px; color: #475569; margin-top: 4px; }
   .legend span { display: inline-flex; align-items: center; gap: 4px; }
   .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
+  .share { display: flex; align-items: center; gap: 16px; }
+  .share-legend { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 14px; font-size: 10px; color: #475569; }
+  .share-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .detail { margin: 4px 0 12px; padding: 6px 8px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; break-inside: avoid; }
+  .detail h3 { font-size: 10px; margin: 0 0 3px; color: #475569; text-transform: uppercase; letter-spacing: .04em; }
+  .detail table { font-size: 9.5px; }
+  .detail th, .detail td { padding: 2px 5px; }
 </style></head><body>
   <h1>${esc(title)}</h1>
   <p class="sub">${esc(period)} · Generated ${esc(fmtDateTime(report.generatedAt))}${report.baseUrl ? ` · ${esc(report.baseUrl.replace(/^https?:\/\//, ''))}` : ''}</p>
@@ -1723,6 +1962,24 @@ function pdfTable(headers: string[], numeric: boolean[], rows: unknown[][]): str
     )
     .join('')
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+}
+
+/** Most call-log rows written for any one extension or queue when details are
+ *  exported. A month of a busy system runs to hundreds of thousands of rows in
+ *  total, which is more HTML than the PDF renderer will get through. */
+const PDF_DETAIL_LIMIT = 1000
+
+/** One drill-down block in the PDF: the call-log rows behind a single row of the
+ *  table above it. Only written when "Export all details" is on — on a busy
+ *  month these run to more pages than the report itself. */
+function pdfDetail(title: string, headers: string[], numeric: boolean[], rows: unknown[][]): string {
+  if (!rows.length) return ''
+  const shown = rows.slice(0, PDF_DETAIL_LIMIT)
+  const more =
+    rows.length > shown.length
+      ? `<p class="sub">Showing the first ${shown.length} of ${rows.length} rows.</p>`
+      : ''
+  return `<div class="detail"><h3>${esc(title)} — ${rows.length} row${rows.length === 1 ? '' : 's'}</h3>${pdfTable(headers, numeric, shown)}${more}</div>`
 }
 
 /** Inline-styled stacked-per-day column chart for the PDF (colours are explicit
@@ -2524,12 +2781,25 @@ const DN_KIND_LABEL: Record<DnKind, string> = {
   other: 'Other'
 }
 
-function queueTable(rows: QueueRow[], nameFor: (dn: string) => string | undefined): string {
+function queueTable(
+  rows: QueueRow[],
+  nameFor: (dn: string) => string | undefined,
+  search = ''
+): string {
   if (!rows.length)
     return emptyNote('No calls went through a queue, ring group or IVR in this report.')
-  const body = rows
+  const q = search.trim().toLowerCase()
+  const shown = q
+    ? rows.filter((r) =>
+        `${r.dn} ${nameFor(r.dn) ?? ''} ${DN_KIND_LABEL[r.kind]}`.toLowerCase().includes(q)
+      )
+    : rows
+  if (!shown.length) return emptyNote(`Nothing matches “${search}”.`)
+  const rowCls =
+    'border-t border-slate-100 dark:border-slate-700/50 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/60'
+  const body = shown
     .map(
-      (r) => `<tr class="border-t border-slate-100 dark:border-slate-700/50">
+      (r) => `<tr data-queue-row="${esc(r.dn)}" class="${rowCls}">
         <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(r.dn)}</td>
         <td class="py-1 pr-2 truncate max-w-[180px]">${esc(nameFor(r.dn) ?? '')}</td>
         <td class="py-1 pr-2 text-slate-400 whitespace-nowrap">${esc(DN_KIND_LABEL[r.kind])}</td>

@@ -5,6 +5,7 @@ import {
   detourOffset,
   quadPoint,
   routeEdge,
+  segmentSpec,
   type Box,
   type Pt
 } from '../src/renderer/src/graph/routing'
@@ -49,6 +50,22 @@ function elbowCrosses(
   const vHits = (x: number, ya: number, yb: number): boolean =>
     x >= b.x1 && x <= b.x2 && Math.min(ya, yb) <= b.y2 && Math.max(ya, yb) >= b.y1
   return hits(sy, sx, turnX) || vHits(turnX, sy, ty) || hits(ty, turnX, tx)
+}
+
+/** Walk the three legs of a side lane — out of the facing side of the source,
+ *  down the lane, back in to the target — and report whether any runs into `b`. */
+function laneCrosses(src: Box, tgt: Box, points: Pt[], b: Box): boolean {
+  const laneX = points[0].x
+  const right = laneX > (src.x1 + src.x2) / 2
+  const sy = centre(src).y
+  const ty = centre(tgt).y
+  const sx = right ? src.x2 : src.x1
+  const tx = right ? tgt.x2 : tgt.x1
+  const hits = (y: number, xa: number, xb: number): boolean =>
+    y >= b.y1 && y <= b.y2 && Math.min(xa, xb) <= b.x2 && Math.max(xa, xb) >= b.x1
+  const vHits = (x: number, ya: number, yb: number): boolean =>
+    x >= b.x1 && x <= b.x2 && Math.min(ya, yb) <= b.y2 && Math.max(ya, yb) >= b.y1
+  return hits(sy, sx, laneX) || vHits(laneX, sy, ty) || hits(ty, laneX, tx)
 }
 
 describe('routeEdge', () => {
@@ -109,22 +126,60 @@ describe('routeEdge', () => {
     for (const b of blockers) expect(elbowCrosses(src, tgt, r.direction, r.turn, b)).toBe(false)
   })
 
-  it('bows instead when the two ends overlap horizontally', () => {
-    // Stacked vertically: there is no gap to turn in.
+  it('takes a lane down one side when the two ends overlap horizontally', () => {
+    // Stacked vertically with something in between: there is no gap to turn in,
+    // so the link goes out of one side, down past both, and back in.
     const src = box(0, 0)
     const tgt = box(10, 300)
     const blocker = box(5, 150)
     const r = routeEdge(src, tgt, [blocker])
-    expect(r.kind).toBe('bezier')
-    if (r.kind !== 'bezier') return
-    expect(bowCrosses(centre(src), centre(tgt), r.offset, blocker)).toBe(false)
+    expect(r.kind).toBe('segments')
+    if (r.kind !== 'segments') return
+    expect(laneCrosses(src, tgt, r.points, blocker)).toBe(false)
+    // Both bends sit in one vertical lane clear of both nodes, level with the
+    // node each is leaving / entering.
+    expect(r.points[0].x).toBeCloseTo(r.points[1].x)
+    expect(r.points[0].y).toBeCloseTo(centre(src).y)
+    expect(r.points[1].y).toBeCloseTo(centre(tgt).y)
+    const laneX = r.points[0].x
+    expect(laneX < Math.min(src.x1, tgt.x1) || laneX > Math.max(src.x2, tgt.x2)).toBe(true)
+  })
+
+  it('routes an upstream stack the same way, mirrored', () => {
+    // The dragged-below-its-neighbours case: the source sits under the target.
+    const src = box(0, 300)
+    const tgt = box(10, 0)
+    const r = routeEdge(src, tgt, [box(5, 150)])
+    expect(r.kind).toBe('segments')
+    if (r.kind !== 'segments') return
+    expect(r.points[0].y).toBeCloseTo(centre(src).y)
+    expect(r.points[1].y).toBeCloseTo(centre(tgt).y)
+  })
+
+  it('takes the side the link leans towards', () => {
+    // The target sits below and to the left, so the left-hand lane is the
+    // shorter way round.
+    const src = box(0, 0)
+    const tgt = box(-30, 300)
+    const r = routeEdge(src, tgt, [box(-15, 150, 120, 40)])
+    expect(r.kind).toBe('segments')
+    if (r.kind !== 'segments') return
+    expect(r.points[0].x).toBeLessThan(tgt.x1)
   })
 
   it('leaves a short, clear, overlapping link alone', () => {
     expect(routeEdge(box(0, 0), box(10, 300), []).kind).toBe('straight')
   })
 
-  it('bows when the gap is too tight for a turn', () => {
+  it('bows when two overlapping ends have no vertical gap either', () => {
+    // Practically on top of each other — no lane to run along, so a bow it is.
+    const src = box(0, 0)
+    const tgt = box(10, 40)
+    const r = routeEdge(src, tgt, [box(200, 20, 400, 400)])
+    expect(r.kind).toBe('bezier')
+  })
+
+  it('does not elbow when the gap is too tight for a turn', () => {
     // Borders 20px apart: less than the two insets an elbow needs.
     const r = routeEdge(box(0, 0), box(80, 200), [box(40, 100)])
     expect(r.kind).not.toBe('taxi')
@@ -208,5 +263,46 @@ describe('boxesOverlap', () => {
     expect(boxesOverlap({ x1: 0, y1: 0, x2: 10, y2: 10 }, { x1: 10, y1: 0, x2: 20, y2: 10 })).toBe(
       true
     )
+  })
+})
+
+describe('segmentSpec', () => {
+  /** Rebuild a point the way cytoscape's findSegmentsPoints does, so a passing
+   *  round trip means the drawn polyline goes through the points routing chose. */
+  const rebuild = (p1: Pt, p2: Pt, w: number, d: number): Pt => {
+    const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1
+    const nx = -(p2.y - p1.y) / len
+    const ny = (p2.x - p1.x) / len
+    return { x: p1.x * (1 - w) + p2.x * w + nx * d, y: p1.y * (1 - w) + p2.y * w + ny * d }
+  }
+
+  it('round-trips arbitrary points through weight + distance', () => {
+    const p1: Pt = { x: 40, y: 10 }
+    const p2: Pt = { x: 90, y: 400 }
+    const points: Pt[] = [
+      { x: 160, y: 10 },
+      { x: 160, y: 400 }
+    ]
+    const { weights, distances } = segmentSpec(p1, p2, points)
+    points.forEach((p, i) => {
+      const back = rebuild(p1, p2, weights[i], distances[i])
+      expect(back.x).toBeCloseTo(p.x)
+      expect(back.y).toBeCloseTo(p.y)
+    })
+  })
+
+  it('round-trips a lane on the other side too', () => {
+    const p1: Pt = { x: 0, y: 300 }
+    const p2: Pt = { x: -30, y: 0 }
+    const points: Pt[] = [
+      { x: -120, y: 300 },
+      { x: -120, y: 0 }
+    ]
+    const { weights, distances } = segmentSpec(p1, p2, points)
+    points.forEach((p, i) => {
+      const back = rebuild(p1, p2, weights[i], distances[i])
+      expect(back.x).toBeCloseTo(p.x)
+      expect(back.y).toBeCloseTo(p.y)
+    })
   })
 })

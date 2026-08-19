@@ -23,6 +23,17 @@ export class Minimap {
   private insetRight = 0
   private onViewport = (): void => this.updateRect()
   private onLayout = (): void => this.sync()
+  /** Dragging a node on the canvas moves it here too. The main graph fires one
+   *  `position` per node per frame, so the copy is coalesced into a single pass
+   *  on the next frame rather than run per event. */
+  private onNodePosition = (): void => {
+    if (this.followFrame) return
+    this.followFrame = requestAnimationFrame(() => {
+      this.followFrame = 0
+      this.followPositions()
+    })
+  }
+  private followFrame = 0
   private dragging = false
   private onWinMove = (e: MouseEvent): void => {
     if (this.dragging) this.recenter(e)
@@ -64,6 +75,7 @@ export class Minimap {
     this.sync()
     main.on('pan zoom resize render', this.onViewport)
     main.on('layoutstop', this.onLayout)
+    main.on('position', 'node', this.onNodePosition)
 
     // Click or drag to move the main view; scroll to zoom it.
     host.addEventListener('mousedown', (e) => {
@@ -119,6 +131,37 @@ export class Minimap {
       x: w / 2 - ((b.x1 + b.x2) / 2) * zoom,
       y: h / 2 - ((b.y1 + b.y2) / 2) * zoom
     })
+  }
+
+  /** Copy the main graph's node positions across without rebuilding the element
+   *  set, and re-frame around where they've landed. This is what keeps the map
+   *  honest while a node is being dragged — sync() would do it too, but throwing
+   *  away and re-adding every element each frame is far too much work for a
+   *  drag. Only the map's own zoom/pan and the link directions can change. */
+  private followPositions(): void {
+    if (this.mini.nodes().empty()) return
+    let moved = false
+    this.mini.batch(() => {
+      this.mini.nodes().forEach((m) => {
+        const n = this.main.getElementById(m.id())
+        if (n.empty()) return
+        const p = n.position()
+        const q = m.position()
+        if (p.x === q.x && p.y === q.y) return
+        m.position({ x: p.x, y: p.y })
+        moved = true
+      })
+      if (!moved) return
+      // Which way a link flows can flip when a node is dragged past its
+      // neighbour, and the elbow direction is styled off that class.
+      this.mini.edges().forEach((e) => {
+        e.toggleClass('back', e.target().position().x < e.source().position().x)
+      })
+    })
+    if (!moved) return
+    this.fitToPositions()
+    this.applyScale()
+    this.updateRect()
   }
 
   /** Re-frame the existing elements at the container's current size. Cheap enough
@@ -259,6 +302,8 @@ export class Minimap {
   destroy(): void {
     this.main.off('pan zoom resize render', this.onViewport)
     this.main.off('layoutstop', this.onLayout)
+    this.main.off('position', 'node', this.onNodePosition)
+    if (this.followFrame) cancelAnimationFrame(this.followFrame)
     window.removeEventListener('mousemove', this.onWinMove)
     window.removeEventListener('mouseup', this.onWinUp)
     this.mini.destroy()

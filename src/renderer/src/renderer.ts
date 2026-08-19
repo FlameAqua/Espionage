@@ -59,10 +59,14 @@ function showError(err: unknown): void {
       <div class="text-red-400 text-sm max-w-lg">Loading failed: ${String((err as Error)?.message ?? err)}</div>
       <button id="back" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm">Back to login</button>
     </div>`
-  root.querySelector('#back')!.addEventListener('click', () => showLogin())
+  root.querySelector('#back')!.addEventListener('click', () => void showLogin())
 }
 
-function showLogin(prefill?: { baseUrl?: string; username?: string }): void {
+async function showLogin(prefill?: { baseUrl?: string; username?: string }): Promise<void> {
+  // Adding a system, or switching to one whose password has to be typed again,
+  // both land here with a session still running behind them. Offer the way back
+  // rather than making a mis-click cost a sign-in.
+  const connected = await window.api.threecx.isConnected().catch(() => false)
   renderLogin(
     root,
     async (req: ConnectRequest): Promise<string | null> => {
@@ -72,19 +76,44 @@ function showLogin(prefill?: { baseUrl?: string; username?: string }): void {
       return null
     },
     () => void openSnapshot(),
-    prefill
+    prefill,
+    connected ? goBackToCurrent : undefined
   )
 }
+
+/** Return to the system that was on screen when the login form was opened. The
+ *  topology it was built from is still in hand, so this is a re-render rather
+ *  than a refetch — and it restores the view the system was left in. */
+function goBackToCurrent(): void {
+  if (lastTopology && lastTopology.baseUrl === currentBaseUrl) {
+    renderApp(root, lastTopology, liveCallbacks(), undefined, viewStates.get(currentBaseUrl))
+    return
+  }
+  void loadAndShow()
+}
+
+/** Where each system was left: layout, focus, department, camera. Switching away
+ *  and back should land you where you were rather than at the top of the graph —
+ *  the sessions themselves are kept side by side, so the views should be too.
+ *  In memory only; a relaunch starts every system fresh. */
+const viewStates = new Map<string, ViewState>()
+/** The system currently on screen, so its view can be filed under the right key
+ *  when the user switches away from it. */
+let currentBaseUrl: string | undefined
+/** What that system was last drawn from, so stepping back out of the login
+ *  screen doesn't have to refetch it. */
+let lastTopology: Topology | undefined
 
 /** Show another system: switch to it if it's already connected, otherwise take
  *  the user to the login screen with its details filled in. Passwords are never
  *  stored, so an unconnected system always needs one. */
-async function switchSystem(baseUrl: string): Promise<void> {
+async function switchSystem(baseUrl: string, leaving?: ViewState): Promise<void> {
+  if (currentBaseUrl && leaving) viewStates.set(currentBaseUrl, leaving)
   if (await window.api.threecx.switchTo(baseUrl)) {
     await loadAndShow()
     return
   }
-  showLogin({ baseUrl, username: loadSystems().find((s) => s.baseUrl === baseUrl)?.username })
+  void showLogin({ baseUrl, username: loadSystems().find((s) => s.baseUrl === baseUrl)?.username })
 }
 
 /** Callbacks for a live (connected) session. */
@@ -94,8 +123,11 @@ function liveCallbacks(): AppCallbacks {
     onDisconnect: () => void disconnect(),
     onOpenSnapshot: () => void openSnapshot(),
     onRefresh: (state) => softRefresh(state), // soft refresh → keep view
-    onSwitchSystem: (baseUrl) => void switchSystem(baseUrl),
-    onAddSystem: () => showLogin({ baseUrl: '', username: '' })
+    onSwitchSystem: (baseUrl, state) => void switchSystem(baseUrl, state),
+    onAddSystem: (state) => {
+      if (currentBaseUrl) viewStates.set(currentBaseUrl, state)
+      void showLogin({ baseUrl: '', username: '' })
+    }
   }
 }
 
@@ -113,7 +145,13 @@ async function loadAndShow(reauth = false): Promise<void> {
     return
   }
   stop()
-  renderApp(root, topology, liveCallbacks(), focusFromHash())
+  currentBaseUrl = topology.baseUrl
+  lastTopology = topology
+  // A hard refresh is a deliberate "start again", so it drops the saved view;
+  // arriving at a system any other way puts back where you left it.
+  const restore = reauth ? undefined : viewStates.get(topology.baseUrl)
+  if (reauth) viewStates.delete(topology.baseUrl)
+  renderApp(root, topology, liveCallbacks(), restore ? undefined : focusFromHash(), restore)
 }
 
 /** Soft refresh: refetch in the background (no full-screen loader) and rebuild
@@ -124,6 +162,8 @@ async function softRefresh(state: ViewState): Promise<void> {
     const topology = await window.api.threecx.fetchTopology({
       includeQueueLogins: readQueueLogins()
     })
+    lastTopology = topology
+    currentBaseUrl = topology.baseUrl
     renderApp(root, topology, liveCallbacks(), undefined, state)
   } catch (err) {
     notify(`Refresh failed: ${(err as Error).message}`, true)
@@ -134,7 +174,7 @@ async function softRefresh(state: ViewState): Promise<void> {
 function snapshotCallbacks(topology: Topology): AppCallbacks {
   return {
     onReload: () => showSnapshot(topology),
-    onDisconnect: () => showLogin(),
+    onDisconnect: () => void showLogin(),
     onOpenSnapshot: () => void openSnapshot(),
     // No live server to refetch from — just re-render, preserving the view.
     onRefresh: async (state) =>
@@ -143,6 +183,11 @@ function snapshotCallbacks(topology: Topology): AppCallbacks {
 }
 
 function showSnapshot(topology: Topology): void {
+  // A snapshot is read offline and isn't a system you can switch back to, so it
+  // must not have its view filed under whichever system was last on screen —
+  // nor be what "back" from the login screen returns to.
+  currentBaseUrl = undefined
+  lastTopology = undefined
   renderApp(root, topology, snapshotCallbacks(topology))
 }
 
@@ -176,12 +221,16 @@ async function disconnect(): Promise<void> {
   const sessions = await window.api.threecx.sessions()
   const active = sessions.find((s) => s.active)
   await window.api.threecx.disconnect(active?.baseUrl)
+  // Signing out ends the session, so the view it was left in goes with it.
+  if (active?.baseUrl) viewStates.delete(active.baseUrl)
+  currentBaseUrl = undefined
+  lastTopology = undefined
   window.location.hash = ''
   if (await window.api.threecx.isConnected()) {
     await loadAndShow()
     return
   }
-  showLogin()
+  void showLogin()
 }
 
 async function start(): Promise<void> {
@@ -194,7 +243,7 @@ async function start(): Promise<void> {
   } catch {
     /* fall through to login */
   }
-  showLogin()
+  void showLogin()
 }
 
 // Listen for auto-update events (toast lives on document.body, so it survives

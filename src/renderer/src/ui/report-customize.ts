@@ -71,12 +71,12 @@ export interface ReportCustomize {
   charts: BreakdownChart[]
   /** Per-section chart style (for the styleable non-breakdown sections). */
   styles: Partial<Record<SectionId, ChartStyle>>
-  /** Show the estimated per-zone call cost. Off by default — it's internal, not
-   *  something to put in front of customers. */
+  /** Show the estimated per-zone call cost. Off by default. */
   showZoneCost: boolean
-  /** Bundle every section's chart into the exported PDF (for sending to
-   *  customers), regardless of what's on screen. */
-  includeAllChartsInPdf: boolean
+  /** Carry the drill-downs — the call-log rows behind each extension and each
+   *  queue — into the exported file. Off by default: it's the working detail
+   *  that explains the figures, and on a busy month it dwarfs the report. */
+  exportAllDetails: boolean
 }
 
 const KEY = 'espionage.reportCustomize'
@@ -94,7 +94,7 @@ export function defaultReportCustomize(): ReportCustomize {
     ],
     styles: { callTime: 'donut', zones: 'bar' },
     showZoneCost: false,
-    includeAllChartsInPdf: true
+    exportAllDetails: false
   }
 }
 
@@ -130,7 +130,7 @@ export function loadReportCustomize(): ReportCustomize {
     charts,
     styles: { ...base.styles, ...(saved.styles ?? {}) },
     showZoneCost: saved.showZoneCost ?? base.showZoneCost,
-    includeAllChartsInPdf: saved.includeAllChartsInPdf ?? base.includeAllChartsInPdf
+    exportAllDetails: saved.exportAllDetails ?? base.exportAllDetails
   }
 }
 

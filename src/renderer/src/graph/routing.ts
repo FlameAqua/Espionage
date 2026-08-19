@@ -1,4 +1,4 @@
-import type { Core } from 'cytoscape'
+import type { Core, EdgeCollection } from 'cytoscape'
 
 // Deciding how a link gets from one node to another.
 //
@@ -15,8 +15,14 @@ import type { Core } from 'cytoscape'
 // than a spray of diagonals. The only thing chosen per link is WHERE in the gap
 // it turns, which is what lets it dodge the nodes in between.
 //
-// Links whose ends overlap horizontally have no gap to turn in; those fall back
-// to a single bowed curve, which also marks them out as the odd ones.
+// Links whose ends overlap horizontally have no gap between them to turn in —
+// dragging a node directly above or below the ones it connects to puts every one
+// of its links in that state. Rather than give up and bow them all across each
+// other, those take a lane down one side: out of the facing side of the source,
+// along a clear vertical lane past both nodes, and back in horizontally to the
+// same side of the target. It is the same rule read sideways, so a stack of
+// links still reads as a bundle. Only when there is no vertical gap either (two
+// nodes practically on top of each other) does a link fall back to a bow.
 
 export interface Pt {
   x: number
@@ -32,6 +38,9 @@ export interface Box {
 export type Route =
   /** An elbow: out to `turn` px past the source's facing edge, then across. */
   | { kind: 'taxi'; direction: 'rightward' | 'leftward'; turn: number }
+  /** A polyline through `points` (model coordinates), for links whose ends
+   *  overlap horizontally and so route around one side instead. */
+  | { kind: 'segments'; points: Pt[] }
   /** A single bow, `offset` px perpendicular to the straight line. */
   | { kind: 'bezier'; offset: number }
   /** Leave it alone. */
@@ -47,6 +56,9 @@ const MIN_GAP = TURN_INSET * 2 + 10
 /** Where in the gap to try turning, as fractions of the usable span. Middle
  *  first: that is the tidiest and, with dagre's rank separation, usually clear. */
 const TURN_TRIES = [0.5, 0.35, 0.65, 0.22, 0.78, 0.1, 0.9]
+/** How far past the outer edge of the two nodes a side lane is tried, nearest
+ *  first — a lane hugging the pair is the tidiest one that works. */
+const LANE_TRIES = [26, 46, 74, 112, 160, 220, 300]
 /** Bow sizes tried, as multiples of what the geometry says is needed. */
 const BOW_TRIES = [1, 1.5, 2.2, 3]
 
@@ -112,6 +124,101 @@ function pickTurn(src: Box, tgt: Box, obstacles: Box[], margin: number): number 
   }
   // Nothing was completely clear; the least-bad turn still beats a diagonal.
   return best
+}
+
+/** Obstacles the three legs of a side lane run through: out of the facing side
+ *  of the source, down (or up) the lane, back in to the same side of the target. */
+function laneHits(
+  src: Box,
+  tgt: Box,
+  laneX: number,
+  right: boolean,
+  obstacles: Box[],
+  margin: number
+): number {
+  const fromY = (src.y1 + src.y2) / 2
+  const toY = (tgt.y1 + tgt.y2) / 2
+  const sx = right ? src.x2 : src.x1
+  const tx = right ? tgt.x2 : tgt.x1
+  let n = 0
+  for (const b of obstacles) {
+    if (
+      hLineHits(fromY, sx, laneX, b, margin) ||
+      vLineHits(laneX, fromY, toY, b, margin) ||
+      hLineHits(toY, laneX, tx, b, margin)
+    )
+      n++
+  }
+  return n
+}
+
+/**
+ * The two bend points of a lane down one side, for a pair whose ends overlap
+ * horizontally. Null when there isn't a vertical gap to run along either.
+ *
+ * Both sides are tried at each distance, nearest first, so the lane that lands
+ * is the closest clear one. Which side is tried first only settles the ties: the
+ * side the link already leans towards, since that is the shorter way round.
+ */
+function pickSideLane(src: Box, tgt: Box, obstacles: Box[], margin: number): Pt[] | null {
+  const vGap = Math.max(tgt.y1 - src.y2, src.y1 - tgt.y2)
+  if (vGap < MIN_GAP) return null
+  const fromY = (src.y1 + src.y2) / 2
+  const toY = (tgt.y1 + tgt.y2) / 2
+  const rightEdge = Math.max(src.x2, tgt.x2)
+  const leftEdge = Math.min(src.x1, tgt.x1)
+  const lean = (tgt.x1 + tgt.x2) / 2 - (src.x1 + src.x2) / 2
+  // Level ends go right: the graph flows left to right, so the right-hand side
+  // is where a reader already expects links to run.
+  const sides = lean < 0 ? [false, true] : [true, false]
+
+  let best: Pt[] | null = null
+  let bestHits = Infinity
+  for (const d of LANE_TRIES) {
+    for (const right of sides) {
+      const laneX = right ? rightEdge + d : leftEdge - d
+      const hits = laneHits(src, tgt, laneX, right, obstacles, margin)
+      const pts: Pt[] = [
+        { x: laneX, y: fromY },
+        { x: laneX, y: toY }
+      ]
+      if (hits === 0) return pts
+      if (hits < bestHits) {
+        bestHits = hits
+        best = pts
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * Express absolute points as the (weight, distance) pairs cytoscape's `segments`
+ * curve style takes: a fraction along the line from `p1` to `p2`, and a
+ * perpendicular offset from it. The normal matches `controlPoint`'s, which is
+ * what cytoscape uses for both — see findSegmentsPoints. `p1` and `p2` must be
+ * the node POSITIONS, which is why routed links also set edge-distances.
+ */
+export function segmentSpec(
+  p1: Pt,
+  p2: Pt,
+  points: Pt[]
+): { weights: number[]; distances: number[] } {
+  const dx = p2.x - p1.x
+  const dy = p2.y - p1.y
+  const len2 = dx * dx + dy * dy
+  const len = Math.sqrt(len2) || 1
+  const nx = -dy / len
+  const ny = dx / len
+  const weights: number[] = []
+  const distances: number[] = []
+  for (const p of points) {
+    const vx = p.x - p1.x
+    const vy = p.y - p1.y
+    weights.push(len2 ? (vx * dx + vy * dy) / len2 : 0)
+    distances.push(vx * nx + vy * ny)
+  }
+  return { weights, distances }
 }
 
 /** The control point cytoscape places for `unbundled-bezier` with a single
@@ -234,8 +341,7 @@ export function routeEdge(
   opts: { margin?: number } = {}
 ): Route {
   const margin = opts.margin ?? MARGIN
-  // Which way does this link flow? Anything with horizontally overlapping ends
-  // has no gap to turn in, and drops through to a bow.
+  // Which way does this link flow?
   if (tgt.x1 - src.x2 >= MIN_GAP) {
     const turn = pickTurn(src, tgt, obstacles, margin)
     if (turn != null) return { kind: 'taxi', direction: 'rightward', turn }
@@ -243,9 +349,16 @@ export function routeEdge(
     const turn = pickTurn(flipBox(src), flipBox(tgt), obstacles.map(flipBox), margin)
     if (turn != null) return { kind: 'taxi', direction: 'leftward', turn }
   }
+  // No gap between the ends to turn in. A clear line still needs nothing done to
+  // it; one that runs through something takes a lane down whichever side is
+  // clear, and only falls back to a bow when there is no vertical gap to run
+  // along either.
   const centre = (b: Box): Pt => ({ x: (b.x1 + b.x2) / 2, y: (b.y1 + b.y2) / 2 })
   const offset = detourOffset(centre(src), centre(tgt), obstacles, { margin })
-  return offset ? { kind: 'bezier', offset } : { kind: 'straight' }
+  if (!offset) return { kind: 'straight' }
+  const points = pickSideLane(src, tgt, obstacles, margin)
+  if (points) return { kind: 'segments', points }
+  return { kind: 'bezier', offset }
 }
 
 // --- Applying a route to a live graph ---------------------------------------
@@ -253,7 +366,7 @@ export function routeEdge(
 /** Every style property routing sets, so switching it off puts the stylesheet
  *  back rather than leaving half a route behind. */
 export const ROUTE_STYLE_PROPS =
-  'curve-style control-point-distances control-point-weights taxi-direction taxi-turn taxi-radius taxi-turn-min-distance'
+  'curve-style control-point-distances control-point-weights taxi-direction taxi-turn taxi-radius taxi-turn-min-distance segment-distances segment-weights segment-radii edge-distances'
 
 /** Above this much work the search costs more than the mess it tidies, so links
  *  are left as the stylesheet draws them. (edges x nodes, both visible.) */
@@ -265,15 +378,20 @@ const DEFAULT_BUDGET = 4_000_000
  *
  * Loops have their own arc, and split routes are already fanned apart by the
  * bundling, so both are left alone.
+ *
+ * `only` narrows which links are re-routed (the obstacle set is always every
+ * node): mid-drag, the links hanging off the node being moved are the ones that
+ * have to keep up, and re-routing the whole graph every frame would not.
  */
 export function applyEdgeRoutes(
   cy: Core,
   enabled: boolean,
-  opts: { radius?: number; budget?: number } = {}
+  opts: { radius?: number; budget?: number; only?: EdgeCollection } = {}
 ): void {
-  const edges = cy
-    .edges()
-    .filter((e) => !e.hasClass('hidden') && !e.isLoop() && !e.hasClass('route-split'))
+  const pool = opts.only ?? cy.edges()
+  const edges = pool.filter(
+    (e) => !e.hasClass('hidden') && !e.isLoop() && !e.hasClass('route-split')
+  )
   if (edges.empty()) return
   const reset = (): void => {
     cy.batch(() => {
@@ -318,6 +436,7 @@ export function applyEdgeRoutes(
       )
       const route = routeEdge(sb, tb, obstacles)
       if (route.kind === 'taxi') {
+        e.removeStyle('segment-distances segment-weights segment-radii edge-distances')
         e.style({
           'curve-style': 'round-taxi',
           'taxi-direction': route.direction,
@@ -325,7 +444,23 @@ export function applyEdgeRoutes(
           'taxi-turn-min-distance': 8,
           'taxi-radius': radius
         })
+      } else if (route.kind === 'segments') {
+        e.removeStyle('taxi-direction taxi-turn taxi-radius taxi-turn-min-distance')
+        const p1 = { x: (sb.x1 + sb.x2) / 2, y: (sb.y1 + sb.y2) / 2 }
+        const p2 = { x: (tb.x1 + tb.x2) / 2, y: (tb.y1 + tb.y2) / 2 }
+        const { weights, distances } = segmentSpec(p1, p2, route.points)
+        e.style({
+          'curve-style': 'round-segments',
+          // The weights and distances above are measured from the node centres,
+          // so the style has to be told to read them the same way — cytoscape
+          // otherwise measures from the border intersections.
+          'edge-distances': 'node-position',
+          'segment-weights': weights.map((w) => w.toFixed(4)).join(' '),
+          'segment-distances': distances.map((d) => d.toFixed(1)).join(' '),
+          'segment-radii': String(radius)
+        })
       } else if (route.kind === 'bezier') {
+        e.removeStyle('segment-distances segment-weights segment-radii edge-distances')
         e.removeStyle('taxi-direction taxi-turn taxi-radius taxi-turn-min-distance')
         e.style({
           'curve-style': 'unbundled-bezier',

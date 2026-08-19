@@ -36,12 +36,21 @@ import { EgoMap } from './egomap'
 import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
 import { auditTopology, groupFindings } from '../graph/audit'
+import {
+  buildDeepIndex,
+  countFields,
+  DEEP_COLLECTIONS,
+  searchDeep,
+  snippet,
+  type DeepHit,
+  type DeepSearchResult
+} from '../graph/deep-search'
 import { UndoManager } from './history'
 import { openReport, readHomeCountry, showLiveReport, writeHomeCountry } from './report'
 import { showReportSetup } from './report-setup'
 import { mountReportTray, type ReportTray } from './report-tray'
 import type { DnKind, ReportContext, ReportTarget } from './report-context'
-import { loadSystems, systemLabel } from './systems'
+import { forgetSystem, loadSystems, systemLabel } from './systems'
 import { readDefaultLayout, readEdgeRouting, readLastLayout, writeLastLayout } from './prefs'
 import { hidePopover, playExit, reducedMotion, showPopover, tween } from './motion'
 import { ICONS } from './icons'
@@ -71,9 +80,11 @@ export interface AppCallbacks {
   onDisconnect: () => void
   onOpenSnapshot: () => void
   /** Show another connected system, or sign into a new one. Absent when viewing
-   *  a snapshot offline, where there's nothing to switch between. */
-  onSwitchSystem?: (baseUrl: string) => void
-  onAddSystem?: () => void
+   *  a snapshot offline, where there's nothing to switch between. `state` is the
+   *  view being left behind, so it can be put back when this system comes round
+   *  again. */
+  onSwitchSystem?: (baseUrl: string, state: ViewState) => void
+  onAddSystem?: (state: ViewState) => void
   /** Soft refresh: re-fetch, then rebuild preserving the captured view state. */
   onRefresh: (state: ViewState) => Promise<void>
 }
@@ -97,6 +108,49 @@ interface DidRow {
   did: string
   name: string
   dests: string[]
+}
+
+/** One extension as the status table needs it: everything sortable already
+ *  worked out, so ordering never has to re-read the raw 3CX record. */
+interface ExtStatusRow {
+  node: GraphNode
+  number: string
+  name: string
+  presence: string
+  presenceColor?: string
+  queue: {
+    state: 'in' | 'out' | 'partial' | 'unknown'
+    /** What the cell reads, and what goes in the CSV. */
+    text: string
+    /** Tooltip — the per-queue breakdown, or why 3CX says it's signed out. */
+    detail: string
+  }
+  depts: string
+}
+
+/** Most records a deep search reports on, and most matching fields shown per
+ *  record. A bare term like "3" matches nearly everything; the caps keep that
+ *  from rendering a page-long wall instead of an answer. */
+const DEEP_LIMIT = 400
+const DEEP_PER_RECORD = 12
+
+/** One column of a sortable table panel. */
+interface TableColumn<T> {
+  key: string
+  label: string
+  /** Header tooltip. */
+  title?: string
+  /** Classes applied to both the header and every cell in the column. */
+  cls?: string
+  /** What the column sorts on. Strings compare naturally (so ext 9 precedes
+   *  ext 10); numbers compare numerically, which is how a status column orders
+   *  itself by state rather than alphabetically. */
+  sort: (r: T) => string | number
+  /** The cell's inner HTML (already escaped by the caller). */
+  cell: (r: T) => string
+  csv: (r: T) => string
+  /** What the search box matches on, when that differs from the CSV value. */
+  search?: (r: T) => string
 }
 
 /** Pixel sizes of the resizable chrome, persisted between launches. */
@@ -1104,6 +1158,17 @@ export function renderApp(
     ctxEl.append(item(ICONS.target, 'Focus here', () => enterFocus(node.id)))
     ctxEl.append(item(ICONS.compass, 'Trace call flow', () => showTracePanel(node)))
     ctxEl.append(
+      item(ICONS.window, 'Open in new window', () =>
+        window.api.app.openWindow(`#focus=${encodeURIComponent(node.id)}`)
+      )
+    )
+    if (threecxUrl(baseUrl, node))
+      ctxEl.append(
+        item(ICONS.external, 'Open in 3CX', () => window.api.app.openExternal(threecxUrl(baseUrl, node)!))
+      )
+    // Hide sits below the ways of looking at a node rather than among them: it's
+    // the one entry here that changes the graph.
+    ctxEl.append(
       item(ICONS.hide, 'Hide', () => {
         // Hiding the node the view is focused on would leave the focus centred on
         // nothing, so drop back to the whole graph first.
@@ -1122,15 +1187,6 @@ export function renderApp(
         flash('Node hidden - undo with Ctrl+Z.')
       })
     )
-    ctxEl.append(
-      item(ICONS.window, 'Open in new window', () =>
-        window.api.app.openWindow(`#focus=${encodeURIComponent(node.id)}`)
-      )
-    )
-    if (threecxUrl(baseUrl, node))
-      ctxEl.append(
-        item(ICONS.external, 'Open in 3CX', () => window.api.app.openExternal(threecxUrl(baseUrl, node)!))
-      )
     // Copy actions, grouped below a divider so they're easy to pick out.
     ctxEl.append(divider())
     ctxEl.append(item(ICONS.copy, 'Copy name', () => window.api.app.copy(node.label)))
@@ -1605,6 +1661,9 @@ export function renderApp(
     key: string
     shift?: boolean
     label: string
+    /** Extra words the command palette matches on, for a command whose name
+     *  isn't what someone would think to type. */
+    keywords?: string
     run: () => void
   }
   const shortcuts: Shortcut[] = [
@@ -1619,6 +1678,16 @@ export function renderApp(
     { key: 'h', label: 'Health check', run: () => showAuditPanel() },
     { key: 'x', label: 'Extensions', run: () => showExtensionsPanel() },
     { key: 'd', label: 'DID table', run: () => showDidTable() },
+    {
+      key: 'f',
+      shift: true,
+      label: 'Deep system search',
+      keywords: 'raw json metadata configuration fields everything grep',
+      // Ctrl+F finds a node; Ctrl+Shift+F goes deeper, into the configuration
+      // behind it. Whatever is in the node search box seeds it, so widening a
+      // fruitless search doesn't mean typing it again.
+      run: () => showDeepSearchPanel(searchEl.value)
+    },
     { key: 'c', shift: true, label: 'Compare snapshot', run: () => void showSnapshotDiff() },
     { key: 'g', label: 'Generate report', run: () => showReportSetup(reportCtx) },
     { key: 'l', label: 'Live report', run: () => void showLiveReport(reportCtx) },
@@ -1653,6 +1722,7 @@ export function renderApp(
       title: s.label,
       group: paletteGroupFor(s.label),
       accel: accel(s),
+      keywords: s.keywords,
       run: s.run
     }))
     // View controls, which are mouse-only otherwise.
@@ -1940,6 +2010,7 @@ export function renderApp(
     menuEl.append(item(ICONS.pulse, 'Health check', showAuditPanel))
     menuEl.append(item(ICONS.people, 'Extensions', showExtensionsPanel))
     menuEl.append(item(ICONS.table, 'DID table', showDidTable))
+    menuEl.append(item(ICONS.search, 'Deep system search', () => showDeepSearchPanel()))
     // Reports — call-activity reporting.
     menuEl.append(section('Reports'))
     menuEl.append(item(ICONS.chart, 'Generate report', () => showReportSetup(reportCtx)))
@@ -1990,10 +2061,12 @@ export function renderApp(
       label: string,
       sub: string,
       onPick: () => void,
-      opts: { active?: boolean; muted?: boolean } = {}
+      opts: { active?: boolean; muted?: boolean; onForget?: () => void } = {}
     ): HTMLElement => {
+      // A row is a button, so the forget control can't be one too — it's a span
+      // acting as one, with the click stopped before it reaches the row.
       const b = document.createElement('button')
-      b.className = `w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 ${
+      b.className = `w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 group ${
         opts.active ? 'bg-slate-100 dark:bg-slate-700/60' : ''
       }`
       b.innerHTML = `<div class="flex items-center gap-2">
@@ -2002,8 +2075,14 @@ export function renderApp(
           <span class="block text-xs truncate ${opts.muted ? 'text-slate-500' : ''}">${esc(label)}</span>
           <span class="block text-[10px] text-slate-400 truncate">${esc(sub)}</span>
         </span>
+        ${opts.onForget ? `<span data-forget role="button" tabindex="0" title="Forget this system" class="shrink-0 w-5 h-5 grid place-items-center rounded text-slate-400 opacity-0 group-hover:opacity-100 hover:bg-slate-200 dark:hover:bg-slate-600 hover:text-red-500">✕</span>` : ''}
       </div>`
-      b.addEventListener('click', () => {
+      b.addEventListener('click', (e) => {
+        if (opts.onForget && (e.target as HTMLElement).closest('[data-forget]')) {
+          e.stopPropagation()
+          opts.onForget()
+          return
+        }
         hidePopover(systemMenu)
         onPick()
       })
@@ -2012,23 +2091,41 @@ export function renderApp(
     systemMenu.replaceChildren()
     for (const sess of sessions)
       systemMenu.append(
-        row(systemLabel(sess.baseUrl), sess.username, () => cb.onSwitchSystem?.(sess.baseUrl), {
-          active: sess.active
-        })
+        row(
+          systemLabel(sess.baseUrl),
+          sess.username,
+          () => cb.onSwitchSystem?.(sess.baseUrl, captureState()),
+          { active: sess.active }
+        )
       )
     // Signed into before but not currently connected — picking one takes you to
     // the login screen with the fields filled in, since passwords aren't stored.
+    // These are the ones that can be forgotten: a connected system would stay on
+    // the list anyway (it's a live session), so dropping it from the remembered
+    // ones there would look like nothing happened.
     for (const k of known.filter((k) => !connected.has(k.baseUrl)))
       systemMenu.append(
-        row(systemLabel(k.baseUrl), `${k.username} · sign in again`, () => cb.onSwitchSystem?.(k.baseUrl), {
-          muted: true
-        })
+        row(
+          systemLabel(k.baseUrl),
+          `${k.username} · sign in again`,
+          () => cb.onSwitchSystem?.(k.baseUrl, captureState()),
+          {
+            muted: true,
+            onForget: () => {
+              forgetSystem(k.baseUrl)
+              flash(`Forgot ${systemLabel(k.baseUrl)}.`)
+              void buildSystemMenu()
+            }
+          }
+        )
       )
     if (cb.onAddSystem) {
       const sep = document.createElement('div')
       sep.className = 'my-1 border-t border-slate-200 dark:border-slate-700'
       systemMenu.append(sep)
-      systemMenu.append(row('Add a system…', 'Sign in to another 3CX', () => cb.onAddSystem?.()))
+      systemMenu.append(
+        row('Add a system…', 'Sign in to another 3CX', () => cb.onAddSystem?.(captureState()))
+      )
     }
   }
   systemBtn.addEventListener('click', (e) => {
@@ -2214,6 +2311,111 @@ export function renderApp(
     wireNav()
   }
 
+  // --- Sortable, searchable table panel ------------------------------------
+  // Shared by the DID and extension tables: both are inventories you come to
+  // with a question ("who is signed out?", "where does this number land?"), so
+  // both want the same three things — find, order, and take away as a CSV.
+  const showTablePanel = <T>(opts: {
+    title: string
+    /** Filename stem for the CSV export. */
+    csvName: string
+    rows: T[]
+    columns: TableColumn<T>[]
+    placeholder: string
+    /** Shown above the table, recomputed for whatever is currently on show. */
+    summary?: (shown: T[]) => string
+    /** Shown instead of the table when there are no rows at all. */
+    empty: string
+    /** Column sorted on when the panel opens. */
+    sortKey: string
+  }): void => {
+    if (!opts.rows.length) {
+      panelShell(opts.title, `<p class="text-slate-500 dark:text-slate-400">${esc(opts.empty)}</p>`)
+      return
+    }
+    let sortKey = opts.sortKey
+    let desc = false
+    let search = ''
+    const textOf = (r: T, c: TableColumn<T>): string => (c.search ?? c.csv)(r)
+
+    const shownRows = (): T[] => {
+      const q = search.trim().toLowerCase()
+      const matched = q
+        ? opts.rows.filter((r) => opts.columns.some((c) => textOf(r, c).toLowerCase().includes(q)))
+        : [...opts.rows]
+      const col = opts.columns.find((c) => c.key === sortKey) ?? opts.columns[0]
+      matched.sort((a, b) => {
+        const av = col.sort(a)
+        const bv = col.sort(b)
+        const n =
+          typeof av === 'number' && typeof bv === 'number'
+            ? av - bv
+            : String(av).localeCompare(String(bv), undefined, { numeric: true })
+        return desc ? -n : n
+      })
+      return matched
+    }
+
+    const draw = (): void => {
+      const rows = shownRows()
+      const head = opts.columns
+        .map((c) => {
+          const active = c.key === sortKey
+          const arrow = active ? (desc ? ' ▼' : ' ▲') : ''
+          const title = c.title ? ` title="${esc(c.title)}"` : ''
+          return `<th class="pr-2 pb-1 font-medium ${c.cls ?? ''}"${title}><button data-sort="${esc(c.key)}" class="hover:text-slate-600 dark:hover:text-slate-200 ${active ? 'text-slate-600 dark:text-slate-200' : ''}">${esc(c.label)}${arrow}</button></th>`
+        })
+        .join('')
+      const body = rows
+        .map(
+          (r) =>
+            `<tr class="border-t border-slate-100 dark:border-slate-700/50 align-top">${opts.columns
+              .map((c) => `<td class="py-1 pr-2 ${c.cls ?? ''}">${c.cell(r)}</td>`)
+              .join('')}</tr>`
+        )
+        .join('')
+      const none = `<tr><td colspan="${opts.columns.length}" class="py-2 text-slate-400">Nothing matches “${esc(search)}”.</td></tr>`
+      tableWrap.innerHTML = `${opts.summary ? `<p class="text-[11px] text-slate-400 mb-1.5">${opts.summary(rows)}</p>` : ''}
+        <div class="overflow-x-auto"><table class="w-full text-[11px]">
+          <thead><tr class="text-left text-slate-400">${head}</tr></thead>
+          <tbody>${body || none}</tbody>
+        </table></div>`
+      wireNav()
+    }
+
+    const body = `
+      <input id="tableSearch" type="text" placeholder="${esc(opts.placeholder)}" class="w-full mb-2 px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-[11px]" />
+      <div id="tableWrap"></div>`
+    const actions = `<button id="tableCsv" class="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-[11px]">Export CSV</button>`
+    panelShell(`${opts.title} - ${opts.rows.length}`, body, actions)
+    const tableWrap = panel.querySelector<HTMLElement>('#tableWrap')!
+    draw()
+
+    panel.querySelector<HTMLInputElement>('#tableSearch')!.addEventListener('input', (e) => {
+      search = (e.target as HTMLInputElement).value
+      draw()
+    })
+    // Header clicks sort; clicking the column already sorted on reverses it.
+    tableWrap.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-sort]')
+      if (!btn) return
+      const key = btn.dataset.sort!
+      desc = key === sortKey ? !desc : false
+      sortKey = key
+      draw()
+    })
+    // The CSV is what's on screen — the same search and order — since that's
+    // the selection the user just made.
+    panel.querySelector('#tableCsv')!.addEventListener('click', () =>
+      downloadCsv(
+        opts.csvName,
+        opts.columns.map((c) => c.label),
+        shownRows().map((r) => opts.columns.map((c) => c.csv(r))),
+        host
+      )
+    )
+  }
+
   // --- DID routing table --------------------------------------------------
   const showDidTable = (): void => {
     const rows: DidRow[] = graph.nodes
@@ -2229,37 +2431,48 @@ export function renderApp(
             return t ? (t.number ? `${t.label} (${t.number})` : t.label) : e.target
           })
       }))
-      .sort((a, b) => a.did.localeCompare(b.did))
-    const bodyRows = rows
-      .map(
-        (r) => `
-        <tr class="border-t border-slate-100 dark:border-slate-700/50 align-top">
-          <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(r.did || '-')}</td>
-          <td class="py-1 pr-2"><button data-nav="${esc(r.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(r.name)}</button></td>
-          <td class="py-1">${r.dests.length ? esc(r.dests.join(', ')) : '<span class="text-amber-500">nowhere</span>'}</td>
-        </tr>`
-      )
-      .join('')
-    const body = `<div class="overflow-x-auto"><table class="w-full text-[11px]"><thead><tr class="text-left text-slate-400"><th class="pr-2 font-medium">DID</th><th class="pr-2 font-medium">Rule</th><th class="font-medium">Routes to</th></tr></thead><tbody>${bodyRows || '<tr><td colspan="3" class="py-2 text-slate-400">No inbound rules.</td></tr>'}</tbody></table></div>`
-    const actions = rows.length
-      ? `<button id="didCsv" class="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-[11px]">Export CSV</button>`
-      : ''
-    panelShell(`DID routing - ${rows.length}`, body, actions)
-    wireNav()
-    panel.querySelector('#didCsv')?.addEventListener('click', () => exportDidCsv(rows, host))
+    showTablePanel<DidRow>({
+      title: 'DID routing',
+      csvName: 'dids',
+      rows,
+      placeholder: 'Search DIDs, rules and destinations…',
+      empty: 'No inbound rules.',
+      sortKey: 'did',
+      columns: [
+        {
+          key: 'did',
+          label: 'DID',
+          cls: 'font-mono whitespace-nowrap',
+          sort: (r) => r.did,
+          cell: (r) => esc(r.did || '-'),
+          csv: (r) => r.did
+        },
+        {
+          key: 'name',
+          label: 'Rule',
+          sort: (r) => r.name,
+          cell: (r) =>
+            `<button data-nav="${esc(r.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(r.name)}</button>`,
+          csv: (r) => r.name
+        },
+        {
+          key: 'dests',
+          label: 'Routes to',
+          sort: (r) => r.dests.join(', '),
+          cell: (r) =>
+            r.dests.length
+              ? esc(r.dests.join(', '))
+              : '<span class="text-amber-500">nowhere</span>',
+          csv: (r) => r.dests.join('; ')
+        }
+      ]
+    })
   }
 
   // --- Extension status ---------------------------------------------------
   // Every extension with its live presence and whether it's logged in to queues,
   // so an agent who's quietly signed out is easy to spot.
   const showExtensionsPanel = (): void => {
-    const rows = graph.nodes
-      .filter((n) => n.kind === 'user')
-      .sort((a, b) => (a.number ?? '').localeCompare(b.number ?? '', undefined, { numeric: true }))
-    if (!rows.length) {
-      panelShell('Extensions', `<p class="text-slate-500 dark:text-slate-400">No extensions.</p>`)
-      return
-    }
     // Agent links per extension, so the queue column can report per-queue logins
     // (3CX v20 lets an agent be logged out of one queue but not another).
     const agentEdgesByUser = new Map<string, typeof graph.edges>()
@@ -2269,71 +2482,320 @@ export function renderApp(
       if (list) list.push(e)
       else agentEdgesByUser.set(e.target, [e])
     }
-    const queueTotals = { in: 0, out: 0, partial: 0, unknown: 0 }
-    const body = rows
+    // Everything the table sorts, searches and exports on is worked out once per
+    // extension here, so a re-sort is just a comparison rather than a re-read of
+    // the raw 3CX record.
+    const rows: ExtStatusRow[] = graph.nodes
+      .filter((n) => n.kind === 'user')
       .map((n) => {
         const presence = presenceOf(n.raw)
         const meta = presence ? PRESENCE_META[presence] : null
-        const agentEdges = agentEdgesByUser.get(n.id) ?? []
-        const perQueue = agentEdges.filter((e) => e.agentLoggedIn !== undefined)
-        let queueCell: string
+        const perQueue = (agentEdgesByUser.get(n.id) ?? []).filter(
+          (e) => e.agentLoggedIn !== undefined
+        )
+        let queue: ExtStatusRow['queue']
         if (perQueue.length) {
           const inCount = perQueue.filter((e) => e.agentLoggedIn).length
-          if (inCount === perQueue.length) queueTotals.in++
-          else if (inCount === 0) queueTotals.out++
-          else queueTotals.partial++
-          const cls =
-            inCount === perQueue.length
-              ? 'text-emerald-600 dark:text-emerald-400'
-              : inCount === 0
-                ? 'text-amber-600 dark:text-amber-400'
-                : 'text-sky-600 dark:text-sky-400'
           const names = perQueue
-            .map((e) => {
-              const q = nodeById.get(e.source)
-              return `${q?.label ?? e.source}: ${e.agentLoggedIn ? 'in' : 'out'}`
-            })
+            .map(
+              (e) =>
+                `${nodeById.get(e.source)?.label ?? e.source}: ${e.agentLoggedIn ? 'in' : 'out'}`
+            )
             .join(', ')
-          queueCell = `<span class="${cls}" title="${esc(names)}">${inCount} / ${perQueue.length} in</span>`
+          queue = {
+            state: inCount === perQueue.length ? 'in' : inCount === 0 ? 'out' : 'partial',
+            text: `${inCount} / ${perQueue.length} in`,
+            detail: names
+          }
         } else {
           // 3CX v20 doesn't expose per-queue login on the Queues endpoint, so this
           // is the normal path: the extension's effective state, which accounts for
           // a status profile that auto-logs it out of queues.
-          const state = queueLoginState(n.raw)
-          if (state?.loggedIn === true) queueTotals.in++
-          else if (state?.loggedIn === false) queueTotals.out++
-          else queueTotals.unknown++
-          queueCell = !state
-            ? '<span class="text-slate-400">-</span>'
-            : state.loggedIn
-              ? '<span class="text-emerald-600 dark:text-emerald-400" title="Queue login status">Logged in</span>'
-              : `<span class="text-amber-600 dark:text-amber-400" title="${esc(state.reason ?? 'Queue login status')}">Logged out${state.reason ? ' ⓘ' : ''}</span>`
+          const s = queueLoginState(n.raw)
+          queue = !s
+            ? { state: 'unknown', text: '-', detail: '' }
+            : s.loggedIn
+              ? { state: 'in', text: 'Logged in', detail: 'Queue login status' }
+              : { state: 'out', text: 'Logged out', detail: s.reason ?? 'Queue login status' }
         }
-        const depts = n.departments?.length ? n.departments.join(', ') : ''
-        return `<tr class="border-t border-slate-100 dark:border-slate-700/50">
-          <td class="py-1 pr-2 font-mono whitespace-nowrap">${esc(n.number ?? '')}</td>
-          <td class="py-1 pr-2"><button data-nav="${esc(n.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(n.label)}</button></td>
-          <td class="py-1 pr-2 whitespace-nowrap">${
-            meta
-              ? `<span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full shrink-0" style="background:${meta.color}"></span>${esc(meta.label)}</span>`
-              : '<span class="text-slate-400">Unknown</span>'
-          }</td>
-          <td class="py-1 pr-2 whitespace-nowrap">${queueCell}</td>
-          <td class="py-1 truncate max-w-[160px] text-slate-500 dark:text-slate-400">${esc(depts)}</td>
-        </tr>`
+        return {
+          node: n,
+          number: n.number ?? '',
+          name: n.label,
+          presence: meta?.label ?? 'Unknown',
+          presenceColor: meta?.color,
+          queue,
+          depts: n.departments?.length ? n.departments.join(', ') : ''
+        }
       })
-      .join('')
-    const summary = `<p class="text-[11px] text-slate-400 mb-1.5">${rows.length} extensions · ${queueTotals.in} logged in to queues · ${queueTotals.out} logged out${queueTotals.partial ? ` · ${queueTotals.partial} partially logged in` : ''}${queueTotals.unknown ? ` · ${queueTotals.unknown} unknown` : ''}</p>`
-    const table = `<div class="overflow-x-auto"><table class="w-full text-[11px]">
-      <thead><tr class="text-left text-slate-400">
-        <th class="pr-2 pb-1 font-medium">Ext</th>
-        <th class="pr-2 pb-1 font-medium">Name</th>
-        <th class="pr-2 pb-1 font-medium">Status</th>
-        <th class="pr-2 pb-1 font-medium">Queues</th>
-        <th class="pb-1 font-medium">Department</th>
-      </tr></thead><tbody>${body}</tbody></table></div>`
-    panelShell(`Extensions - ${rows.length}`, summary + table)
-    wireNav()
+
+    // Signed out first when sorting ascending — that's what the panel is opened
+    // to find. Unknown sits outside the order, at the far end.
+    const QUEUE_RANK = { out: 0, partial: 1, in: 2, unknown: 3 }
+    const QUEUE_CLS = {
+      in: 'text-emerald-600 dark:text-emerald-400',
+      out: 'text-amber-600 dark:text-amber-400',
+      partial: 'text-sky-600 dark:text-sky-400',
+      unknown: 'text-slate-400'
+    }
+    showTablePanel<ExtStatusRow>({
+      title: 'Extensions',
+      csvName: 'extensions',
+      rows,
+      placeholder: 'Search extensions, names, status and departments…',
+      empty: 'No extensions.',
+      sortKey: 'number',
+      summary: (shown) => {
+        const n = (s: string): number => shown.filter((r) => r.queue.state === s).length
+        const parts = [
+          `${shown.length} extension${shown.length === 1 ? '' : 's'}`,
+          `${n('in')} logged in to queues`,
+          `${n('out')} logged out`
+        ]
+        if (n('partial')) parts.push(`${n('partial')} partially logged in`)
+        if (n('unknown')) parts.push(`${n('unknown')} unknown`)
+        return esc(parts.join(' · '))
+      },
+      columns: [
+        {
+          key: 'number',
+          label: 'Ext',
+          cls: 'font-mono whitespace-nowrap',
+          sort: (r) => r.number,
+          cell: (r) => esc(r.number),
+          csv: (r) => r.number
+        },
+        {
+          key: 'name',
+          label: 'Name',
+          sort: (r) => r.name,
+          cell: (r) =>
+            `<button data-nav="${esc(r.node.id)}" class="text-left text-sky-600 dark:text-sky-400 hover:underline">${esc(r.name)}</button>`,
+          csv: (r) => r.name
+        },
+        {
+          key: 'presence',
+          label: 'Status',
+          cls: 'whitespace-nowrap',
+          sort: (r) => r.presence,
+          cell: (r) =>
+            r.presenceColor
+              ? `<span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full shrink-0" style="background:${r.presenceColor}"></span>${esc(r.presence)}</span>`
+              : '<span class="text-slate-400">Unknown</span>',
+          csv: (r) => r.presence
+        },
+        {
+          key: 'queue',
+          label: 'Queues',
+          cls: 'whitespace-nowrap',
+          title: 'Whether the extension is logged in to its queues',
+          sort: (r) => QUEUE_RANK[r.queue.state],
+          cell: (r) =>
+            `<span class="${QUEUE_CLS[r.queue.state]}"${r.queue.detail ? ` title="${esc(r.queue.detail)}"` : ''}>${esc(r.queue.text)}${r.queue.state === 'out' && r.queue.detail ? ' ⓘ' : ''}</span>`,
+          csv: (r) => r.queue.text,
+          search: (r) => `${r.queue.text} ${r.queue.state} ${r.queue.detail}`
+        },
+        {
+          key: 'depts',
+          label: 'Department',
+          cls: 'truncate max-w-[160px] text-slate-500 dark:text-slate-400',
+          sort: (r) => r.depts,
+          cell: (r) => esc(r.depts),
+          csv: (r) => r.depts
+        }
+      ]
+    })
+  }
+
+  // --- Deep system search -------------------------------------------------
+  // The search box above the graph finds nodes. This finds anything in the
+  // system's configuration — every field of every record 3CX handed over,
+  // including the collections and fields the graph has no use for. See
+  // graph/deep-search.ts for what that covers and what is deliberately absent.
+  const showDeepSearchPanel = (initial = ''): void => {
+    const records = buildDeepIndex(topology)
+    const fieldCount = countFields(records)
+    // Records come straight from the topology, and a graph node holds the very
+    // same object — so identity is enough to offer "show this on the graph".
+    const nodeByRaw = new Map<Record<string, unknown>, GraphNode>()
+    for (const n of graph.nodes) if (!nodeByRaw.has(n.raw)) nodeByRaw.set(n.raw, n)
+
+    let term = initial
+    let useRegex = false
+    let matchFieldNames = false
+    let result: DeepSearchResult = { hits: [], total: 0 }
+
+    const highlight = (text: string, start: number, end: number): string => {
+      const s = snippet(text, start, end)
+      return `${esc(s.before)}<mark class="bg-amber-200 dark:bg-amber-500/40 text-inherit rounded-sm px-0.5">${esc(s.hit)}</mark>${esc(s.after)}`
+    }
+
+    const hitHtml = (hit: DeepHit, i: number): string => {
+      const r = hit.record
+      const node = nodeByRaw.get(r.raw)
+      const rows = hit.matches
+        .map((m) => {
+          // A field-name match highlights the name; a value match highlights the
+          // value. Either way both are shown, so the hit is readable in context.
+          const path = m.inPath ? highlight(m.path, m.start, m.end) : esc(m.path)
+          const value = m.inPath
+            ? esc(m.value.length > 140 ? `${m.value.slice(0, 140)}…` : m.value)
+            : highlight(m.value, m.start, m.end)
+          return `<div class="flex gap-2 py-0.5">
+            <code class="shrink-0 text-slate-400 max-w-[45%] truncate" title="${esc(m.path)}">${path}</code>
+            <span class="min-w-0 flex-1 break-all text-slate-600 dark:text-slate-300">${value}</span>
+          </div>`
+        })
+        .join('')
+      const more =
+        hit.matches.length >= DEEP_PER_RECORD
+          ? `<p class="text-[10px] text-slate-400 mt-0.5">Showing the first ${DEEP_PER_RECORD} matching fields.</p>`
+          : ''
+      return `<div class="rounded border border-slate-200 dark:border-slate-700 mb-1.5">
+        <div class="flex items-center gap-2 px-2 py-1 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-700">
+          <span class="shrink-0 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-300">${esc(r.collectionLabel)}</span>
+          <span class="min-w-0 flex-1 truncate font-medium">${esc(r.title)}</span>
+          ${r.subtitle ? `<span class="shrink-0 text-[10px] text-slate-400">${esc(r.subtitle)}</span>` : ''}
+          ${node ? `<button data-nav="${esc(node.id)}" class="shrink-0 text-[10px] text-sky-600 dark:text-sky-400 hover:underline">Show on graph</button>` : ''}
+          <button data-raw="${i}" class="shrink-0 text-[10px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">Raw</button>
+        </div>
+        <div class="px-2 py-1 text-[11px] font-mono">${rows}${more}</div>
+        <pre data-rawbody="${i}" class="hidden mx-2 mb-2 p-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-[10px] leading-snug overflow-x-auto text-slate-600 dark:text-slate-300"></pre>
+      </div>`
+    }
+
+    const draw = (): void => {
+      result = term.trim()
+        ? searchDeep(records, term, {
+            regex: useRegex,
+            fieldNames: matchFieldNames,
+            limit: DEEP_LIMIT,
+            perRecord: DEEP_PER_RECORD
+          })
+        : { hits: [], total: 0 }
+      csvBtn.disabled = !result.hits.length
+      csvBtn.classList.toggle('opacity-40', !result.hits.length)
+      // Reading a term as a field query is a judgement about what was meant, so
+      // it's stated rather than left to be inferred from the results.
+      const q = result.query
+      queryEl.classList.toggle('hidden', !q)
+      if (q)
+        queryEl.innerHTML = `Field <code class="text-slate-600 dark:text-slate-200">${esc(q.key)}</code> ${
+          !q.value
+            ? 'is set to anything'
+            : q.exact
+              ? `is exactly <code class="text-slate-600 dark:text-slate-200">${esc(q.value)}</code>`
+              : `contains <code class="text-slate-600 dark:text-slate-200">${esc(q.value)}</code>`
+        }`
+      if (result.error) {
+        resultsEl.innerHTML = `<p class="text-xs text-amber-600 dark:text-amber-400">${esc(result.error)}</p>`
+        countEl.textContent = ''
+        return
+      }
+      if (!term.trim()) {
+        resultsEl.innerHTML = `<div class="text-xs text-slate-400 space-y-2">
+          <p>Type to search every field of all ${records.length.toLocaleString()} records — names, numbers, ids, flags, nested settings, and the collections the graph never draws.</p>
+          <p>Name a field to search it directly, in the JSON's own words or without the ceremony:</p>
+          <ul class="space-y-0.5 font-mono text-[11px]">
+            <li><code class="text-slate-500 dark:text-slate-300">"Number": "8006"</code> — that field, exactly that value</li>
+            <li><code class="text-slate-500 dark:text-slate-300">Number: 800</code> — that field, containing 800</li>
+            <li><code class="text-slate-500 dark:text-slate-300">Groups[0].Name = Sales</code> — a nested field</li>
+            <li><code class="text-slate-500 dark:text-slate-300">MobileNumber:</code> — every record that has one</li>
+          </ul>
+        </div>`
+        countEl.textContent = ''
+        return
+      }
+      if (!result.hits.length) {
+        resultsEl.innerHTML = `<p class="text-xs text-slate-400">Nothing in the system's configuration matches “${esc(term)}”.</p>`
+        countEl.textContent = '0 records'
+        return
+      }
+      countEl.textContent =
+        result.total > result.hits.length
+          ? `${result.hits.length} of ${result.total.toLocaleString()} records`
+          : `${result.total.toLocaleString()} record${result.total === 1 ? '' : 's'}`
+      resultsEl.innerHTML = result.hits.map(hitHtml).join('')
+      wireNav()
+    }
+
+    const body = `
+      <input id="deepTerm" type="text" value="${esc(term)}" placeholder="Search anything, or &quot;Number&quot;: &quot;8006&quot;"
+        class="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs" />
+      <p id="deepQuery" class="hidden mt-1 text-[10px] text-sky-600 dark:text-sky-400 font-mono"></p>
+      <div class="flex items-center gap-3 mt-1.5 mb-2 text-[10px] text-slate-500 dark:text-slate-400">
+        <label class="flex items-center gap-1 cursor-pointer select-none" title="Treat the whole term as a regular expression (case-insensitive). Turns off field-query reading, so text shaped like a query can be searched for literally.">
+          <input id="deepRegex" type="checkbox" class="accent-sky-500" /> Regex
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer select-none" title="Also match the names of fields, not just what they hold.">
+          <input id="deepPaths" type="checkbox" class="accent-sky-500" /> Field names
+        </label>
+        <span id="deepCount" class="ml-auto tabular-nums"></span>
+      </div>
+      <div id="deepResults"></div>
+      <p class="text-[10px] text-slate-400 mt-2 pt-2 border-t border-slate-200 dark:border-slate-700">
+        ${fieldCount.toLocaleString()} fields across ${records.length.toLocaleString()} records, from ${DEEP_COLLECTIONS.length} collections.
+        Passwords, SIP auth ids and voicemail PINs are stripped before the app ever sees them, so they cannot be found here.
+      </p>`
+    const actions = `<button id="deepCsv" class="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-[11px]">Export CSV</button>`
+    panelShell('Deep system search', body, actions)
+
+    const termEl = panel.querySelector<HTMLInputElement>('#deepTerm')!
+    const resultsEl = panel.querySelector<HTMLElement>('#deepResults')!
+    const countEl = panel.querySelector<HTMLElement>('#deepCount')!
+    const queryEl = panel.querySelector<HTMLElement>('#deepQuery')!
+    const csvBtn = panel.querySelector<HTMLButtonElement>('#deepCsv')!
+    draw()
+    termEl.focus()
+    termEl.select()
+
+    // Searching a large system walks tens of thousands of fields, which is fast
+    // but not free — a short settle keeps a fast typist from paying for it once
+    // per letter.
+    let timer = 0
+    termEl.addEventListener('input', () => {
+      term = termEl.value
+      window.clearTimeout(timer)
+      timer = window.setTimeout(draw, 110)
+    })
+    cleanup.push(() => window.clearTimeout(timer))
+    panel.querySelector<HTMLInputElement>('#deepRegex')!.addEventListener('change', (e) => {
+      useRegex = (e.target as HTMLInputElement).checked
+      draw()
+    })
+    panel.querySelector<HTMLInputElement>('#deepPaths')!.addEventListener('change', (e) => {
+      matchFieldNames = (e.target as HTMLInputElement).checked
+      draw()
+    })
+    // The full record is written out only when someone asks to see it. Doing it
+    // up front meant serialising every hit on every keystroke, most of which
+    // nobody ever unfolds.
+    resultsEl.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-raw]')
+      if (!btn) return
+      const i = Number(btn.dataset.raw)
+      const pre = resultsEl.querySelector<HTMLElement>(`[data-rawbody="${i}"]`)
+      if (!pre) return
+      if (!pre.textContent) pre.textContent = JSON.stringify(result.hits[i]?.record.raw, null, 2)
+      pre.classList.toggle('hidden')
+    })
+    csvBtn.addEventListener('click', () =>
+      downloadCsv(
+        'deep-search',
+        ['Collection', 'Record', 'Number / id', 'Field', 'Value', 'Source'],
+        result.hits.flatMap((h) =>
+          h.matches.map((m) => [
+            h.record.collectionLabel,
+            h.record.title,
+            h.record.subtitle,
+            m.path,
+            m.value,
+            h.record.source
+          ])
+        ),
+        host
+      )
+    )
   }
 
   // --- Selective unhide ---------------------------------------------------
@@ -2561,7 +3023,9 @@ function flash(message: string, isError = false): void {
   setTimeout(() => el.remove(), 2500)
 }
 
-function exportDidCsv(rows: DidRow[], host: string): void {
+/** Save a table as CSV. `name` becomes part of the filename; `host` identifies
+ *  which system it came from. */
+function downloadCsv(name: string, header: string[], rows: string[][], host: string): void {
   const cell = (s: string): string => {
     // Guard against CSV formula injection: a value a spreadsheet would treat as
     // a formula (=, +, -, @, tab, CR) gets a leading apostrophe. 3CX display
@@ -2569,16 +3033,13 @@ function exportDidCsv(rows: DidRow[], host: string): void {
     const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s
     return `"${safe.replace(/"/g, '""')}"`
   }
-  const lines = [
-    'DID,Rule,Routes to',
-    ...rows.map((r) => [cell(r.did), cell(r.name), cell(r.dests.join('; '))].join(','))
-  ]
+  const lines = [header, ...rows].map((r) => r.map(cell).join(','))
   // Prepend a BOM so Excel reads UTF-8 correctly.
   const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `espionage-dids-${host.replace(/[^\w.-]/g, '_')}.csv`
+  a.download = `espionage-${name}-${host.replace(/[^\w.-]/g, '_')}.csv`
   a.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

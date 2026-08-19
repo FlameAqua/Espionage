@@ -272,6 +272,10 @@ export class GraphView {
     // (the grabbed node plus any co-selected nodes that move together), then diff
     // on release and report the ones that actually moved.
     let grabStart = new Map<string, { x: number; y: number }>()
+    // Links hanging off whatever is being dragged, so they can be re-routed
+    // as it moves rather than snapping into shape only on release.
+    let dragEdges: cytoscape.EdgeCollection | null = null
+    let dragFrame = 0
     this.cy.on('grab', 'node', (evt) => {
       grabStart = new Map()
       const grabbed = evt.target as NodeSingular
@@ -282,8 +286,27 @@ export class GraphView {
           grabStart.set(n.id(), { x: p.x, y: p.y })
         }
       })
+      dragEdges = moving.connectedEdges()
+    })
+    // A dragged node's links are re-routed as it moves, so what's on screen is
+    // already what will be there on release — an elbow that will become a side
+    // lane changes as you cross, rather than after the fact. Only the moving
+    // node's own links are recomputed each frame; everything else is a link
+    // whose obstacle set has barely changed, and is caught by the full pass on
+    // release. Coalesced to one recompute per frame.
+    this.cy.on('drag', 'node', () => {
+      if (!this.edgeRouting || !dragEdges || dragEdges.empty() || dragFrame) return
+      dragFrame = requestAnimationFrame(() => {
+        dragFrame = 0
+        if (dragEdges && !dragEdges.empty()) applyEdgeRoutes(this.cy, true, { only: dragEdges })
+      })
     })
     this.cy.on('free', 'node', () => {
+      dragEdges = null
+      if (dragFrame) {
+        cancelAnimationFrame(dragFrame)
+        dragFrame = 0
+      }
       if (!grabStart.size) return
       const moves: NodeMove[] = []
       grabStart.forEach((from, id) => {

@@ -9,7 +9,11 @@ export function renderLogin(
   onOpenSnapshot?: () => void,
   /** Pre-fill for "add another system" and for switching to one that isn't
    *  connected — the password is never remembered, so it's asked for again. */
-  prefill?: { baseUrl?: string; username?: string }
+  prefill?: { baseUrl?: string; username?: string },
+  /** Return to the system already on screen. Only passed when there is one, so
+   *  reaching this screen by accident isn't a dead end that has to be signed
+   *  out of. Absent on a cold start, where there is nowhere to go back to. */
+  onBack?: () => void
 ): void {
   const known = loadSystems()
   const saved = { baseUrl: prefill?.baseUrl ?? known[0]?.baseUrl, username: prefill?.username ?? known[0]?.username }
@@ -18,6 +22,14 @@ export function renderLogin(
     <div class="relative min-h-screen flex items-center justify-center overflow-hidden bg-slate-900 text-slate-100">
       <canvas id="matrix" class="absolute inset-0 w-full h-full pointer-events-none"></canvas>
       <form id="login" class="relative z-10 w-[380px] bg-slate-800/95 backdrop-blur-sm rounded-xl shadow-2xl p-7 space-y-4">
+        ${
+          onBack
+            ? `<button id="back" type="button" title="Back to the system you were on (Esc)"
+                 class="absolute top-3 left-3 flex items-center gap-1 px-2 py-1 rounded text-xs text-slate-400 hover:text-slate-100 hover:bg-slate-700/70">
+                 <span aria-hidden="true">←</span> Back
+               </button>`
+            : ''
+        }
         <div class="text-center">
           <div class="flex items-center justify-center gap-2.5">
             <span class="shrink-0">${logoSvg(40)}</span>
@@ -90,8 +102,24 @@ export function renderLogin(
   syncKnown()
   root.querySelector('#forget')!.addEventListener('click', () => {
     forgetSystem(urlEl.value.trim().replace(/\/+$/, ''))
-    renderLogin(root, onConnect, onOpenSnapshot, { baseUrl: '', username: '' })
+    renderLogin(root, onConnect, onOpenSnapshot, { baseUrl: '', username: '' }, onBack)
   })
+
+  if (onBack) {
+    // Escape is the reflex for "I didn't mean to open this". Either way out
+    // drops the listener, so re-rendering this screen can't stack them up; the
+    // isConnected guard covers a form that left the DOM some other way.
+    const onEsc = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return
+      window.removeEventListener('keydown', onEsc)
+      if (form.isConnected) onBack()
+    }
+    window.addEventListener('keydown', onEsc)
+    root.querySelector('#back')!.addEventListener('click', () => {
+      window.removeEventListener('keydown', onEsc)
+      onBack()
+    })
+  }
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
