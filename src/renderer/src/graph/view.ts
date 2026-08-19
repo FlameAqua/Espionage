@@ -298,7 +298,7 @@ export class GraphView {
       if (!this.edgeRouting || !dragEdges || dragEdges.empty() || dragFrame) return
       dragFrame = requestAnimationFrame(() => {
         dragFrame = 0
-        if (dragEdges && !dragEdges.empty()) applyEdgeRoutes(this.cy, true, { only: dragEdges })
+        if (dragEdges && !dragEdges.empty()) this.routeEdges(dragEdges)
       })
     })
     this.cy.on('free', 'node', () => {
@@ -425,13 +425,16 @@ export class GraphView {
    *  present in the graph (see GraphNode.deptGroup). */
   private enterDepartmentMode(): void {
     if (this.deptParentsActive) return
-    this.deptParentsActive = true
     const buckets = new Map<string, string>() // bucket -> colour
     this.cy.nodes().forEach((n) => {
       const model = n.data('model') as GraphNode | undefined
       if (model?.deptGroup) buckets.set(model.deptGroup, departmentColor(model.deptGroup))
     })
+    // Nothing to box. The flag stays down so a later attempt still tries: it was
+    // being raised before the work, so bailing here left the mode marked active
+    // with no boxes, and every later switch into it did nothing.
     if (!buckets.size) return
+    this.deptParentsActive = true
     const parents: ElementDefinition[] = []
     buckets.forEach((color, bucket) => {
       parents.push({
@@ -474,6 +477,42 @@ export class GraphView {
     this.frameView(animate)
   }
 
+  /**
+   * Lay the department view out, rebuilding its boxes first — which is what
+   * switching to Flow and back does by hand, and the only thing that reliably
+   * stops the departments piling onto one another.
+   *
+   * A department box has no size of its own: cytoscape derives it from where its
+   * members sit, and cytoscape-dagre measures every node it is handed and passes
+   * that on as the cluster's size. So a box that has been measured around one
+   * view goes on describing that view. Filter down to a single department and
+   * the rest report a collapsed box; come back to all of them and they report
+   * whatever span their members were last scattered over. Either way dagre is
+   * told the wrong amount of room to keep for each cluster, and with a dozen
+   * departments that puts most of them on top of each other.
+   *
+   * A box that has only just been created has been measured for nothing, so
+   * dagre sizes each cluster from the members it actually holds. Hence the
+   * rebuild — cheap next to the layout it precedes, and only on the actions that
+   * change which departments are on screen.
+   */
+  private relayoutDepartments(animate: boolean): void {
+    this.exitDepartmentMode()
+    this.enterDepartmentMode()
+    // The boxes above are new elements, carrying neither the hidden flags the
+    // filter needs nor the "no visible member" state applyVisibility maintains.
+    this.applyVisibility()
+    this.runLayout(animate)
+  }
+
+  /** Lay out for the current mode, rebuilding the department boxes when there
+   *  are any. Used by the actions that change which departments are on screen. */
+  private relayoutForVisibility(animate: boolean): void {
+    if (this.layoutName === 'department' && this.deptParentsActive)
+      this.relayoutDepartments(animate)
+    else this.runLayout(animate)
+  }
+
   // --- Link routing -------------------------------------------------------
 
   private edgeRouting = true
@@ -491,9 +530,19 @@ export class GraphView {
   }
 
   /** Recompute every visible link's route. Called after a layout and after a
-   *  drag, which are the only two things that move a node. */
-  private routeEdges(): void {
-    applyEdgeRoutes(this.cy, this.edgeRouting)
+   *  drag, which are the only two things that move a node.
+   *
+   *  Routing is how links are drawn, not whether the graph works, and it runs
+   *  in the middle of runLayout — before the camera is framed, and inside the
+   *  dimmed window of a view-mode switch. So a failure here is contained: the
+   *  links fall back to however the stylesheet draws them and the layout carries
+   *  on, rather than taking the framing and the un-dimming down with it. */
+  private routeEdges(edges?: cytoscape.EdgeCollection): void {
+    try {
+      applyEdgeRoutes(this.cy, this.edgeRouting, edges ? { only: edges } : {})
+    } catch (err) {
+      console.error('Link routing failed; leaving links as the stylesheet draws them.', err)
+    }
   }
 
   private layoutOptions(): cytoscape.LayoutOptions {
@@ -788,7 +837,7 @@ export class GraphView {
     this.traceId = null
     this.applyVisibility()
     this.emphasizeFocus(id)
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   /** Change how many hops out from the focus node stay visible (Infinity = the
@@ -806,11 +855,20 @@ export class GraphView {
     if (this.focusId == null && this.deptFilter == null) return
     this.cy.stop()
     this.applyVisibility()
+    // A focused node stays anchored as the reach grows. A filtered department
+    // gets no such treatment: the filter has already done the narrowing, and
+    // spotlighting the department on top of it faded out the very nodes the
+    // reach had just been widened to reveal — including any node belonging to
+    // more than one department, which is bucketed as shared and so fails a
+    // `deptGroup === bucket` test for the department it is actually in. The
+    // view ended up muted end to end, and differed from the same department
+    // entered without touching the slider. Emphasis belongs to the spotlight
+    // (see highlightDepartment), not to the filter.
     if (this.focusId != null) this.emphasizeFocus(this.focusId)
-    else if (this.deptFilter != null) this.highlightDepartment(this.deptFilter)
+    else this.cy.elements().removeClass('faded selected dim lit')
     // Deferred a frame so the display:none changes flush before the layout reads
     // positions (otherwise re-shown nodes lay out from stale coordinates).
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   getFocusDepth(): number {
@@ -849,7 +907,7 @@ export class GraphView {
     this.traceId = null
     this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   isFocused(): boolean {
@@ -865,7 +923,10 @@ export class GraphView {
     this.deptFilter = bucket
     this.cy.elements().removeClass('faded selected dim lit')
     this.applyVisibility()
-    requestAnimationFrame(() => this.runLayout(true))
+    // Entering, leaving or changing a department changes which boxes are on
+    // screen, so the boxes are rebuilt around the result. See
+    // relayoutDepartments.
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   getDepartmentFilter(): string | null {
@@ -892,7 +953,7 @@ export class GraphView {
     // outright, so the fade would only mute the path itself.
     this.cy.elements().removeClass('faded')
     this.applyVisibility()
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
     return ends
   }
 
@@ -911,18 +972,31 @@ export class GraphView {
   }
 
   /** Spotlight a department: its members and the links between them, dimming the
-   *  rest. Mirrors what focusing a node does, one level up. */
-  highlightDepartment(bucket: string): void {
-    this.cy.elements().removeClass('faded selected dim lit')
-    this.cy.elements().not('.dept-parent').addClass('faded')
+   *  rest. Mirrors what focusing a node does, one level up.
+   *
+   *  Returns whether it actually lit anything. A spotlight is only meaningful
+   *  when the thing being lit is on screen, and a department's members need not
+   *  be: inside a node-focus view the graph is cut down to one neighbourhood,
+   *  which may hold none of them. Fading everything to light nothing left the
+   *  whole canvas muted with no way back, so that case is declined here and the
+   *  caller is left to do something that makes sense instead.
+   *
+   *  Membership is read from the `hidden` CLASS rather than `:visible` for the
+   *  reason emphasizeFocus documents: this can run directly after
+   *  applyVisibility(), whose display changes have not been flushed yet. */
+  highlightDepartment(bucket: string): boolean {
     const members = this.cy.nodes().filter((n) => {
       const model = n.data('model') as GraphNode | undefined
-      return !!model && model.deptGroup === bucket
+      return !!model && model.deptGroup === bucket && !n.hasClass('hidden')
     })
+    this.cy.elements().removeClass('faded selected dim lit')
+    if (members.empty()) return false
+    this.cy.elements().not('.dept-parent').addClass('faded')
     members.removeClass('faded').addClass('selected')
     // Internal links only: a link leaving the department belongs to its neighbour
     // as much as to it, so leave those dimmed.
     members.edgesWith(members).removeClass('faded').addClass('lit')
+    return true
   }
 
   /** Hide every member of a department. Returns the ids hidden, for undo. */
@@ -1143,13 +1217,13 @@ export class GraphView {
     this.applyVisibility()
     // Defer so the display:none → visible changes flush before the layout reads
     // positions — otherwise re-shown nodes land on stale/zero coordinates.
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   setHideUnconnected(hide: boolean): void {
     this.hideUnconnected = hide
     this.applyVisibility()
-    requestAnimationFrame(() => this.runLayout(true))
+    requestAnimationFrame(() => this.relayoutForVisibility(true))
   }
 
   /** Recompute element visibility from the kind filter and any active focus or

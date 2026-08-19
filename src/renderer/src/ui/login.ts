@@ -1,7 +1,7 @@
 // The connection screen: collects the 3CX URL + credentials and reports back.
 import type { ConnectRequest } from '../../../shared/types'
 import { logoSvg } from './logo'
-import { forgetSystem, loadSystems, rememberSystem } from './systems'
+import { forgetSystem, loadSystems, rememberSystem, systemLabel } from './systems'
 
 export function renderLogin(
   root: HTMLElement,
@@ -38,12 +38,29 @@ export function renderLogin(
           <p class="text-xs text-slate-400 mt-1">Connect to a 3CX system to map its call flow.</p>
         </div>
         <label class="block text-xs font-medium text-slate-300">3CX URL
-          <input name="baseUrl" type="text" required placeholder="https://pbx.example.com"
-            list="knownSystems" autocomplete="off" value="${attr(saved.baseUrl ?? '')}"
-            class="mt-1 w-full px-3 py-2 rounded-md bg-slate-900 border border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" />
-          <datalist id="knownSystems">
-            ${known.map((k) => `<option value="${attr(k.baseUrl)}">${attr(k.username)}</option>`).join('')}
-          </datalist>
+          <div class="relative mt-1">
+            <input name="baseUrl" type="text" required placeholder="https://pbx.example.com"
+              autocomplete="off" value="${attr(saved.baseUrl ?? '')}"
+              class="w-full px-3 py-2 ${known.length ? 'pr-9' : ''} rounded-md bg-slate-900 border border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" />
+            ${
+              known.length
+                ? `<button id="knownToggle" type="button" title="Systems you've signed into before"
+                     class="absolute inset-y-0 right-0 w-9 flex items-center justify-center text-slate-500 hover:text-slate-200">▾</button>
+                   <div id="knownList" class="hidden absolute z-20 top-full left-0 right-0 max-h-52 overflow-y-auto rounded-b-md bg-slate-700 border border-t-0 border-slate-500 shadow-2xl">
+                     ${known
+                       .map(
+                         (k) => `<button type="button" data-system="${attr(k.baseUrl)}"
+                            title="${attr(k.baseUrl)}"
+                            class="w-full text-left px-3 py-1.5 border-b border-slate-600/60 last:border-b-0 hover:bg-slate-600">
+                            <span class="block text-xs truncate text-slate-100">${attr(systemLabel(k.baseUrl))}</span>
+                            <span class="block text-[10px] text-slate-300 truncate">${attr(k.username)}</span>
+                          </button>`
+                       )
+                       .join('')}
+                   </div>`
+                : ''
+            }
+          </div>
           <div id="forgetRow" class="hidden mt-1 text-right">
             <button id="forget" type="button" class="text-[11px] text-slate-500 hover:text-red-400">Forget this system</button>
           </div>
@@ -100,25 +117,72 @@ export function renderLogin(
   urlEl.addEventListener('change', syncKnown)
   urlEl.addEventListener('input', syncKnown)
   syncKnown()
+
+  // The remembered systems, as a list of their own rather than the browser's
+  // autocomplete. A <datalist> filters its options against whatever the field
+  // already holds — and the field opens pre-filled with the last system's full
+  // URL, so it matched only that one and the rest appeared to be missing until
+  // you deleted enough of it to widen the match.
+  const knownList = root.querySelector<HTMLElement>('#knownList')
+  const closeKnown = (): void => knownList?.classList.add('hidden')
+  const knownOpen = (): boolean => !!knownList && !knownList.classList.contains('hidden')
+  if (knownList) {
+    root.querySelector('#knownToggle')!.addEventListener('click', (e) => {
+      e.stopPropagation()
+      knownList.classList.toggle('hidden')
+    })
+    knownList.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-system]')
+      if (!btn) return
+      const hit = known.find((k) => k.baseUrl === btn.dataset.system)
+      if (!hit) return
+      urlEl.value = hit.baseUrl
+      // Picking a system means wanting its username too, so this overwrites
+      // rather than only filling a blank the way syncKnown does.
+      userEl.value = hit.username
+      syncKnown()
+      closeKnown()
+      form.querySelector<HTMLInputElement>('[name=password]')?.focus()
+    })
+    // Self-cleaning, like the backdrop animation: the login screen re-renders
+    // itself (after a Forget), and a listener per render would pile up.
+    const onDocClick = (): void => {
+      if (form.isConnected) return closeKnown()
+      document.removeEventListener('click', onDocClick)
+    }
+    document.addEventListener('click', onDocClick)
+  }
   root.querySelector('#forget')!.addEventListener('click', () => {
     forgetSystem(urlEl.value.trim().replace(/\/+$/, ''))
     renderLogin(root, onConnect, onOpenSnapshot, { baseUrl: '', username: '' }, onBack)
   })
 
-  if (onBack) {
-    // Escape is the reflex for "I didn't mean to open this". Either way out
-    // drops the listener, so re-rendering this screen can't stack them up; the
-    // isConnected guard covers a form that left the DOM some other way.
+  // One Escape handler for the whole screen, so the two things it can dismiss
+  // can't fight over the same keypress: the open systems list is the nearer of
+  // them, and leaving the screen is what a second Escape means. Registering one
+  // listener rather than one per feature also keeps the behaviour independent
+  // of which was set up first.
+  //
+  // It drops itself once the form has left the DOM — the login screen
+  // re-renders itself after a Forget, and a listener per render would pile up.
+  if (knownList || onBack) {
     const onEsc = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
-      window.removeEventListener('keydown', onEsc)
-      if (form.isConnected) onBack()
-    }
-    window.addEventListener('keydown', onEsc)
-    root.querySelector('#back')!.addEventListener('click', () => {
+      if (!form.isConnected) {
+        window.removeEventListener('keydown', onEsc)
+        return
+      }
+      if (knownOpen()) return closeKnown()
+      if (!onBack) return
       window.removeEventListener('keydown', onEsc)
       onBack()
-    })
+    }
+    window.addEventListener('keydown', onEsc)
+    if (onBack)
+      root.querySelector('#back')!.addEventListener('click', () => {
+        window.removeEventListener('keydown', onEsc)
+        onBack()
+      })
   }
 
   form.addEventListener('submit', async (e) => {

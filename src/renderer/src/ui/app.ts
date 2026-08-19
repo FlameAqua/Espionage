@@ -1236,7 +1236,10 @@ export function renderApp(
     ctxEl.append(item(ICONS.target, `Focus on “${name}”`, () => setDept(bucket)))
     ctxEl.append(
       item(ICONS.eye, 'Show department details', () => {
-        view.highlightDepartment(bucket)
+        // Nothing on screen to spotlight means the details belong to a
+        // department this view isn't showing, so go there rather than fading
+        // the canvas to light nothing. See highlightDepartment.
+        if (!view.highlightDepartment(bucket)) return setDept(bucket)
         showDepartmentDetails(bucket)
       })
     )
@@ -1411,7 +1414,15 @@ export function renderApp(
         showDetails(null)
         return
       }
-      view.highlightDepartment(bucket)
+      // Tapping a department while the view is narrowed to one node's
+      // neighbourhood (or one call corridor) is a request to go to that
+      // department, not to spotlight it inside a view built around something
+      // else — which holds few of its members, or none. Same when the spotlight
+      // finds nothing to light for any other reason.
+      if (view.isFocused() || view.getTraceId() != null || !view.highlightDepartment(bucket)) {
+        setDept(bucket)
+        return
+      }
       showDepartmentDetails(bucket)
     },
     onDepartmentContext: (bucket, x, y) => showDeptCtx(bucket, x, y),
@@ -1546,14 +1557,30 @@ export function renderApp(
     // produced flicker on large graphs), so dim the canvas across the switch and
     // let it fade back in. The dim has to be instant, or the transition has
     // barely started before it's undone and nothing is masked.
+    //
+    // Restoring it is deliberately belt-and-braces. The dim is applied here but
+    // undone two animation frames later, and anything that stops those frames
+    // arriving — the layout throwing, or the window being hidden or occluded, in
+    // which case the browser stops servicing requestAnimationFrame entirely —
+    // used to leave the whole canvas washed out with no way back, looking for
+    // all the world like every node had been deselected. So: a finally, and a
+    // timer that restores it regardless of whether the frames ever come.
+    const restore = (): void => {
+      graphEl.style.transition = ''
+      graphEl.style.opacity = ''
+    }
     graphEl.style.transition = 'none'
     graphEl.style.opacity = '0.3'
+    const failsafe = window.setTimeout(restore, 1000)
     requestAnimationFrame(() => {
-      view.setLayout(next)
-      requestAnimationFrame(() => {
-        graphEl.style.transition = ''
-        graphEl.style.opacity = ''
-      })
+      try {
+        view.setLayout(next)
+      } finally {
+        requestAnimationFrame(() => {
+          window.clearTimeout(failsafe)
+          restore()
+        })
+      }
     })
   }
   layoutSel.addEventListener('change', () =>
