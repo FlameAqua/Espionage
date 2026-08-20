@@ -40,7 +40,7 @@ function configure(): void {
   autoUpdater.autoInstallOnAppQuit = false
   // Beta channel: let v1.0.0-beta.2 supersede v1.0.0-beta.1, and betas roll
   // forward into the eventual stable release.
-  autoUpdater.allowPrerelease = true
+  autoUpdater.allowPrerelease = false
 
   autoUpdater.setFeedURL({
     provider: 'github',
