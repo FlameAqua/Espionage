@@ -5,6 +5,7 @@ export type NodeKind =
   | 'did'
   | 'inboundRule'
   | 'ivr'
+  | 'routePoint'
   | 'queue'
   | 'ringGroup'
   | 'user'
@@ -40,12 +41,25 @@ export interface GraphNode {
   searchTerms?: { label: string; value: string }[]
   /** Path after `/#/office/` to deep-link this node in the 3CX console. */
   threecxPath?: string
+  /** Every DN a route point's script mentions, with the line each was found
+   *  on. Present only on route points, and only leads — see graph/script-refs.ts. */
+  scriptRefs?: { number: string; line: number; text: string }[]
   /** Original entity JSON (or a small synthesized object for external/unknown). */
   raw: Record<string, unknown>
 }
 
 export type EdgeKind =
-  'route' | 'overflow' | 'agent' | 'manager' | 'member' | 'trunk' | 'afterhours' | 'forward'
+  | 'route'
+  | 'overflow'
+  | 'agent'
+  | 'manager'
+  | 'member'
+  | 'trunk'
+  | 'afterhours'
+  | 'forward'
+  /** Not routing the system told us about: a DN the route point's script
+   *  mentions. See graph/script-refs.ts for how little that means. */
+  | 'script'
 
 /** Display name + colour per link type, shared by the canvas styling and the
  *  settings panel that lets whole link types be hidden. */
@@ -57,7 +71,8 @@ export const EDGE_KIND_META: Record<EdgeKind, { label: string; color: string }> 
   member: { label: 'Ring group member', color: '#14b8a6' },
   trunk: { label: 'Trunk', color: '#a855f7' },
   afterhours: { label: 'Out of hours / holiday', color: '#0891b2' },
-  forward: { label: 'Call forwarding', color: '#ec4899' }
+  forward: { label: 'Call forwarding', color: '#ec4899' },
+  script: { label: 'Mentioned in script', color: '#f43f5e' }
 }
 
 /** The "route type" a link label belongs to — the granularity at which links can
@@ -132,6 +147,19 @@ export function departmentColor(bucket: string): string {
 
 export function departmentLabel(bucket: string): string {
   return bucket === SHARED_DEPARTMENT ? 'Multiple Departments' : bucket
+}
+
+/**
+ * Is this Group a department someone would recognise?
+ *
+ * 3CX keeps bookkeeping of its own in the same collection as real departments:
+ * the tenant-wide `DEFAULT` group, and a `___FAVORITES___<ext>` group per user
+ * holding that person's speed dials. Neither is a department, and both would
+ * otherwise show up as badges, boxes in Department view and rows in the office
+ * hours panel. The triple underscore is 3CX's own marker for internal groups.
+ */
+export function isRealDepartment(name: string): boolean {
+  return !!name && !/^default$/i.test(name) && !name.startsWith('___')
 }
 
 /** Live presence of a user extension, derived from its raw 3CX fields. Mirrors
@@ -267,6 +295,7 @@ export const NODE_KIND_META: Record<NodeKind, { label: string; color: string }> 
   did: { label: 'DID', color: '#ec4899' },
   inboundRule: { label: 'Inbound Rule', color: '#f97316' },
   ivr: { label: 'IVR', color: '#eab308' },
+  routePoint: { label: 'Route Point', color: '#f43f5e' },
   queue: { label: 'Queue', color: '#22c55e' },
   ringGroup: { label: 'Ring Group', color: '#14b8a6' },
   user: { label: 'Extension', color: '#3b82f6' },

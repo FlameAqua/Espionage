@@ -37,6 +37,14 @@ import { Minimap } from './minimap'
 import { checkForUpdates } from './updates'
 import { auditTopology, groupFindings } from '../graph/audit'
 import {
+  DAY_NAMES,
+  departmentHours,
+  describeDay,
+  stateAt,
+  weekView,
+  type HoursState
+} from '../graph/office-hours'
+import {
   buildDeepIndex,
   countFields,
   DEEP_COLLECTIONS,
@@ -173,7 +181,7 @@ const esc = (s: unknown): string =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!
   )
 
-const THEME_KEY = '3cx-spy.theme'
+const THEME_KEY = 'espionage.theme'
 // Theme-aware so the header and side panels follow light/dark mode. The skin and
 // the sizing are separate because Tailwind resolves conflicting utilities by
 // stylesheet order, not by the order they appear in a class attribute — so
@@ -215,7 +223,14 @@ export function renderApp(
   // NB 'group' is deliberately absent: departments are badges on their members,
   // never nodes, so the row could only ever read 0 — and the Departments section
   // below the legend is the real control for them.
-  const ALWAYS_SHOW_KINDS: NodeKind[] = ['user', 'queue', 'ringGroup', 'ivr', 'inboundRule', 'trunk']
+  const ALWAYS_SHOW_KINDS: NodeKind[] = [
+    'user',
+    'queue',
+    'ringGroup',
+    'ivr',
+    'inboundRule',
+    'trunk'
+  ]
   // Everything to list: core categories + any synthetic kind that's actually present.
   const displayKinds = (Object.keys(NODE_KIND_META) as NodeKind[]).filter(
     (k) => ALWAYS_SHOW_KINDS.includes(k) || counts[k]
@@ -520,9 +535,11 @@ export function renderApp(
       .map((d) => departmentLabel(d))
     if (all.length && (n.kind === 'user' || !extAllDepts.has(n.number)))
       extAllDepts.set(n.number, [...new Set(all)])
-    const bucket = n.deptGroup && n.deptGroup !== SHARED_DEPARTMENT ? n.deptGroup : n.departments?.[0]
+    const bucket =
+      n.deptGroup && n.deptGroup !== SHARED_DEPARTMENT ? n.deptGroup : n.departments?.[0]
     if (!bucket || bucket === SHARED_DEPARTMENT) continue
-    if (n.kind === 'user' || !extDepts.has(n.number)) extDepts.set(n.number, departmentLabel(bucket))
+    if (n.kind === 'user' || !extDepts.has(n.number))
+      extDepts.set(n.number, departmentLabel(bucket))
   }
   const deptFor = (ext: string): string | undefined => extDepts.get(ext)
   const deptsFor = (ext: string): string[] => {
@@ -556,7 +573,9 @@ export function renderApp(
     })
   }
   reportTargets.sort(
-    (a, b) => a.number.localeCompare(b.number, undefined, { numeric: true }) || a.label.localeCompare(b.label)
+    (a, b) =>
+      a.number.localeCompare(b.number, undefined, { numeric: true }) ||
+      a.label.localeCompare(b.label)
   )
 
   // DN → what it actually is. The call log can't tell a queue, a ring group or a
@@ -905,8 +924,8 @@ export function renderApp(
   // Sizes are in px so a drag maps 1:1 to the pointer. `sizes` is the live
   // layout; LAYOUT_DEFAULT_KEY holds the user's own "default" (Settings → Set
   // current as default), falling back to BUILTIN_SIZES.
-  const LAYOUT_KEY = '3cx-spy.layout'
-  const LAYOUT_DEFAULT_KEY = '3cx-spy.layout.default'
+  const LAYOUT_KEY = 'espionage.layout'
+  const LAYOUT_DEFAULT_KEY = 'espionage.layout.default'
   const BUILTIN_SIZES: LayoutSizes = {
     left: 192,
     right: 320,
@@ -1043,8 +1062,7 @@ export function renderApp(
    *  through applyLayout, the same path drag-resizing takes. */
   const slidePanel = (side: 'left' | 'right', hidden: boolean): void => {
     const target = hidden ? 0 : side === 'left' ? sizes.left : sizes.right
-    const from =
-      side === 'left' ? (animLeft ?? appliedLeftWidth) : (animRight ?? appliedRightWidth)
+    const from = side === 'left' ? (animLeft ?? appliedLeftWidth) : (animRight ?? appliedRightWidth)
     tween(from, target, 200, (v) => {
       const done = v === target
       if (side === 'left') animLeft = done ? null : v
@@ -1164,7 +1182,9 @@ export function renderApp(
     )
     if (threecxUrl(baseUrl, node))
       ctxEl.append(
-        item(ICONS.external, 'Open in 3CX', () => window.api.app.openExternal(threecxUrl(baseUrl, node)!))
+        item(ICONS.external, 'Open in 3CX', () =>
+          window.api.app.openExternal(threecxUrl(baseUrl, node)!)
+        )
       )
     // Hide sits below the ways of looking at a node rather than among them: it's
     // the one entry here that changes the graph.
@@ -1191,9 +1211,12 @@ export function renderApp(
     ctxEl.append(divider())
     ctxEl.append(item(ICONS.copy, 'Copy name', () => window.api.app.copy(node.label)))
     if (node.number)
-      ctxEl.append(item(ICONS.phone, `Copy ext ${node.number}`, () => window.api.app.copy(node.number!)))
+      ctxEl.append(
+        item(ICONS.phone, `Copy ext ${node.number}`, () => window.api.app.copy(node.number!))
+      )
     const rawId = node.raw['Id']
-    if (rawId != null) ctxEl.append(item(ICONS.idCard, 'Copy ID', () => window.api.app.copy(String(rawId))))
+    if (rawId != null)
+      ctxEl.append(item(ICONS.idCard, 'Copy ID', () => window.api.app.copy(String(rawId))))
     // Undo / redo, always available from the menu (disabled when the stack is empty).
     ctxEl.append(divider())
     if (undo.canUndo()) ctxEl.append(item('↩', 'Undo', doUndo))
@@ -1279,7 +1302,13 @@ export function renderApp(
     ctxEl.append(
       item(ICONS.hide, 'Hide this link', () => {
         view.hideEdge(info.edgeId)
-        undo.push({ type: 'hide', nodeIds: [], edgeIds: [info.edgeId], edgeKinds: [], hidden: true })
+        undo.push({
+          type: 'hide',
+          nodeIds: [],
+          edgeIds: [info.edgeId],
+          edgeKinds: [],
+          hidden: true
+        })
         flash('Link hidden - undo with Ctrl+Z.')
       })
     )
@@ -1459,7 +1488,7 @@ export function renderApp(
   // meaningful while a node is focused — the row dims when nothing is focused.
   // Defined here (before the restore/initial-focus path below) so showNode can
   // safely call syncFocusDepthRow once focus is entered.
-  const FOCUS_DEPTH_KEY = '3cx-spy.focusDepth'
+  const FOCUS_DEPTH_KEY = 'espionage.focusDepth'
   const depthSlider = root.querySelector<HTMLInputElement>('#focusDepth')!
   const depthValEl = root.querySelector<HTMLElement>('#focusDepthVal')!
   const depthRow = root.querySelector<HTMLElement>('#focusDepthRow')!
@@ -1647,8 +1676,8 @@ export function renderApp(
       apply()
     })
   }
-  setupCollapse('3cx-spy.collapse.categories', '#catHeader', '#catBody', '#catChevron')
-  setupCollapse('3cx-spy.collapse.departments', '#deptHeader', '#deptBody', '#deptChevron')
+  setupCollapse('espionage.collapse.categories', '#catHeader', '#catBody', '#catChevron')
+  setupCollapse('espionage.collapse.departments', '#deptHeader', '#deptBody', '#deptChevron')
 
   // Minimap show/hide toggle sits just under the map.
   const mapToggle = root.querySelector<HTMLButtonElement>('#mapToggle')!
@@ -1705,6 +1734,12 @@ export function renderApp(
     { key: 'h', label: 'Health check', run: () => showAuditPanel() },
     { key: 'x', label: 'Extensions', run: () => showExtensionsPanel() },
     { key: 'd', label: 'DID table', run: () => showDidTable() },
+    {
+      key: 'w',
+      label: 'Office hours',
+      keywords: 'opening closing schedule when open department time',
+      run: () => showOfficeHoursPanel()
+    },
     {
       key: 'f',
       shift: true,
@@ -1818,14 +1853,17 @@ export function renderApp(
       commands: paletteCommands(),
       // Reuse the same matcher the header search uses, so results agree.
       findNodes: (q) =>
-        view.searchDetailed(q).slice(0, SEARCH_LIMIT).map(({ node, via }) => ({
-          id: node.id,
-          label: node.label,
-          // Prefer the reason this hit matched at all — an extension number the
-          // searcher didn't type explains less than the DID they did.
-          detail: via ?? node.number,
-          colour: NODE_KIND_META[node.kind].color
-        })),
+        view
+          .searchDetailed(q)
+          .slice(0, SEARCH_LIMIT)
+          .map(({ node, via }) => ({
+            id: node.id,
+            label: node.label,
+            // Prefer the reason this hit matched at all — an extension number the
+            // searcher didn't type explains less than the DID they did.
+            detail: via ?? node.number,
+            colour: NODE_KIND_META[node.kind].color
+          })),
       onNavigate: (id) => navigate(id, true)
     })
   // Suppress the app shortcuts while any full-screen modal/overlay is open, so
@@ -2037,6 +2075,7 @@ export function renderApp(
     menuEl.append(item(ICONS.pulse, 'Health check', showAuditPanel))
     menuEl.append(item(ICONS.people, 'Extensions', showExtensionsPanel))
     menuEl.append(item(ICONS.table, 'DID table', showDidTable))
+    menuEl.append(item(ICONS.clock, 'Office hours', showOfficeHoursPanel))
     menuEl.append(item(ICONS.search, 'Deep system search', () => showDeepSearchPanel()))
     // Reports — call-activity reporting.
     menuEl.append(section('Reports'))
@@ -2639,6 +2678,157 @@ export function renderApp(
   // system's configuration — every field of every record 3CX handed over,
   // including the collections and fields the graph has no use for. See
   // graph/deep-search.ts for what that covers and what is deliberately absent.
+  // --- Office hours --------------------------------------------------------
+  // When each department is open, and what that means for a call arriving at a
+  // given moment. The time is adjustable so the question can be asked about a
+  // Sunday night without waiting for one.
+  const HOURS_STATE_META: Record<HoursState, { label: string; cls: string }> = {
+    open: {
+      label: 'Open',
+      cls: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+    },
+    closed: {
+      label: 'Closed',
+      cls: 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+    },
+    break: {
+      label: 'Break',
+      cls: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'
+    },
+    holiday: {
+      label: 'Holiday',
+      cls: 'bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300'
+    },
+    unknown: {
+      label: 'Not set',
+      cls: 'bg-slate-100 text-slate-400 dark:bg-slate-800 dark:text-slate-500'
+    }
+  }
+
+  const showOfficeHoursPanel = (): void => {
+    const depts = departmentHours(topology.groups?.value ?? [])
+    if (!depts.length) {
+      panelShell(
+        'Office hours',
+        `<p class="text-slate-500 dark:text-slate-400">No departments on this system carry opening hours.</p>`
+      )
+      return
+    }
+    // Starts at now; the controls below move it without touching the clock.
+    let when = new Date()
+    let search = ''
+
+    const pad = (n: number): string => String(n).padStart(2, '0')
+    const dateValue = (d: Date): string =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    const timeValue = (d: Date): string => `${pad(d.getHours())}:${pad(d.getMinutes())}`
+
+    const card = (d: (typeof depts)[number]): string => {
+      const { state, why } = stateAt(d, when)
+      const meta = HOURS_STATE_META[state]
+      const today = when.getDay()
+      // A department with no schedule has nothing to lay out. Drawing the week
+      // anyway put "Closed" against all seven days, which says the opposite of
+      // what is actually known — that we have no hours for it either way.
+      const week = d.hours
+        ? `<table class="w-full">${weekView(d.hours)
+            .map((row) => {
+              const isToday = row.day === today
+              return `<tr class="${isToday ? 'font-semibold text-slate-700 dark:text-slate-200' : 'text-slate-500 dark:text-slate-400'}">
+            <td class="py-0.5 pr-3 whitespace-nowrap">${esc(row.name)}${isToday ? ' ·' : ''}</td>
+            <td class="py-0.5 font-mono">${esc(describeDay(row.periods))}</td>
+          </tr>`
+            })
+            .join('')}</table>`
+        : `<p class="text-slate-400 italic">No weekly schedule to show.</p>`
+      const breaks = weekView(d.breakTime)
+        .filter((r) => r.periods.length)
+        .map((r) => `${r.name.slice(0, 3)} ${describeDay(r.periods)}`)
+        .join(' · ')
+      const holidays = d.holidays.length
+        ? d.holidays
+            .map((h) => `${esc(h.name)} (${h.day}/${h.month}${h.recurring ? ', yearly' : ''})`)
+            .join(' · ')
+        : ''
+      return `<div class="rounded border border-slate-200 dark:border-slate-700 mb-2">
+        <div class="flex items-center gap-2 px-2 py-1.5 border-b border-slate-200 dark:border-slate-700">
+          <span class="flex-1 min-w-0 truncate font-medium">${esc(departmentLabel(d.bucket))}</span>
+          <span class="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold ${meta.cls}">${meta.label}</span>
+        </div>
+        <div class="px-2 py-1.5 text-[11px]">
+          <p class="text-slate-400 mb-1">${esc(why)}${d.timeZoneId ? ` · ${esc(d.timeZoneId)}` : ''}</p>
+          ${week}
+          ${breaks ? `<p class="mt-1 text-[10px] text-amber-600 dark:text-amber-400">Break: ${esc(breaks)}</p>` : ''}
+          ${holidays ? `<p class="mt-1 text-[10px] text-sky-600 dark:text-sky-400">Holidays: ${holidays}</p>` : ''}
+          ${d.forced ? `<p class="mt-1 text-[10px] text-rose-600 dark:text-rose-400">Override in force: ${esc(d.forced)}</p>` : ''}
+        </div>
+      </div>`
+    }
+
+    const draw = (): void => {
+      const q = search.trim().toLowerCase()
+      const shown = q
+        ? depts.filter((d) => departmentLabel(d.bucket).toLowerCase().includes(q))
+        : depts
+      whenEl.textContent = `${DAY_NAMES[when.getDay()]} ${timeValue(when)}`
+      listEl.innerHTML = shown.length
+        ? shown.map(card).join('')
+        : `<p class="text-xs text-slate-400">Nothing matches “${esc(search)}”.</p>`
+    }
+
+    // If not one department came back with an Hours field, the likely cause is
+    // the request, not the configuration. Say so rather than letting a wall of
+    // "Not set" imply the system has no opening hours.
+    const noneHaveHours = depts.every((d) => !d.hoursPresent)
+    const warning = noneHaveHours
+      ? `<p class="mb-2 px-2 py-1.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-[11px]">
+          3CX returned no opening hours for any department. That usually means this
+          build doesn't publish them on the Groups endpoint, rather than that none
+          are configured — check Departments in the 3CX console.
+        </p>`
+      : ''
+
+    const body = `
+      ${warning}
+      <div class="flex items-center gap-2 mb-2">
+        <input id="hoursDate" type="date" value="${dateValue(when)}" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-[11px]" />
+        <input id="hoursTime" type="time" value="${timeValue(when)}" class="px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-[11px]" />
+        <button id="hoursNow" class="px-2 py-1 rounded bg-slate-200 dark:bg-slate-700 text-[11px]">Now</button>
+        <span id="hoursWhen" class="ml-auto text-[11px] text-slate-400 tabular-nums"></span>
+      </div>
+      <input id="hoursSearch" type="text" placeholder="Find a department…" class="w-full mb-2 px-2 py-1 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-[11px]" />
+      <div id="hoursList"></div>
+      <p class="text-[10px] text-slate-400 mt-2 pt-2 border-t border-slate-200 dark:border-slate-700">
+        Times are read as this machine's local time. A department with no hours of
+        its own follows the system-wide schedule, which 3CX keeps separately.
+      </p>`
+    panelShell(`Office hours - ${depts.length}`, body)
+
+    const listEl = panel.querySelector<HTMLElement>('#hoursList')!
+    const whenEl = panel.querySelector<HTMLElement>('#hoursWhen')!
+    const dateEl = panel.querySelector<HTMLInputElement>('#hoursDate')!
+    const timeEl = panel.querySelector<HTMLInputElement>('#hoursTime')!
+    draw()
+
+    const setWhen = (): void => {
+      const next = new Date(`${dateEl.value}T${timeEl.value || '00:00'}`)
+      if (!Number.isNaN(next.getTime())) when = next
+      draw()
+    }
+    dateEl.addEventListener('change', setWhen)
+    timeEl.addEventListener('change', setWhen)
+    panel.querySelector('#hoursNow')!.addEventListener('click', () => {
+      when = new Date()
+      dateEl.value = dateValue(when)
+      timeEl.value = timeValue(when)
+      draw()
+    })
+    panel.querySelector<HTMLInputElement>('#hoursSearch')!.addEventListener('input', (e) => {
+      search = (e.target as HTMLInputElement).value
+      draw()
+    })
+  }
+
   const showDeepSearchPanel = (initial = ''): void => {
     const records = buildDeepIndex(topology)
     const fieldCount = countFields(records)
@@ -2831,7 +3021,10 @@ export function renderApp(
   const showUnhidePanel = (): void => {
     const ids = view.hiddenNodeIds()
     if (!ids.length) {
-      panelShell('Hidden nodes', `<p class="text-slate-500 dark:text-slate-400">Nothing is hidden.</p>`)
+      panelShell(
+        'Hidden nodes',
+        `<p class="text-slate-500 dark:text-slate-400">Nothing is hidden.</p>`
+      )
       // Stay registered: hiding something while this is open should fill it in.
       openPanelRefresh = showUnhidePanel
       return
@@ -2858,9 +3051,13 @@ export function renderApp(
       .map(([bucket, members]) => {
         const name = bucket ? departmentLabel(bucket) : 'No department'
         const rows = members
-          .sort((a, b) => (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true }))
+          .sort((a, b) =>
+            (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true })
+          )
           .map(
-            (n) => `<li class="flex items-center gap-2 px-1.5 py-0.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
+            (
+              n
+            ) => `<li class="flex items-center gap-2 px-1.5 py-0.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
               <span class="w-2 h-2 rounded-full shrink-0" style="background:${NODE_KIND_META[n.kind].color}"></span>
               <span class="flex-1 truncate">${esc(n.label)}${n.number ? ` <span class="text-slate-400 font-mono">${esc(n.number)}</span>` : ''}</span>
               <button data-unhide="${esc(n.id)}" class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-[10px] shrink-0">Unhide</button>
@@ -2932,7 +3129,8 @@ export function renderApp(
       .map((n) => {
         // A removed node isn't in the current graph, so it isn't navigable.
         const nav = n.change === 'removed' ? '' : `data-nav="${esc(n.id)}"`
-        const cursor = n.change === 'removed' ? '' : 'cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800'
+        const cursor =
+          n.change === 'removed' ? '' : 'cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800'
         return `<li ${nav} class="flex items-start gap-2 px-1.5 py-1 rounded ${cursor}">
           ${badge(n.change)}
           <span class="w-2 h-2 mt-1 rounded-full shrink-0" style="background:${NODE_KIND_META[n.kind].color}"></span>
@@ -3152,7 +3350,8 @@ function collectErrors(t: Topology): string[] {
     ['Inbound Rules', t.inboundRules],
     ['DID Numbers', t.didNumbers],
     ['Trunks', t.trunks],
-    ['Groups', t.groups]
+    ['Groups', t.groups],
+    ['Route points', t.callFlowApps ?? {}]
   ]
   return sets.filter(([, s]) => s.error).map(([name, s]) => `${name}: ${s.error}`)
 }

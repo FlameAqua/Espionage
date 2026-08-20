@@ -1,5 +1,5 @@
 {
-  "name": "3cx-spy",
+  "name": "espionage",
   "version": "1.0.0",
   "description": "Interactive graph viewer for a 3CX phone system's call flow",
   "main": "./out/main/index.js",

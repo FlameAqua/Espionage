@@ -37,8 +37,8 @@ import {
 import { applyEdgeRoutes } from '../graph/routing'
 import { readEdgeRouting } from './prefs'
 
-const DEPTH_KEY = '3cx-spy.egoDepth'
-const LAYOUT_KEY = '3cx-spy.egoLayout'
+const DEPTH_KEY = 'espionage.egoDepth'
+const LAYOUT_KEY = 'espionage.egoLayout'
 
 /** The mini-map's arrangement. Deliberately the same three the main View Mode
  *  offers, so the small view is a scaled-down version of the big one rather than

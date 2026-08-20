@@ -1,6 +1,6 @@
 # Espionage
 
-> Codebase / package name: `3cx-spy`.
+> Codebase / package name: `espionage`. The GitHub repository is still `FlameAqua/3cx-spy`, which is what the updater points at.
 
 An Electron + Vite desktop app that connects to a 3CX phone system and draws an
 interactive graph of its call flow — trunks and DIDs into inbound rules, into

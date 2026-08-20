@@ -69,6 +69,8 @@ export const ICONS = {
   moon: svg('<path d="M13.4 9.4A5.8 5.8 0 0 1 6.6 2.6a5.8 5.8 0 1 0 6.8 6.8Z"/>'),
   /** Heartbeat trace — the health check. */
   pulse: svg('<path d="M1.6 8h2.9l1.5-3.6L8.4 12l1.6-4 1 2h3.4"/>'),
+  /** Clock — opening hours. */
+  clock: svg('<circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.4 1.5"/>'),
   /** Second window — open this node in its own window. */
   window: svg('<rect x="1.8" y="3.4" width="9" height="8" rx="1.2"/><path d="M1.8 6.1h9"/><path d="M5.6 3.4V2.6a1.2 1.2 0 0 1 1.2-1.2h6.2a1.2 1.2 0 0 1 1.2 1.2v6.2a1.2 1.2 0 0 1-1.2 1.2h-.8"/>'),
   /** Card — copy the internal id. */

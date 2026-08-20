@@ -6,10 +6,12 @@
 // rather than hard-coding one schema. Anything that can't be resolved is kept
 // as an "unresolved" node and recorded as a warning so it's visible, not lost.
 
+import { groupRefs, parseCfdTransfers, scanScriptForDns } from './script-refs'
 import type { Topology } from '../../../shared/types'
 import {
   SHARED_DEPARTMENT,
   agentLoggedIn,
+  isRealDepartment,
   type GraphEdge,
   type GraphNode,
   type NodeKind,
@@ -113,7 +115,7 @@ class Builder {
   /** Resolve a destination reference (by number, then id) to an existing node,
    *  or synthesize an external/unresolved node so the route stays visible. */
   resolveTarget(
-    ref: { number?: string; id?: string; type?: string; external?: string },
+    ref: { number?: string; id?: string; type?: string; external?: string; name?: string },
     context: string
   ): GraphNode | null {
     if (ref.number) {
@@ -137,11 +139,26 @@ class Builder {
     // conference, voicemail, call-flow route points, …). These are real
     // destinations, not errors — show them as terminal endpoint nodes.
     if (KNOWN_ENDPOINT_TYPES.test(type) && ref.number) {
-      const label = `${prettyType(ref.type!)} ${ref.number}`.trim()
-      return this.addNode('endpoint', `${type}:${ref.number}`, label, {
-        Number: ref.number,
-        Type: ref.type
-      })
+      // Prefer what 3CX calls it. A route point is a Call Flow Designer script,
+      // and its name ("onecontact") is the only clue to what the script does —
+      // "Route Point 7771" says nothing at all.
+      const label = ref.name
+        ? `${ref.name} (${ref.number})`
+        : `${prettyType(ref.type!)} ${ref.number}`.trim()
+      // Carries its DN as the node's own number, not just a raw field, so it is
+      // findable by extension in search and reachable by number when something
+      // else routes to the same DN.
+      return this.addNode(
+        'endpoint',
+        `${type}:${ref.number}`,
+        label,
+        {
+          Number: ref.number,
+          Type: ref.type,
+          ...(ref.name ? { Name: ref.name } : {})
+        },
+        ref.number
+      )
     }
     // Pure "end call / hangup" style targets aren't worth a node.
     if (!ref.number && !ref.id) return null
@@ -164,7 +181,7 @@ class Builder {
 /** Detect & normalise a destination-shaped object into a target reference. */
 function asDestRef(
   v: unknown
-): { number?: string; id?: string; type?: string; external?: string } | null {
+): { number?: string; id?: string; type?: string; external?: string; name?: string } | null {
   if (!isObj(v)) return null
   // Newer xapi nests the real target under a Peer/Destination object.
   const peer = v['Peer'] ?? v['Destination'] ?? v['To']
@@ -173,6 +190,8 @@ function asDestRef(
     if (inner) {
       const external = str(pick(v, 'External', 'ExternalNumber'))
       if (external && !inner.external) inner.external = external
+      const outerName = str(pick(v, 'Name'))
+      if (outerName && !inner.name) inner.name = outerName
       return inner
     }
   }
@@ -188,12 +207,17 @@ function asDestRef(
   const id = isForwardRecord ? '' : str(pick(v, 'Id', 'PeerId', 'DestinationId'))
   const type = str(pick(v, 'Type', 'To', 'PeerType', 'DestinationType', 'ForwardType'))
   const external = str(pick(v, 'External', 'ExternalNumber'))
+  // 3CX names the destination inline for targets it doesn't publish as a
+  // collection of their own — a route point's script name arrives here and
+  // nowhere else, so it is the only thing that tells "onecontact" from "7771".
+  const name = str(pick(v, 'Name'))
   if (number || external || (id && type)) {
     return {
       number: number || undefined,
       id: id || undefined,
       type: type || undefined,
-      external: external || undefined
+      external: external || undefined,
+      name: name || undefined
     }
   }
   return null
@@ -428,7 +452,11 @@ const TRUNK_ROUTE_KEYS: [RegExp, string][] = [
  *  skipping it outright left every trunk as an island: the default destination a
  *  trunk points at is exactly what makes it part of the call flow. So the rule's
  *  destinations are attached to the TRUNK node instead of a node of their own. */
-function attachTrunkDefaultRoutes(b: Builder, topo: Topology, didToTrunk: Map<string, string>): void {
+function attachTrunkDefaultRoutes(
+  b: Builder,
+  topo: Topology,
+  didToTrunk: Map<string, string>
+): void {
   for (const rule of topo.inboundRules.value as Obj[]) {
     if (!isTrunkDefaultRule(rule)) continue
     const trunk = trunkForRule(b, rule, didToTrunk)
@@ -585,6 +613,32 @@ export function buildTopology(topo: Topology): TopologyGraph {
       number || undefined
     )
   }
+  // Route points. A Call Flow Designer script decides where a call goes at
+  // runtime, so nothing here can say what it does next — but a call arriving at
+  // one is no longer arriving at a bare number, and whether the script actually
+  // compiled and registered is the difference between a working call flow and a
+  // silent dead end.
+  for (const raw of (topo.callFlowApps?.value ?? []) as Obj[]) {
+    const number = str(pick(raw, 'Number'))
+    const node = b.addNode(
+      'routePoint',
+      number || str(pick(raw, 'Id')),
+      displayName(raw) || `Route Point ${number}`,
+      raw,
+      number || undefined
+    )
+    const info: { label: string; value: string }[] = []
+    const compiled = raw['CompilationSucceeded']
+    const invalid = raw['InvalidScript']
+    if (compiled === false || invalid === true)
+      info.push({ label: 'Script', value: 'Failed to compile' })
+    else if (compiled === true) info.push({ label: 'Script', value: 'Compiled' })
+    const lastOk = str(pick(raw, 'CompilationLastSuccess'))
+    if (lastOk) info.push({ label: 'Last built', value: lastOk })
+    const routing = str(pick(raw, 'RoutingType'))
+    if (routing) info.push({ label: 'Reached by', value: prettyType(routing) })
+    if (info.length) node.info = info
+  }
   for (const raw of topo.trunks.value as Obj[]) {
     const id = str(pick(raw, 'Id'))
     const number = str(pick(raw, 'Number'))
@@ -684,11 +738,65 @@ export function buildTopology(topo: Topology): TopologyGraph {
     if (number) collectForwardingProfiles(b, `user:${number}`, number, raw)
   }
 
+  // What each route point's script mentions. Runs after every real node exists,
+  // because a mention only counts when the DN belongs to something.
+  collectScriptReferences(b, topo)
+
   // Group nodes into department "buckets" for the Department layout. Needs all
   // edges to exist first, so this runs last.
   computeDeptGroups(b)
 
   return b.build()
+}
+
+/**
+ * Link each route point to the DNs its script mentions.
+ *
+ * These are not routes. A Call Flow Designer script chooses where a call goes
+ * while the call is happening, and nothing in the configuration records that —
+ * so the closest honest thing is "this script names this extension somewhere".
+ * They get their own link kind so they read, and can be hidden, as exactly that;
+ * each carries the line it was found on so the reader can judge it.
+ */
+function collectScriptReferences(b: Builder, topo: Topology): void {
+  const apps = (topo.callFlowApps?.value ?? []) as Obj[]
+  if (!apps.length) return
+  const knownDns = b.nodes.map((n) => n.number).filter((n): n is string => !!n)
+  if (!knownDns.length) return
+
+  for (const raw of apps) {
+    const script = str(pick(raw, 'ScriptCode'))
+    if (!script) continue
+    const number = str(pick(raw, 'Number'))
+    const self = b.getByNumber(number)
+    if (!self) continue
+    const refs = scanScriptForDns(script, knownDns, { self: number })
+    if (refs.length) self.scriptRefs = refs
+
+    // A CFD transfer component is a destination the script sets on purpose, and
+    // it carries the author's own name for the branch. Those take the link and
+    // the label; a DN that only appears somewhere is the weaker fallback.
+    const transfers = parseCfdTransfers(script)
+    const linked = new Set<string>()
+    for (const t of transfers) {
+      const target = b.getByNumber(t.number)
+      if (!target || target.id === self.id) continue
+      linked.add(t.number)
+      b.addEdge(
+        self.id,
+        target.id,
+        'script',
+        t.label ? `transfer: ${t.label}` : `transfer (line ${t.line})`
+      )
+    }
+    for (const { number: dn, refs: hits } of groupRefs(refs)) {
+      if (linked.has(dn)) continue
+      const target = b.getByNumber(dn)
+      if (!target || target.id === self.id) continue
+      const where = hits.length === 1 ? `line ${hits[0].line}` : `${hits.length} mentions`
+      b.addEdge(self.id, target.id, 'script', `mentioned in script (${where})`)
+    }
+  }
 }
 
 /** Assign each node to a department bucket for the Department layout: its own
@@ -968,8 +1076,7 @@ function attachDepartments(b: Builder, topo: Topology): void {
     node.departments ??= []
     if (!node.departments.includes(dept)) node.departments.push(dept)
   }
-  // 3CX's tenant-wide "DEFAULT" group is noise as a department badge.
-  const isReal = (dept: string): boolean => !!dept && !/^default$/i.test(dept)
+  const isReal = isRealDepartment
   // From each group's member list.
   for (const raw of topo.groups.value as Obj[]) {
     const dept = displayName(raw)

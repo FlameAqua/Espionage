@@ -273,4 +273,7 @@ export interface Topology {
   didNumbers: EntitySet
   trunks: EntitySet
   groups: EntitySet
+  /** Route points: the DNs a Call Flow Designer script is deployed on. Optional
+   *  because snapshots written before this existed simply won't have it. */
+  callFlowApps?: EntitySet
 }

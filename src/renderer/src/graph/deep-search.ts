@@ -117,6 +117,7 @@ export type CollectionKey =
   | 'didNumbers'
   | 'trunks'
   | 'groups'
+  | 'callFlowApps'
 
 /** Every collection the topology carries, in the order results are grouped —
  *  roughly the order a call travels: in off a trunk, through the rules, to the
@@ -127,6 +128,7 @@ export const DEEP_COLLECTIONS: Array<{ key: CollectionKey; label: string }> = [
   { key: 'didNumbers', label: 'DID numbers' },
   { key: 'outboundRules', label: 'Outbound rules' },
   { key: 'receptionists', label: 'IVRs' },
+  { key: 'callFlowApps', label: 'Route points' },
   { key: 'queues', label: 'Queues' },
   { key: 'ringGroups', label: 'Ring groups' },
   { key: 'users', label: 'Extensions' },
