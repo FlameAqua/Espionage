@@ -39,6 +39,8 @@ const api = {
   },
   app: {
     openWindow: (hash: string): Promise<void> => ipcRenderer.invoke('app:openWindow', hash),
+    /** The running app's version, for Settings to show. */
+    version: (): Promise<string> => ipcRenderer.invoke('app:version'),
     copy: (text: string): Promise<void> => ipcRenderer.invoke('app:copy', text),
     openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url),
     /** `defaultDir` pre-selects the folder configured in Settings. */

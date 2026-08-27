@@ -335,7 +335,11 @@ async function getPage(
   } catch {
     throw new Error(`Non-JSON response on ${path}.`)
   }
-  const page = Array.isArray(json.value) ? json.value : Array.isArray(json) ? (json as unknown[]) : []
+  const page = Array.isArray(json.value)
+    ? json.value
+    : Array.isArray(json)
+      ? (json as unknown[])
+      : []
   const count = Number(json['@odata.count'])
   return { page, total: Number.isFinite(count) && count >= 0 ? count : undefined }
 }
@@ -388,7 +392,9 @@ async function getCollection(path: string, opts: CollectionOptions = {}): Promis
     const remaining = total != null ? Math.ceil((total - skip) / PAGE_SIZE) : concurrency
     const batch = Math.max(1, Math.min(concurrency, remaining))
     const pages = await Promise.all(
-      Array.from({ length: batch }, (_, i) => getPage(sess, path, sep, skip + i * PAGE_SIZE, opts, false))
+      Array.from({ length: batch }, (_, i) =>
+        getPage(sess, path, sep, skip + i * PAGE_SIZE, opts, false)
+      )
     )
     let ended = false
     for (const p of pages) {
@@ -418,6 +424,105 @@ async function fetchSet(path: string): Promise<EntitySet> {
   }
 }
 
+/**
+ * Departments, with their opening hours attached.
+ *
+ * `OfficeHolidays` is a navigation property: it is simply absent unless asked
+ * for by name, so a department's holidays never arrive on the plain request.
+ * Ask for it alongside Members, and step down a rung at a time if the build
+ * rejects the combination — losing holidays is much better than losing the
+ * members every department box on the graph is built from.
+ */
+async function fetchGroups(): Promise<EntitySet> {
+  const shapes = [
+    '/xapi/v1/Groups?$expand=Members,OfficeHolidays',
+    '/xapi/v1/Groups?$expand=Members'
+  ]
+  let last: EntitySet | undefined
+  for (const path of shapes) {
+    const set = await fetchSet(path)
+    if (!set.error) return set
+    last = set
+  }
+  return last!
+}
+
+/**
+ * Configuration the graph never draws, fetched so Deep Search can reach it.
+ *
+ * Chosen against a live v20 PBX's $metadata (157 endpoints) rather than guessed.
+ * Everything reporting - Report*, *Statistics, *HistoryView, CallLogData,
+ * ActivityLog, AuditLog, EventLogs - is deliberately excluded: those are large,
+ * time-parameterised and not configuration. So are MyTokens / SecurityTokens,
+ * which hold refresh tokens and must never be pulled into a snapshot.
+ *
+ * A PBX that doesn't expose one of these answers 404, which fetchSet turns into
+ * an empty set (see below), so an absent endpoint costs a request and nothing
+ * more. Names differ between builds - Contacts exists here, Phones does not.
+ */
+const EXTRA_COLLECTIONS = [
+  ['parkings', '/xapi/v1/Parkings'],
+  ['fxs', '/xapi/v1/Fxs'],
+  ['fax', '/xapi/v1/Fax'],
+  ['contacts', '/xapi/v1/Contacts'],
+  ['customPrompts', '/xapi/v1/CustomPrompts'],
+  ['promptSets', '/xapi/v1/PromptSets'],
+  ['holidays', '/xapi/v1/Holidays'],
+  ['blackListNumbers', '/xapi/v1/BlackListNumbers'],
+  ['blocklist', '/xapi/v1/Blocklist'],
+  ['emergencyLocations', '/xapi/v1/EmergencyGeoLocations'],
+  ['sipDevices', '/xapi/v1/SipDevices'],
+  ['sbcs', '/xapi/v1/Sbcs']
+] as const
+
+/**
+ * Singletons: one record each, no `value` array.
+ *
+ * Worth the requests because this is where the system's own DNs are declared -
+ * the voicemail, conference, fax and parking extensions. Everywhere else in the
+ * API those numbers only ever appear as the target of a route, which is why the
+ * graph has to synthesise a node for them and can say nothing about what they
+ * are. Folded into one `systemSettings` set, each record tagged with the
+ * singleton it came from so a hit can say which page of 3CX to look on.
+ */
+const SYSTEM_SINGLETONS = [
+  'VoicemailSettings',
+  'ConferenceSettings',
+  'FaxServerSettings',
+  'CallParkingSettings',
+  'EmergencyNotificationsSettings',
+  'MusicOnHoldSettings',
+  'GeneralSettingsForPbx',
+  'OfficeHours',
+  'E164Settings',
+  'DialCodeSettings',
+  'PhonesSettings'
+] as const
+
+/** Fetch one singleton as a single-record set, or nothing if it isn't there. */
+async function fetchSingleton(name: string): Promise<Record<string, unknown> | null> {
+  const sess = session
+  if (!sess) return null
+  try {
+    // A singleton has no `value` array, so getCollection cannot read it: one
+    // plain GET, and anything other than a JSON object is treated as absent.
+    const res = await request(`${sess.baseUrl}/xapi/v1/${name}`, {
+      headers: { Authorization: `Bearer ${sess.token}`, Accept: 'application/json' },
+      allowInsecure: sess.allowInsecure
+    })
+    if (res.status < 200 || res.status >= 300) return null
+    const raw = JSON.parse(res.body) as Record<string, unknown> | null
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    // Strip OData's own annotations, then tag it so a search hit can name the
+    // settings page it came from.
+    const out: Record<string, unknown> = { Setting: name }
+    for (const [k, v] of Object.entries(raw)) if (!k.startsWith('@odata')) out[k] = v
+    return out
+  } catch {
+    return null
+  }
+}
+
 export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Promise<Topology> {
   if (!session) throw new Error('Not connected.')
 
@@ -430,7 +535,8 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
     outboundRules,
     didNumbers,
     trunks,
-    groups
+    groups,
+    callFlowApps
   ] = await Promise.all([
     fetchSet('/xapi/v1/Users?$expand=Groups,ForwardingProfiles'),
     fetchSet('/xapi/v1/Queues?$expand=Agents,Managers'),
@@ -442,7 +548,11 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
     fetchSet('/xapi/v1/OutboundRules'),
     fetchSet('/xapi/v1/DidNumbers'),
     fetchSet('/xapi/v1/Trunks'),
-    fetchSet('/xapi/v1/Groups?$expand=Members')
+    fetchGroups(),
+    // Route points: the DNs a Call Flow Designer script is deployed on. Without
+    // these a call routed into one dead-ends at a bare number, because nothing
+    // else in the API names them.
+    fetchSet('/xapi/v1/CallFlowApps')
   ])
 
   // Several endpoints reject $expand on some 3CX builds; retry bare on failure.
@@ -459,6 +569,20 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
     })
   )
   const [queues2, ringGroups2, groups2, users2, receptionists2] = retried
+
+  // Search-only configuration. Fetched after the spine so a slow or missing
+  // endpoint here can never hold up the graph, and every failure is already
+  // contained by fetchSet.
+  const extraSets = await Promise.all(EXTRA_COLLECTIONS.map(([, path]) => fetchSet(path)))
+  const singletons = await Promise.all(SYSTEM_SINGLETONS.map((n) => fetchSingleton(n)))
+  const extra: Record<string, EntitySet> = {}
+  EXTRA_COLLECTIONS.forEach(([key], i) => {
+    extra[key] = extraSets[i]
+  })
+  extra.systemSettings = {
+    path: '/xapi/v1/(singletons)',
+    value: singletons.filter((r): r is Record<string, unknown> => r !== null)
+  }
 
   // Per-queue agent logins aren't in the config API at all, so optionally read
   // them from the web client's Switchboard and stamp them onto the agent entries
@@ -481,8 +605,179 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
     outboundRules,
     didNumbers,
     trunks,
-    groups: groups2
+    groups: groups2,
+    // The script source travels through intact: it is the only thing that says
+    // what a route point does, and the details panel shows it. It is withheld
+    // when a snapshot is written instead — see stripScriptSource.
+    callFlowApps: await withScriptSources(callFlowApps, session),
+    ...extra
   })
+}
+
+/**
+ * Fill in each route point's `ScriptCode`, which the collection doesn't carry.
+ *
+ * `/xapi/v1/CallFlowApps` answers with everything about an app EXCEPT its
+ * source — 3CX leaves the large property out of the list response, the way
+ * OData services usually do. Reading the entity on its own returns it, so this
+ * asks once per route point. There are only ever a handful of them, and a
+ * failure is per-app and silent: no script simply means the details panel says
+ * it couldn't read one, which is the same thing it says for an older snapshot.
+ */
+/** The ways an OData service can be asked for one property of one entity. 3CX
+ *  doesn't document which it honours for ScriptCode, so each is tried in turn
+ *  and whichever answers is used for the rest — see probeScriptShape. */
+const SCRIPT_URL_SHAPES: Array<{
+  name: string
+  url: (base: string, id: string) => string
+  /** The raw-value form returns the script as the body, not as JSON. */
+  raw?: boolean
+}> = [
+  // Ordered by what a live v20 system actually answered: $select returns the
+  // source; a plain entity read answers 200 WITHOUT it, because the property is
+  // projected away unless asked for; the raw-value route doesn't exist (404).
+  // The losers stay as fallbacks in case another build differs.
+  { name: '$select', url: (b, id) => `${b}/xapi/v1/CallFlowApps(${id})?$select=ScriptCode` },
+  { name: 'entity', url: (b, id) => `${b}/xapi/v1/CallFlowApps(${id})` },
+  {
+    name: '$value',
+    url: (b, id) => `${b}/xapi/v1/CallFlowApps(${id})/ScriptCode/$value`,
+    raw: true
+  }
+]
+
+/** GET one URL and pull ScriptCode out of it, or say why not. */
+async function readScript(
+  sess: Session,
+  url: string,
+  raw: boolean
+): Promise<{ script?: string; why: string }> {
+  let res: RawResponse
+  try {
+    res = await request(url, {
+      headers: { Authorization: `Bearer ${sess.token}`, Accept: 'application/json' },
+      allowInsecure: sess.allowInsecure
+    })
+  } catch (err) {
+    return { why: `request failed (${(err as Error).message})` }
+  }
+  if (res.status < 200 || res.status >= 300) return { why: `HTTP ${res.status}` }
+  if (raw) {
+    return res.body ? { script: res.body, why: 'ok' } : { why: 'HTTP 200 but empty body' }
+  }
+  let json: Obj
+  try {
+    json = JSON.parse(res.body) as Obj
+  } catch {
+    return { why: 'HTTP 200 but the body was not JSON' }
+  }
+  const code = json?.['ScriptCode']
+  if (typeof code === 'string' && code) return { script: code, why: 'ok' }
+  if (code === null || code === '') return { why: 'HTTP 200, ScriptCode empty' }
+  return { why: 'HTTP 200 but no ScriptCode field' }
+}
+
+/** Ask the collection for Id + ScriptCode in one request. Returns an empty map
+ *  when the service won't widen the projection, which is the common case — the
+ *  property is left out of list responses precisely because it is large. */
+async function readScriptsFromCollection(): Promise<{ byId: Map<string, string>; why: string }> {
+  const byId = new Map<string, string>()
+  try {
+    // Read through getCollection rather than as a single request: 3CX caps $top
+    // at 100 and pages the rest, so a system with more route points than that
+    // would otherwise lose every script past the first page — silently, since
+    // the response is a perfectly valid 200.
+    const rows = (await getCollection('/xapi/v1/CallFlowApps?$select=Id,ScriptCode', {
+      concurrency: CONFIG_CONCURRENCY
+    })) as Obj[]
+    for (const row of rows) {
+      const code = row?.['ScriptCode']
+      const id = pickField(row ?? {}, 'Id')
+      if (id && typeof code === 'string' && code) byId.set(id, code)
+    }
+  } catch (err) {
+    return { byId, why: (err as Error).message }
+  }
+  return { byId, why: byId.size ? `ok (${byId.size})` : 'answered, but no ScriptCode in any row' }
+}
+
+/** Work out which URL shape this PBX answers for a script, trying each once and
+ *  keeping a note of what every one of them said. */
+async function probeScriptShape(
+  sess: Session,
+  id: string
+): Promise<{ shape?: (typeof SCRIPT_URL_SHAPES)[number]; script?: string; note: string }> {
+  const tried: string[] = []
+  for (const shape of SCRIPT_URL_SHAPES) {
+    const { script, why } = await readScript(sess, shape.url(sess.baseUrl, id), !!shape.raw)
+    tried.push(`${shape.name}: ${why}`)
+    if (script) return { shape, script, note: tried.join('; ') }
+  }
+  return { note: tried.join('; ') }
+}
+
+/**
+ * Fill in each route point's `ScriptCode`, which the collection doesn't carry.
+ *
+ * `/xapi/v1/CallFlowApps` answers with everything about an app EXCEPT its
+ * source — 3CX leaves the large property out of the list response, the way
+ * OData services usually do. Which request DOES return it isn't documented, so
+ * the first route point is used to probe the alternatives and the shape that
+ * answers is then used for the rest.
+ *
+ * Every attempt is recorded rather than swallowed. A script that can't be read
+ * is a normal outcome — a licence may gate it, a build may not expose it — but
+ * "couldn't read it" and "there isn't one" are different answers, and the first
+ * needs to say why. The note lands on the collection (so it shows under Fetch
+ * warnings) and on each app (so the details panel can explain itself).
+ */
+async function withScriptSources(set: EntitySet, sess: Session): Promise<EntitySet> {
+  const apps = set.value as Obj[]
+  if (!apps?.length) return set
+  // Already present (a future 3CX build might include it) — nothing to do.
+  if (apps.every((a) => typeof a['ScriptCode'] === 'string')) return set
+
+  // Cheapest shape first: ask the collection for the property it left out. One
+  // request covers every route point, and if the service honours $select here
+  // there is no need to read the entities one at a time.
+  const viaCollection = await readScriptsFromCollection()
+  if (viaCollection.byId.size) {
+    return {
+      ...set,
+      value: apps.map((a) => {
+        const script = viaCollection.byId.get(pickField(a, 'Id'))
+        return script ? { ...a, ScriptCode: script } : a
+      })
+    }
+  }
+
+  const first = apps.find((a) => typeof a['ScriptCode'] !== 'string' && pickField(a, 'Id'))
+  if (!first) return set
+  const firstId = pickField(first, 'Id')
+  const probe = await probeScriptShape(sess, firstId)
+  probe.note = `collection $select: ${viaCollection.why}; ${probe.note}`
+
+  if (!probe.shape) {
+    const why = `Route point scripts could not be read. Tried ${probe.note}.`
+    return {
+      ...set,
+      error: set.error ? `${set.error} ${why}` : why,
+      value: apps.map((a) => ({ ...a, ScriptSourceError: probe.note }))
+    }
+  }
+
+  const shape = probe.shape
+  const filled = await Promise.all(
+    apps.map(async (app) => {
+      if (typeof app['ScriptCode'] === 'string') return app
+      const id = pickField(app, 'Id')
+      if (!id) return app
+      if (id === firstId && probe.script) return { ...app, ScriptCode: probe.script }
+      const { script, why } = await readScript(sess, shape.url(sess.baseUrl, id), !!shape.raw)
+      return script ? { ...app, ScriptCode: script } : { ...app, ScriptSourceError: why }
+    })
+  )
+  return { ...set, value: filled }
 }
 
 // --- Per-queue agent logins (Switchboard read) -------------------------------
@@ -729,7 +1024,8 @@ export function guessHomeCountry(entries: CallLogEntry[]): string | undefined {
     // Reports written before Beta 9 kept the whole raw record instead of the
     // trunk number, so fall back to re-reading it from there.
     const trunkNum =
-      e.trunkNumber ?? (e.raw ? parseTrunkFromReason(pickField(e.raw, 'Reason'))?.number : undefined)
+      e.trunkNumber ??
+      (e.raw ? parseTrunkFromReason(pickField(e.raw, 'Reason'))?.number : undefined)
     const trunkIso = countryFromBareNumber(trunkNum)?.iso2
     if (trunkIso) trunkTally.set(trunkIso, (trunkTally.get(trunkIso) ?? 0) + 1)
     const extIso = parseInternational(e.external)?.iso2
@@ -1002,7 +1298,8 @@ async function pickCallLogEndpoint(
       const sample = rows.filter(isObj).map((r) => normalizeCallEntry(r as Obj))
       // No rows at all is not evidence either way, so it doesn't disqualify.
       const honoured = !sample.length || trimToPeriod(sample, fromISO, toISO).length > 0
-      const better = !out.tpl || (honoured && !out.honoured) || (!out.sample.length && sample.length)
+      const better =
+        !out.tpl || (honoured && !out.honoured) || (!out.sample.length && sample.length)
       if (better) {
         out.tpl = tpl
         out.path = path
@@ -1048,16 +1345,17 @@ async function readCallLog(
     })
   )
   return dedupeEntries(
-    pages.flat().filter(isObj).map((r) => normalizeCallEntry(r as Obj))
+    pages
+      .flat()
+      .filter(isObj)
+      .map((r) => normalizeCallEntry(r as Obj))
   )
 }
 
 /** The span of days a set of entries actually covers, for saying what an
  *  endpoint returned when it ignored the period it was given. */
 function datedRange(entries: CallLogEntry[]): { from: string; to: string } | null {
-  const times = entries
-    .map((e) => Date.parse(e.startTime ?? ''))
-    .filter((t) => Number.isFinite(t))
+  const times = entries.map((e) => Date.parse(e.startTime ?? '')).filter((t) => Number.isFinite(t))
   if (!times.length) return null
   return {
     from: localDay(new Date(Math.min(...times)).toISOString()),

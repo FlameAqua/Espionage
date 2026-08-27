@@ -179,6 +179,9 @@ interface SettingsCallbacks {
   onCheckUpdates: () => void
   /** Links hidden one-by-one (not by type) — restorable from here too. */
   individuallyHiddenEdges: number
+  /** Opens the hidden-links panel, which lists what is hidden and restores it a
+   *  piece at a time. Settings used to restore every individually hidden link at
+   *  once, which is the one thing the panel exists to avoid. */
   onRestoreHiddenEdges: () => void
   /** Panel/minimap sizing. */
   onRestoreLayout: () => void
@@ -261,7 +264,7 @@ export function showSettings(cb: SettingsCallbacks): void {
               <div class="text-slate-700 dark:text-slate-200 mb-1.5">Visible link types</div>
               <div class="grid grid-cols-2 gap-x-4">${linkTypes}</div>
               <div id="stEdgeRestoreWrap" class="mt-2 ${cb.individuallyHiddenEdges ? '' : 'hidden'}">
-                <button id="stEdgeRestore" class="${smallBtn}">Restore ${cb.individuallyHiddenEdges} individually hidden link${cb.individuallyHiddenEdges === 1 ? '' : 's'}</button>
+                <button id="stEdgeRestore" class="${smallBtn}">Show ${cb.individuallyHiddenEdges} individually hidden link${cb.individuallyHiddenEdges === 1 ? '' : 's'}...</button>
               </div>
             </div>` +
             (routeRows
@@ -354,7 +357,12 @@ export function showSettings(cb: SettingsCallbacks): void {
             'Application updates',
             `<button id="stUpdates" class="${smallBtn}">Check now</button>`,
             'Downloads in the background when one is available.'
-          )
+          ) +
+            `<div class="py-1.5 text-[11px] text-slate-400 space-y-0.5">
+              <div>Version <span class="font-mono" id="stVersion">-</span></div>
+              <div><a href="#" id="stRepo" class="underline hover:text-slate-600 dark:hover:text-slate-300">github.com/FlameAqua/Espionage</a></div>
+              <div class="text-slate-400">An independent project. Not affiliated with, endorsed by, or supported by 3CX.</div>
+            </div>`
         )}
 
       </div>
@@ -408,8 +416,9 @@ export function showSettings(cb: SettingsCallbacks): void {
   }
 
   overlay.querySelector('#stEdgeRestore')?.addEventListener('click', () => {
+    // The panel lives behind this dialog, so step out of the way first.
+    close()
     cb.onRestoreHiddenEdges()
-    overlay.querySelector('#stEdgeRestoreWrap')?.classList.add('hidden')
   })
 
   // --- Appearance: toggling the theme keeps the dialog open ---
@@ -484,4 +493,18 @@ export function showSettings(cb: SettingsCallbacks): void {
   })
 
   overlay.querySelector('#stUpdates')!.addEventListener('click', () => cb.onCheckUpdates())
+
+  overlay.querySelector('#stRepo')?.addEventListener('click', (evt) => {
+    evt.preventDefault()
+    void window.api.app.openExternal('https://github.com/FlameAqua/Espionage')
+  })
+
+  // Filled in once the main process answers; the dialog is usable without it.
+  void window.api.app
+    .version()
+    .then((v) => {
+      const el = overlay.querySelector('#stVersion')
+      if (el) el.textContent = v
+    })
+    .catch(() => {})
 }

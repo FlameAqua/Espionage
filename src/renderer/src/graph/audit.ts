@@ -103,6 +103,29 @@ export function auditTopology(graph: TopologyGraph): AuditFinding[] {
     }
   }
 
+  // 3b) Route points whose script isn't running. A Call Flow Designer script
+  // that failed to compile, or that isn't registered, still accepts the call and
+  // still looks like a destination — it just doesn't do anything with it. That
+  // is the worst kind of break to find by eye, because the configuration around
+  // it is perfectly correct.
+  for (const n of byKind('routePoint')) {
+    if (n.raw['CompilationSucceeded'] === false || n.raw['InvalidScript'] === true) {
+      findings.push({
+        category: 'Route points whose script failed to compile',
+        label: label(n),
+        nodeId: n.id,
+        severity: 'warn'
+      })
+    } else if (isFalse(n.raw, 'IsRegistered', 'Registered')) {
+      findings.push({
+        category: 'Route points not registered',
+        label: label(n),
+        nodeId: n.id,
+        severity: 'warn'
+      })
+    }
+  }
+
   // 4) Disabled extensions still present in the dial plan.
   for (const n of byKind('user')) {
     if (isFalse(n.raw, 'Enabled', 'IsEnabled')) {

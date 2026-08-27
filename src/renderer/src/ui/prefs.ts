@@ -9,6 +9,34 @@ const LAYOUT_KEY = 'espionage.defaultLayout'
 const QUEUE_LOGINS_KEY = 'espionage.queueLogins'
 const STRAIGHT_LINKS_KEY = 'espionage.straightLinks'
 
+/**
+ * Carry settings saved under the old `3cx-spy.` prefix over to `espionage.`.
+ *
+ * Half the keys were already `espionage.` and half still carried the package
+ * name, so renaming the rest would quietly have thrown away whatever theme,
+ * layout, focus reach and panel state the user had chosen. Copy rather than
+ * move: an older build reading the same profile still finds what it expects.
+ *
+ * Runs once at startup and is cheap — a handful of keys. It only ever fills a
+ * gap, so a value saved under the new name always wins.
+ */
+export function migrateLegacyPrefs(): void {
+  const OLD = '3cx-spy.'
+  const NEW = 'espionage.'
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (!key?.startsWith(OLD)) continue
+      const renamed = NEW + key.slice(OLD.length)
+      if (localStorage.getItem(renamed) !== null) continue
+      const value = localStorage.getItem(key)
+      if (value !== null) localStorage.setItem(renamed, value)
+    }
+  } catch {
+    /* storage unavailable — the app just opens on its defaults */
+  }
+}
+
 function read(key: string): string {
   try {
     return localStorage.getItem(key) ?? ''

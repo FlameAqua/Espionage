@@ -4,7 +4,7 @@ import { promises as fs } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import type { Topology, EntitySet } from '../shared/types'
-import { redactSecrets } from '../shared/redact'
+import { redactSecrets, stripScriptSource } from '../shared/redact'
 import { registerThreecxIpc } from './threecx/ipc'
 import { ensureReportsDir, registerReportIpc } from './reports'
 import { initUpdater } from './updater'
@@ -116,12 +116,14 @@ function normalizeTopology(raw: unknown): Topology | null {
     outboundRules: asEntitySet(o.outboundRules),
     didNumbers: asEntitySet(o.didNumbers),
     trunks: asEntitySet(o.trunks),
-    groups: asEntitySet(o.groups)
+    groups: asEntitySet(o.groups),
+    callFlowApps: asEntitySet(o.callFlowApps)
   })
 }
 
 function registerAppIpc(): void {
   ipcMain.handle('app:openWindow', (_evt, hash: string) => createWindow(hash))
+  ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('app:copy', (_evt, text: string) => clipboard.writeText(text))
   ipcMain.handle('app:openExternal', (_evt, url: string) => {
     // Only ever open web links (e.g. the 3CX console), never file:// etc.
@@ -152,7 +154,10 @@ function registerAppIpc(): void {
     const result = await (win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts))
     if (result.canceled || !result.filePath) return { canceled: true }
     try {
-      await fs.writeFile(result.filePath, JSON.stringify(topology, null, 2), 'utf8')
+      // A snapshot is a shareable file, so route-point script sources are
+      // withheld from it even though the app shows them on screen.
+      const safe = stripScriptSource(topology)
+      await fs.writeFile(result.filePath, JSON.stringify(safe, null, 2), 'utf8')
       return { path: result.filePath }
     } catch (err) {
       return { error: `Could not save snapshot: ${(err as Error).message}` }

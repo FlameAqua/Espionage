@@ -6,7 +6,7 @@ import type { ConnectRequest, Topology } from '../../shared/types'
 import { renderLogin } from './ui/login'
 import { loadSystems } from './ui/systems'
 import { playExit } from './ui/motion'
-import { readQueueLogins } from './ui/prefs'
+import { migrateLegacyPrefs, readQueueLogins } from './ui/prefs'
 import { renderApp, type ViewState, type AppCallbacks } from './ui/app'
 import { initUpdates } from './ui/updates'
 
@@ -245,6 +245,9 @@ async function start(): Promise<void> {
   }
   void showLogin()
 }
+
+// Settings saved under the old package-name prefix, before anything reads one.
+migrateLegacyPrefs()
 
 // Listen for auto-update events (toast lives on document.body, so it survives
 // the login <-> app re-renders below).

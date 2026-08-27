@@ -1,6 +1,6 @@
 # Espionage
 
-> Codebase / package name: `3cx-spy`.
+> Released from `github.com/FlameAqua/Espionage`.
 
 An Electron + Vite desktop app that connects to a 3CX phone system and draws an
 interactive graph of its call flow — trunks and DIDs into inbound rules, into
@@ -13,8 +13,8 @@ each. Click any node to inspect its details and relationships.
 - **Focus mode** (toolbar) → clicking a node collapses the graph to just that
   node + its direct connections; click a neighbour to walk outward. "Show all"
   exits. Great for untangling a large system.
-- **Layout** selector → Flow (hierarchical call flow), Force (compact blob),
-  Breadthfirst.
+- **View mode** selector → Flow (hierarchical call flow), Department (grouped
+  into department boxes), Compact (a dense grid for an inventory read).
 - **Zoom** with the +/− buttons, the slider, or the scroll wheel.
 - **Pan** by holding **Space** and dragging (disabled otherwise so clicks/drags
   on nodes stay precise).

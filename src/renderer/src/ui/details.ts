@@ -136,6 +136,7 @@ export function renderDetails(container: HTMLElement, node: GraphNode | null, ct
           ${moreInfo(node)}
         </details>
         ${sections.join('')}
+        ${scriptSection(node)}
         <details class="group">
           <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">Raw JSON</summary>
           <pre class="mt-2 p-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[11px] leading-snug overflow-x-auto text-slate-700 dark:text-slate-300">${esc(JSON.stringify(node.raw, null, 2))}</pre>
@@ -177,7 +178,10 @@ export function renderKindDetails(
       return a.localeCompare(b)
     })
     .map(
-      ([bucket, count]) => `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] bg-slate-100 dark:bg-slate-800">
+      ([
+        bucket,
+        count
+      ]) => `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] bg-slate-100 dark:bg-slate-800">
         <span class="w-2 h-2 rounded-full" style="background:${bucket ? departmentColor(bucket) : '#cbd5e1'}"></span>
         ${esc(bucket ? departmentLabel(bucket) : 'No department')} <span class="text-slate-400">${count}</span>
       </span>`
@@ -186,9 +190,13 @@ export function renderKindDetails(
 
   const rows = nodes
     .slice()
-    .sort((a, b) => (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true }))
+    .sort((a, b) =>
+      (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true })
+    )
     .map(
-      (n) => `<li data-nav="${esc(n.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
+      (
+        n
+      ) => `<li data-nav="${esc(n.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
         ${n.kind === 'user' ? presenceDot(n.raw) : `<span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${meta.color}"></span>`}
         <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(n.label)}</span>
         ${n.number ? `<span class="text-slate-400 font-mono text-xs">${esc(n.number)}</span>` : ''}
@@ -252,7 +260,9 @@ export function renderDepartmentDetails(
   // Links crossing the boundary tell you how the department is reached and where
   // it hands calls on to — usually the first thing you want from a tenant.
   const inbound = ctx.graph.edges.filter((e) => memberIds.has(e.target) && !memberIds.has(e.source))
-  const outbound = ctx.graph.edges.filter((e) => memberIds.has(e.source) && !memberIds.has(e.target))
+  const outbound = ctx.graph.edges.filter(
+    (e) => memberIds.has(e.source) && !memberIds.has(e.target)
+  )
   const nodeById = new Map(ctx.graph.nodes.map((n) => [n.id, n]))
 
   const counts = kinds
@@ -270,9 +280,13 @@ export function renderDepartmentDetails(
       const rows = byKind
         .get(k)!
         .slice()
-        .sort((a, b) => (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true }))
+        .sort((a, b) =>
+          (a.number ?? a.label).localeCompare(b.number ?? b.label, undefined, { numeric: true })
+        )
         .map(
-          (m) => `<li data-nav="${esc(m.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
+          (
+            m
+          ) => `<li data-nav="${esc(m.id)}" class="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800">
             ${m.kind === 'user' ? presenceDot(m.raw) : `<span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${NODE_KIND_META[m.kind].color}"></span>`}
             <span class="flex-1 truncate text-slate-700 dark:text-slate-200">${esc(m.label)}</span>
             ${m.number ? `<span class="text-slate-400 font-mono text-xs">${esc(m.number)}</span>` : ''}
@@ -521,7 +535,9 @@ function queueMembershipSection(
   const queues = inc
     .filter((e) => e.kind === 'agent')
     .map((e) => ({ queue: nodeById.get(e.source), edge: e }))
-    .filter((x): x is { queue: GraphNode; edge: GraphEdge } => !!x.queue && x.queue.kind === 'queue')
+    .filter(
+      (x): x is { queue: GraphNode; edge: GraphEdge } => !!x.queue && x.queue.kind === 'queue'
+    )
   if (!queues.length) return ''
   const rows = queues
     .map(
@@ -597,6 +613,67 @@ function memberStatusSection(
  *  A busy line carries dozens, which as flat "Sends …" fact rows pushed
  *  everything else off the panel — so they're collapsed into their own section,
  *  closed by default with the count on the summary. */
+/**
+ * A route point's Call Flow Designer script: the DNs it mentions, and the source
+ * itself.
+ *
+ * The references are deliberately framed as leads rather than routing. Nothing
+ * here knows which branch runs, so a DN in dead code and a DN the call actually
+ * goes to look identical — the line each was found on is shown so the reader can
+ * tell them apart, which is the only thing that can.
+ */
+function scriptSection(node: GraphNode): string {
+  if (node.kind !== 'routePoint') return ''
+  const script = typeof node.raw['ScriptCode'] === 'string' ? String(node.raw['ScriptCode']) : ''
+  const refs = node.scriptRefs ?? []
+  // Always shown for a route point, even with nothing to show. Hiding it when
+  // there was no source made the whole feature look absent rather than the
+  // script look unavailable, which is a different and much more confusing thing.
+
+  const refRows = refs.length
+    ? `<div class="mt-2 space-y-1">${refs
+        .map(
+          (r) => `<div class="text-[11px]">
+            <div class="flex items-baseline gap-2">
+              <span class="font-mono text-rose-600 dark:text-rose-400">${esc(r.number)}</span>
+              <span class="text-slate-400">line ${r.line}</span>
+            </div>
+            <code class="block truncate text-[10px] text-slate-500 dark:text-slate-400" title="${esc(r.text)}">${esc(r.text)}</code>
+          </div>`
+        )
+        .join('')}</div>`
+    : `<p class="mt-2 text-[11px] text-slate-400">The script doesn't mention any extension on this system.</p>`
+
+  // When the source is missing, say which it is: 3CX refusing to hand it over,
+  // a snapshot that never carried it, or a route point with no script at all.
+  // "No script source available" on its own is the least useful of the three.
+  const failure =
+    typeof node.raw['ScriptSourceError'] === 'string' ? String(node.raw['ScriptSourceError']) : ''
+  const withheld = script === '[script withheld from snapshot]'
+  const scriptBody =
+    script && !withheld
+      ? `<pre class="mt-2 p-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[10px] leading-snug overflow-auto max-h-80 text-slate-700 dark:text-slate-300">${esc(script)}</pre>
+       <p class="mt-1 text-[10px] text-slate-400">Read from the live system. Snapshots are written without it, because a script that calls out to a CRM or an API often has the key in the source.</p>`
+      : withheld
+        ? `<p class="mt-2 text-[11px] text-slate-400">This is a snapshot, and snapshots are written without script sources. Connect to the system to read it.</p>`
+        : failure
+          ? `<p class="mt-2 text-[11px] text-amber-600 dark:text-amber-400">3CX wouldn't hand over the script.</p>
+             <p class="mt-1 text-[10px] text-slate-400">What was tried, and what came back: <code class="break-all">${esc(failure)}</code></p>`
+          : `<p class="mt-2 text-[11px] text-slate-400">No script source came back for this route point, and 3CX didn't say why.</p>`
+
+  return `
+    <details class="group">
+      <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">
+        Mentioned in script${refs.length ? ` (${refs.length})` : ''}
+      </summary>
+      ${refRows}
+    </details>
+    <details class="group">
+      <summary class="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 select-none">Raw script</summary>
+      ${scriptBody}
+    </details>`
+}
+
 function outboundRulesSection(node: GraphNode): string {
   const rules = node.outboundRules ?? []
   if (!rules.length) return ''

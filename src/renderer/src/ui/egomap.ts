@@ -37,8 +37,8 @@ import {
 import { applyEdgeRoutes } from '../graph/routing'
 import { readEdgeRouting } from './prefs'
 
-const DEPTH_KEY = '3cx-spy.egoDepth'
-const LAYOUT_KEY = '3cx-spy.egoLayout'
+const DEPTH_KEY = 'espionage.egoDepth'
+const LAYOUT_KEY = 'espionage.egoLayout'
 
 /** The mini-map's arrangement. Deliberately the same three the main View Mode
  *  offers, so the small view is a scaled-down version of the big one rather than
@@ -153,10 +153,16 @@ export class EgoMap {
   /** Whether a link is switched off in Settings — by type, or because every route
    *  it carries has had its route type hidden (the same rule the canvas uses). */
   private edgeHidden(e: GraphEdge): boolean {
-    if (this.edgeOptions.hiddenKinds.includes(e.kind)) return true
     const routes = this.edgeOptions.hiddenRoutes
-    if (!routes.length || !e.labels.length) return false
-    return e.labels.every((l) => routes.includes(routeGroupOf(l)))
+    const kinds = this.edgeOptions.hiddenKinds
+    // A link with no routes of its own is judged by its type alone.
+    if (!e.labels.length) return kinds.includes(e.kind)
+    // Otherwise per route, since a bundle can mix types - the same rule the
+    // canvas uses (see survivingRoutes in graph/view.ts).
+    return e.labels.every((l, i) => {
+      const kind = e.labelKinds?.[i] ?? e.kind
+      return kinds.includes(kind) || routes.includes(routeGroupOf(l))
+    })
   }
 
   /** The centre node plus everything within `depth` hops of it. */

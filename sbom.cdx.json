@@ -19,14 +19,14 @@
       }
     ],
     "component": {
-      "bom-ref": "3cx-spy@1.0.0",
+      "bom-ref": "espionage@1.2.0",
       "type": "library",
-      "name": "3cx-spy",
+      "name": "espionage",
       "version": "1.0.0",
       "scope": "required",
       "author": "example.com",
       "description": "Interactive graph viewer for a 3CX phone system's call flow",
-      "purl": "pkg:npm/3cx-spy@1.0.0",
+      "purl": "pkg:npm/espionage@1.2.0",
       "properties": [],
       "externalReferences": [
         {
@@ -679,7 +679,7 @@
   ],
   "dependencies": [
     {
-      "ref": "3cx-spy@1.0.0",
+      "ref": "espionage@1.2.0",
       "dependsOn": [
         "@electron-toolkit/preload@3.0.2",
         "@electron-toolkit/utils@4.0.0",
