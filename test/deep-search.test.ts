@@ -22,7 +22,7 @@ const topo: Topology = {
         Number: '2001',
         FirstName: 'Alice',
         LastName: 'Byrne',
-        EmailAddress: 'alice@canices.ie',
+        EmailAddress: 'alice@example.com',
         MobileNumber: '353871234567',
         AuthPassword: '[redacted]',
         Groups: [{ Name: 'Sales', Rights: { RoleName: 'managers' } }],

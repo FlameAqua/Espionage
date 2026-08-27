@@ -49,11 +49,6 @@ jobs:
       # provider is configured in electron-builder.yml.
       - name: Build installers
         shell: bash
-        env:
-          # Read-only PAT embedded into the app so installed clients can read
-          # updates from the private repo. Add it under
-          # Settings → Secrets and variables → Actions → UPDATE_READ_TOKEN.
-          MAIN_VITE_UPDATE_TOKEN: ${{ secrets.UPDATE_READ_TOKEN }}
         run: |
           set -euo pipefail
           # Strip the leading "v": v1.0.0-beta.2 -> 1.0.0-beta.2

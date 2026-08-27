@@ -2,7 +2,7 @@
 // filtering, switchable layouts, theming, zoom control and space-to-pan.
 
 import cytoscape from 'cytoscape'
-import type { Core, ElementDefinition, NodeSingular } from 'cytoscape'
+import type { Core, EdgeSingular, ElementDefinition, NodeSingular } from 'cytoscape'
 import dagre from 'cytoscape-dagre'
 import {
   EDGE_KIND_META,
@@ -28,6 +28,15 @@ export type LayoutName = 'flow' | 'compact' | 'department'
  *  the foreground. Adjustable in Settings (see setEdgeMuting). */
 export const DEFAULT_EDGE_OPACITY = 0.5
 
+// Cytoscape's traversal methods live on the node/edge collection types rather
+// than on the general Collection, so the reach walks below have to say which
+// they are holding at each step.
+type NodeColl = cytoscape.NodeCollection
+type EdgeColl = cytoscape.EdgeCollection
+
+/** Reference size the edge-label widths are measured at, then scaled from. */
+const LABEL_MEASURE_PX = 100
+
 export interface EdgeTapInfo {
   sourceId: string
   targetId: string
@@ -37,6 +46,8 @@ export interface EdgeTapInfo {
   /** Set when one of the split-out per-route edges was tapped, so the details
    *  panel can call out which single route it was. */
   tappedLabel?: string
+  /** The id that hides just the tapped route, set alongside `tappedLabel`. */
+  tappedRouteId?: string
 }
 
 /** Everything the edge context menu needs: the link itself, plus the distinct
@@ -94,6 +105,9 @@ export class GraphView {
   private onWheel!: (e: WheelEvent) => void
   private didInitialFit = false
 
+  /** Set while a re-route is already queued for the end of this frame. */
+  private reroutePending = false
+
   private layoutName: LayoutName = 'flow'
   private visibleKinds: Set<NodeKind>
   private focusId: string | null = null
@@ -106,6 +120,12 @@ export class GraphView {
   private traceId: string | null = null
   private deptParentsActive = false
   private boxEl!: HTMLElement
+  /** Overlay the edge labels are painted onto (see setupEdgeLabels). */
+  private labelEl!: HTMLCanvasElement
+  /** measureText is the expensive part of the label pass and the same handful of
+   *  labels recur every frame, so a per-pixel-of-font-size width is kept per
+   *  typeface + text (see drawEdgeLabels). */
+  private labelWidths = new Map<string, number>()
   /** Nodes the user explicitly hid via the context menu. Wins over every filter. */
   private manuallyHidden = new Set<string>()
   /** Individual links hidden via the edge context menu. */
@@ -243,9 +263,12 @@ export class GraphView {
       // hides the whole link rather than one temporary stand-in — but the route
       // that was actually clicked still leads the per-route hide options.
       const isSplit = e.hasClass('route-split')
-      const baseId = isSplit ? String(e.id()).split('::route:')[0] : String(e.id())
+      const baseId = this.baseEdgeId(e)
       const base = this.cy.getElementById(baseId)
       const tappedLabel = isSplit ? String(e.data('label')) : undefined
+      // A per-route copy's own id is what hides that one route, so it survives
+      // the collapse back to the bundled link.
+      const tappedRouteId = isSplit ? String(e.id()) : undefined
       const labels = ((base.empty() ? e : base).data('labels') as string[]) ?? []
       const groups: string[] = []
       for (const l of tappedLabel ? [tappedLabel, ...labels] : labels) {
@@ -257,9 +280,13 @@ export class GraphView {
           edgeId: baseId,
           sourceId: String(e.data('source')),
           targetId: String(e.data('target')),
+          // A per-route copy carries its own type, so "hide all X links" from
+          // inside an expanded bundle acts on the route that was clicked rather
+          // than on whichever type the bundle happens to be coloured by.
           kind: String(e.data('kind')),
           labels,
           tappedLabel,
+          tappedRouteId,
           routeGroups: groups
         },
         oe?.clientX ?? 0,
@@ -324,6 +351,7 @@ export class GraphView {
     })
 
     this.setupBoxSelect(container)
+    this.setupEdgeLabels(container)
 
     this.applyVisibility()
     requestAnimationFrame(() => {
@@ -337,6 +365,129 @@ export class GraphView {
   /** Hold the right mouse button and drag on empty space to rubber-band a group
    *  of nodes; grabbing any one of them then moves the whole group together
    *  (Cytoscape's built-in grouped-drag on selected nodes). */
+  /** Edge labels are painted here rather than by cytoscape.
+   *
+   *  Cytoscape draws a label in the same pass as the link that owns it (see
+   *  drawCachedElement in its canvas renderer), so any link drawn afterwards
+   *  paints straight over it - which is what buries a label wherever links
+   *  converge on a lane. There is no stylesheet fix: every link carries a label,
+   *  so no z-order satisfies them all. One pass over a canvas above cytoscape's
+   *  own, run after each render, puts every label above every link.
+   *
+   *  The stylesheet stays the source of truth for font, colour, plate and
+   *  padding - they are read back per edge - and `text-opacity: 0` on the edge
+   *  selector is what stops cytoscape drawing the labels a second time
+   *  underneath. Label geometry is cytoscape's too: it is computed whatever the
+   *  text opacity, so the labels land exactly where they always did. */
+  private setupEdgeLabels(container: HTMLElement): void {
+    const canvas = document.createElement('canvas')
+    Object.assign(canvas.style, {
+      position: 'absolute',
+      top: '0',
+      left: '0',
+      // Never take a click: the link underneath must stay selectable.
+      pointerEvents: 'none',
+      // Above cytoscape's canvases, below the box-select rectangle.
+      zIndex: '4'
+    } as CSSStyleDeclaration)
+    container.appendChild(canvas)
+    this.labelEl = canvas
+    this.cy.on('render', this.drawEdgeLabels)
+  }
+
+  /** Bound so it can be removed on destroy, and so `this` survives the event. */
+  private drawEdgeLabels = (): void => {
+    const canvas = this.labelEl
+    const ctx = canvas?.getContext('2d')
+    if (!ctx) return
+
+    const dpr = window.devicePixelRatio || 1
+    const w = this.container.clientWidth
+    const h = this.container.clientHeight
+    if (w <= 0 || h <= 0) return
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr)
+      canvas.height = Math.round(h * dpr)
+      canvas.style.width = `${w}px`
+      canvas.style.height = `${h}px`
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, w, h)
+
+    const zoom = this.cy.zoom()
+    const pan = this.cy.pan()
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+
+    this.cy.edges().forEach((e) => {
+      if (!e.visible()) return
+      const text = String(e.data('label') ?? '')
+      if (!text) return
+
+      // Cytoscape's own label placement, in model coordinates.
+      const rs = (e as unknown as { _private?: { rscratch?: Record<string, unknown> } })._private
+        ?.rscratch
+      const mx = rs?.labelX
+      const my = rs?.labelY
+      if (typeof mx !== 'number' || typeof my !== 'number') return
+
+      const x = mx * zoom + pan.x
+      const y = my * zoom + pan.y
+      // Generous margins: the plate and a rotated label both overhang the point.
+      if (x < -200 || y < -80 || x > w + 200 || y > h + 80) return
+
+      const size = e.numericStyle('font-size') * zoom
+      // Below this the text is a smudge, and skipping it keeps a zoomed-out
+      // graph of several hundred links cheap to pan.
+      if (!(size >= 4)) return
+
+      const alpha = e.effectiveOpacity()
+      if (alpha <= 0) return
+
+      // An empty part would make the shorthand invalid, and an invalid assignment
+      // to ctx.font is ignored - leaving the previous edge's font in place.
+      const weight = e.style('font-weight') || 'normal'
+      const family = e.style('font-family') || 'sans-serif'
+      // Measured once per face at a reference size and scaled from there. Text
+      // width is linear in font size, and the size here carries the zoom - so
+      // caching against it would mint a fresh entry for every zoom level a
+      // scroll passes through, and never reuse one.
+      const key = `${weight} ${family} ${text}`
+      let unitW = this.labelWidths.get(key)
+      if (unitW === undefined) {
+        ctx.font = `${weight} ${LABEL_MEASURE_PX}px ${family}`
+        unitW = ctx.measureText(text).width / LABEL_MEASURE_PX
+        this.labelWidths.set(key, unitW)
+      }
+      ctx.font = `${weight} ${size}px ${family}`
+      const textW = unitW * size
+      const textH = size * 1.2
+
+      const angle = typeof rs?.labelAngle === 'number' ? (rs.labelAngle as number) : 0
+      ctx.save()
+      ctx.translate(x, y)
+      if (angle) ctx.rotate(angle)
+
+      const bgAlpha = e.numericStyle('text-background-opacity')
+      if (bgAlpha > 0) {
+        const pad = (e.numericStyle('text-background-padding') || 0) * zoom
+        ctx.globalAlpha = alpha * bgAlpha
+        ctx.fillStyle = e.style('text-background-color')
+        const bw = textW + pad * 2
+        const bh = textH + pad * 2
+        const r = Math.min(3 * zoom, bw / 2, bh / 2)
+        ctx.beginPath()
+        ctx.roundRect(-bw / 2, -bh / 2, bw, bh, r)
+        ctx.fill()
+      }
+
+      ctx.globalAlpha = alpha
+      ctx.fillStyle = e.style('color')
+      ctx.fillText(text, 0, 0)
+      ctx.restore()
+    })
+  }
+
   private setupBoxSelect(container: HTMLElement): void {
     const box = document.createElement('div')
     Object.assign(box.style, {
@@ -537,6 +688,24 @@ export class GraphView {
    *  dimmed window of a view-mode switch. So a failure here is contained: the
    *  links fall back to however the stylesheet draws them and the layout carries
    *  on, rather than taking the framing and the un-dimming down with it. */
+  /** Re-route once at the end of the frame.
+   *
+   *  A link is only routed while it is drawn (applyEdgeRoutes skips hidden ones),
+   *  and a hidden node stops being an obstacle - so any change to what is on
+   *  screen leaves the routes stale. Restoring a hidden link was the visible
+   *  case: it came back as the stylesheet's plain curve, because nothing had
+   *  routed it since it went away. Coalesced because a single user action can
+   *  run applyVisibility several times over. */
+  private scheduleReroute(): void {
+    if (this.reroutePending) return
+    this.reroutePending = true
+    requestAnimationFrame(() => {
+      this.reroutePending = false
+      if (this.cy.destroyed()) return
+      this.routeEdges()
+    })
+  }
+
   private routeEdges(edges?: cytoscape.EdgeCollection): void {
     try {
       applyEdgeRoutes(this.cy, this.edgeRouting, edges ? { only: edges } : {})
@@ -818,9 +987,21 @@ export class GraphView {
   private focusNeighbourhoodSet(id: string): cytoscape.Collection {
     const start = this.cy.getElementById(id)
     if (start.empty()) return this.cy.collection()
-    if (!Number.isFinite(this.focusDepth)) return start.component()
-    let hood = start.closedNeighborhood()
-    for (let hop = 1; hop < this.focusDepth; hop++) hood = hood.closedNeighborhood()
+    // Walk only the links that are actually drawn. A hidden link is not a way to
+    // reach anything, so crossing one would bring in a neighbour with nothing
+    // joining it to the focus node - a node floating on its own.
+    const live = this.liveEdges()
+    let hood = start
+    let frontier = start
+    for (let hop = 0; hop < this.focusDepth; hop++) {
+      const step = frontier.connectedEdges().intersection(live)
+      const next = step.connectedNodes().difference(hood)
+      // Infinity depth (the slider's top notch) means the whole cluster the
+      // focus node belongs to, which is just this walk run until it stops.
+      if (next.empty()) break
+      hood = hood.union(next).union(step)
+      frontier = next
+    }
     return hood
   }
 
@@ -883,7 +1064,7 @@ export class GraphView {
     this.cy.elements().removeClass('faded selected dim lit')
     const node = this.cy.getElementById(id)
     if (node.empty()) return
-    const nearIds = new Set(node.closedNeighborhood().map((e) => e.id()))
+    const nearIds = new Set(this.liveNeighbourhood(node).map((e) => e.id()))
     // Deliberately iterates ALL elements rather than `:visible`: this runs right
     // after applyVisibility()'s batch, whose display changes haven't been flushed
     // yet, so a `:visible` query still returns the PREVIOUS set — which left
@@ -1119,28 +1300,179 @@ export class GraphView {
     return [...this.hiddenEdgeIds]
   }
 
-  /** Whether every route a link carries has had its type hidden. A collapsed link
-   *  bundles several routes, so it only disappears once nothing it carries would
-   *  still be shown — hiding "timeout" mustn't take out the link's main route. */
-  private routesSuppressed(labels: string[]): boolean {
-    if (!this.hiddenRouteGroups.size || !labels.length) return false
-    return labels.every((l) => this.hiddenRouteGroups.has(routeGroupOf(l)))
+  /** Bring a bundled link's label and colour in line with the routes it still
+   *  carries. Hiding every "manager" route out of a link that also carries a
+   *  "member" one has to leave a member link behind, not an unchanged "2 routes"
+   *  that still lists the manager when you click it. */
+  private retagBundle(e: EdgeSingular): void {
+    const labels = (e.data('labels') as string[]) ?? []
+    if (!labels.length) return
+    const keep = this.survivingRoutes(e)
+
+    const label = compactEdgeLabel(keep.map((i) => labels[i]))
+    if (e.data('label') !== label) e.data('label', label)
+
+    const kinds = (e.data('labelKinds') as string[] | undefined) ?? []
+    const fallback = String(e.data('kind'))
+    const distinct = new Set(keep.map((i) => kinds[i] ?? fallback))
+    // Only recoloured when what is left is all of one type. A bundle that still
+    // mixes types keeps the colour of its dominant kind, as before.
+    const shownKind = distinct.size === 1 ? [...distinct][0] : fallback
+    const current = String(e.data('kindShown') ?? fallback)
+    if (shownKind !== current) {
+      e.removeClass(current).addClass(shownKind)
+      e.data('kindShown', shownKind)
+    }
   }
 
-  /** How many links are hidden right now, individually or by type / route type. */
-  hiddenEdgeCount(): number {
-    let n = this.hiddenEdgeIds.size
-    if (this.hiddenEdgeKinds.size || this.hiddenRouteGroups.size) {
-      this.cy.edges().forEach((e) => {
-        if (e.hasClass('route-split')) return
-        if (this.hiddenEdgeIds.has(String(e.id()))) return // already counted
-        if (
-          this.hiddenEdgeKinds.has(String(e.data('kind'))) ||
-          this.routesSuppressed((e.data('labels') as string[]) ?? [])
-        )
-          n++
-      })
+  /** The link a per-route copy came from; the link itself otherwise. */
+  private baseEdgeId(e: EdgeSingular): string {
+    return e.hasClass('route-split') ? String(e.id()).split('::route:')[0] : String(e.id())
+  }
+
+  /** The id that hides one single route out of a bundled link. It is the id its
+   *  per-route copy is given when the link is expanded, so hiding a route from
+   *  the expanded view and hiding it from the collapsed one are the same act. */
+  private routeEdgeId(baseId: string, index: number): string {
+    return `${baseId}::route:${index}`
+  }
+
+  /** Which of a link's routes are still shown, as indices into its own `labels`.
+   *
+   *  A link bundles every relationship between the same two nodes (see addEdge in
+   *  build.ts), and those can be of different types — a queue's manager who is
+   *  also a ring group member collapses into one link. So "is this filtered out"
+   *  has to be asked per route and not per link, otherwise hiding one type either
+   *  takes the whole bundle or misses it entirely depending on which relationship
+   *  happened to be recorded first. */
+  private survivingRoutes(e: EdgeSingular): number[] {
+    const labels = (e.data('labels') as string[]) ?? []
+    const kinds = (e.data('labelKinds') as string[] | undefined) ?? []
+    const fallback = String(e.data('kind'))
+    const baseId = this.baseEdgeId(e)
+    const out: number[] = []
+    for (let i = 0; i < labels.length; i++) {
+      if (this.hiddenEdgeIds.has(this.routeEdgeId(baseId, i))) continue
+      if (this.hiddenEdgeKinds.has(kinds[i] ?? fallback)) continue
+      const group = routeGroupOf(labels[i])
+      if (group && this.hiddenRouteGroups.has(group)) continue
+      out.push(i)
     }
+    return out
+  }
+
+  /** Whether a link is currently filtered out — hidden outright, or left with no
+   *  route still worth drawing. This is what "not drawn" means, so it also
+   *  decides what counts as a connection when a reach is walked (see
+   *  focusNeighbourhoodSet). */
+  private edgeSuppressed(e: EdgeSingular): boolean {
+    const baseId = this.baseEdgeId(e)
+    // Hiding the link itself takes everything it carries.
+    if (this.hiddenEdgeIds.has(baseId)) return true
+    if (e.hasClass('route-split')) {
+      // A per-route copy stands for exactly one route of its link, and is judged
+      // on that route alone.
+      const index = Number(e.data('routeIndex'))
+      if (Number.isFinite(index) && this.hiddenEdgeIds.has(this.routeEdgeId(baseId, index)))
+        return true
+      if (this.hiddenEdgeKinds.has(String(e.data('kind')))) return true
+      const group = routeGroupOf(String(e.data('label') ?? ''))
+      return !!group && this.hiddenRouteGroups.has(group)
+    }
+    const labels = (e.data('labels') as string[]) ?? []
+    // A link carrying no routes of its own is judged by its type alone.
+    if (!labels.length) return this.hiddenEdgeKinds.has(String(e.data('kind')))
+    return this.survivingRoutes(e).length === 0
+  }
+
+  /** Every link currently drawn. This is what "connected" has to mean once links
+   *  can be hidden - otherwise a reach crosses a link that isn't there. */
+  private liveEdges(): cytoscape.EdgeCollection {
+    return this.cy.edges().filter((e) => !this.edgeSuppressed(e))
+  }
+
+  /** `node`, the nodes one drawn link away, and the links between them. */
+  private liveNeighbourhood(node: NodeSingular): cytoscape.Collection {
+    const step = node.connectedEdges().intersection(this.liveEdges())
+    return node.union(step).union(step.connectedNodes())
+  }
+
+  /** `nodes` grown outward `depth` hops over drawn links only, or to the whole
+   *  connected cluster when the depth is Infinity. The collection form of
+   *  liveNeighbourhood, for a department's members rather than one node. */
+  private liveReach(nodes: NodeColl, depth: number): cytoscape.Collection {
+    const live = this.liveEdges()
+    let acc = nodes
+    let edges = this.cy.collection() as unknown as EdgeColl
+    let frontier = nodes
+    for (let hop = 0; hop < depth; hop++) {
+      const step = frontier.connectedEdges().intersection(live) as EdgeColl
+      const next = step.connectedNodes().difference(acc) as unknown as NodeColl
+      if (next.empty()) break
+      acc = acc.union(next) as unknown as NodeColl
+      edges = edges.union(step) as unknown as EdgeColl
+      frontier = next
+    }
+    return acc.union(edges)
+  }
+
+  /** Everything a call can reach from `start`, and everything that can reach it,
+   *  following drawn links only. Cytoscape's successors()/predecessors() walk the
+   *  whole model graph, so a corridor could otherwise run through a link that is
+   *  not on screen - a path the person tracing it cannot see. The two directions
+   *  are walked independently, so a node reachable both ways is found both ways. */
+  private liveFlow(start: NodeSingular): {
+    succ: cytoscape.Collection
+    pred: cytoscape.Collection
+  } {
+    const live = this.liveEdges()
+    const walk = (downstream: boolean): cytoscape.Collection => {
+      let nodes = this.cy.collection() as unknown as NodeColl
+      let edges = this.cy.collection() as unknown as EdgeColl
+      let frontier = start as unknown as NodeColl
+      for (;;) {
+        const out = downstream ? frontier.outgoers('edge') : frontier.incomers('edge')
+        const step = out.intersection(live) as EdgeColl
+        if (step.empty()) break
+        const reached = (downstream ? step.targets() : step.sources()) as unknown as NodeColl
+        // The start node is never counted as reached: it anchors the corridor
+        // rather than sitting on either side of it.
+        const next = reached.difference(nodes.union(start)) as unknown as NodeColl
+        nodes = nodes.union(reached) as unknown as NodeColl
+        edges = edges.union(step) as unknown as EdgeColl
+        if (next.empty()) break
+        frontier = next
+      }
+      return nodes.union(edges)
+    }
+    return { succ: walk(true), pred: walk(false) }
+  }
+
+  /** How many links are not drawn right now, whether that is because the link
+   *  itself was hidden or because every route it carried has been. Counted off
+   *  the graph rather than off the hidden-id set, which since routes became
+   *  individually hideable holds a mix of link ids and route ids. */
+  hiddenEdgeCount(): number {
+    let n = 0
+    this.cy.edges().forEach((e) => {
+      if (e.hasClass('route-split')) return
+      if (this.edgeSuppressed(e)) n++
+    })
+    return n
+  }
+
+  /** Routes taken out of links that are still drawn. These are invisible to
+   *  hiddenEdgeCount - the link is still there - but they are still something
+   *  hidden that has to be findable to put back, so they are counted separately
+   *  rather than folded into a link count they would falsify. */
+  hiddenRouteCount(): number {
+    let n = 0
+    this.cy.edges().forEach((e) => {
+      if (e.hasClass('route-split')) return
+      if (this.edgeSuppressed(e)) return
+      const labels = (e.data('labels') as string[]) ?? []
+      if (labels.length) n += labels.length - this.survivingRoutes(e).length
+    })
     return n
   }
 
@@ -1168,27 +1500,40 @@ export class GraphView {
     const edge = this.cy.getElementById(edgeId)
     if (edge.empty() || !edge.isEdge()) return false
     const labels = (edge.data('labels') as string[]) ?? []
+    const kinds = (edge.data('labelKinds') as string[] | undefined) ?? []
+    const fallback = String(edge.data('kind'))
     const source = String(edge.data('source'))
     const target = String(edge.data('target'))
     this.spotlightPair(source, target)
-    if (labels.length < 2) return false
 
-    const kind = String(edge.data('kind'))
+    // Only what is actually still drawn: expanding a link must not put back a
+    // route that a hidden link type or an earlier per-route hide took out.
+    const keep = this.survivingRoutes(edge as EdgeSingular)
+    if (keep.length < 2) return false
+
     this.splitEdgeId = edgeId
     edge.addClass('hidden')
     this.cy.add(
-      labels.map((label, i) => ({
-        group: 'edges' as const,
-        data: {
-          id: `${edgeId}::route:${i}`,
-          source,
-          target,
-          label,
-          kind,
-          labels: [label]
-        },
-        classes: `${kind} route-split`
-      }))
+      keep.map((i) => {
+        const kind = kinds[i] ?? fallback
+        return {
+          group: 'edges' as const,
+          data: {
+            // Indexed by the route's position in the link's own labels, so the
+            // copy's id is the id that hides that one route — hiding it here and
+            // hiding it from the collapsed link are the same act.
+            id: this.routeEdgeId(edgeId, i),
+            source,
+            target,
+            label: labels[i],
+            kind,
+            labels: [labels[i]],
+            labelKinds: [kind],
+            routeIndex: i
+          },
+          classes: `${kind} route-split`
+        }
+      })
     )
     return true
   }
@@ -1242,9 +1587,11 @@ export class GraphView {
     let traceIds: Set<string> | null = null
     if (this.traceId) {
       const start = this.cy.getElementById(this.traceId)
-      traceIds = start.empty()
-        ? new Set<string>()
-        : new Set(start.successors().union(start.predecessors()).union(start).map((e) => e.id()))
+      if (start.empty()) traceIds = new Set<string>()
+      else {
+        const { succ, pred } = this.liveFlow(start)
+        traceIds = new Set(succ.union(pred).union(start).map((e) => e.id()))
+      }
     }
 
     let deptIds: Set<string> | null = null
@@ -1256,12 +1603,7 @@ export class GraphView {
       // A department is a focused view too, so Focus Reach grows it: 1 hop = the
       // members plus what they touch, higher = further out, top notch = the whole
       // connected cluster they belong to.
-      let hood = Number.isFinite(this.focusDepth)
-        ? members.closedNeighborhood()
-        : members.component()
-      for (let hop = 1; Number.isFinite(this.focusDepth) && hop < this.focusDepth; hop++) {
-        hood = hood.closedNeighborhood()
-      }
+      const hood = this.liveReach(members, this.focusDepth)
       deptIds = new Set(hood.map((e) => e.id()))
       // Also walk backward — who routes INTO a member — several hops deep, so
       // the whole entry chain (e.g. Inbound Rule -> shared main IVR -> this
@@ -1271,7 +1613,9 @@ export class GraphView {
       // never leaks into a shared node's other branches.
       let frontier = members
       for (let hop = 0; hop < 6 && !frontier.empty(); hop++) {
-        const ancestors = frontier.incomers('node')
+        const ancestors = (
+          frontier.incomers('edge').intersection(this.liveEdges()) as EdgeColl
+        ).sources()
         const fresh = ancestors.filter((n) => !deptIds!.has(n.id()))
         if (fresh.empty()) break
         fresh.forEach((n) => {
@@ -1311,16 +1655,12 @@ export class GraphView {
       this.cy.edges().forEach((e) => {
         const endpointsVisible =
           !e.source().hasClass('hidden') && !e.target().hasClass('hidden')
-        // A per-route copy inherits the hidden state of the edge it split from.
-        const baseId = e.hasClass('route-split') ? String(e.id()).split('::route:')[0] : e.id()
         // A split copy carries exactly one label, so a hidden route type removes
         // just that route from an expanded link and leaves its siblings drawn.
-        const suppressed =
-          this.hiddenEdgeIds.has(baseId) ||
-          this.hiddenEdgeKinds.has(String(e.data('kind'))) ||
-          this.routesSuppressed((e.data('labels') as string[]) ?? [])
+        const suppressed = this.edgeSuppressed(e)
         // The collapsed edge stays hidden while its per-route copies stand in.
         e.toggleClass('hidden', !endpointsVisible || suppressed || e.id() === this.splitEdgeId)
+        if (!suppressed && !e.hasClass('route-split')) this.retagBundle(e)
       })
       // Department boxes: hide any box left with no visible member.
       if (this.deptParentsActive) {
@@ -1330,6 +1670,7 @@ export class GraphView {
         })
       }
     })
+    this.scheduleReroute()
     this.cb.onVisibilityChange?.()
   }
 
@@ -1396,8 +1737,7 @@ export class GraphView {
   traceFlow(id: string): { sources: GraphNode[]; terminals: GraphNode[] } {
     const start = this.cy.getElementById(id)
     if (start.empty() || !start.data('model')) return { sources: [], terminals: [] }
-    const succ = start.successors()
-    const pred = start.predecessors()
+    const { succ, pred } = this.liveFlow(start)
     this.cy.elements().removeClass('selected dim lit')
     this.cy.elements().not('.dept-parent').addClass('faded')
     const corridor = succ.union(pred).union(start)
@@ -1408,14 +1748,16 @@ export class GraphView {
     const terminals: GraphNode[] = []
     succ.nodes().forEach((n) => {
       const model = n.data('model') as GraphNode | undefined
-      // Downstream leaf: a real node with no onward edge (end of the call path).
-      if (model && n.outgoers('edge').empty()) terminals.push(model)
+      // Downstream leaf: a real node with no onward DRAWN edge (end of the path).
+      if (model && n.outgoers('edge').intersection(this.liveEdges()).empty())
+        terminals.push(model)
     })
     const sources: GraphNode[] = []
     pred.nodes().forEach((n) => {
       const model = n.data('model') as GraphNode | undefined
-      // Upstream root: nothing feeds into it, so a call originates there.
-      if (model && n.incomers('edge').empty()) sources.push(model)
+      // Upstream root: nothing drawn feeds into it, so a call originates there.
+      if (model && n.incomers('edge').intersection(this.liveEdges()).empty())
+        sources.push(model)
     })
     return { sources, terminals }
   }
@@ -1457,7 +1799,7 @@ export class GraphView {
   }
 
   private highlightNeighbourhood(node: NodeSingular): void {
-    const hood = node.closedNeighborhood()
+    const hood = this.liveNeighbourhood(node)
     this.cy.elements().removeClass('selected dim lit')
     // Exclude the department boxes — see highlightKind for why.
     this.cy.elements().not('.dept-parent').addClass('faded')
@@ -1470,6 +1812,9 @@ export class GraphView {
     this.resizeObserver.disconnect()
     this.container.removeEventListener('wheel', this.onWheel)
     this.boxEl?.remove()
+    this.cy.off('render', this.drawEdgeLabels)
+    this.labelEl?.remove()
+    this.labelWidths.clear()
     this.cy.destroy()
   }
 }
@@ -1515,7 +1860,11 @@ function toElements(graph: TopologyGraph): ElementDefinition[] {
         target: e.target,
         label: compactEdgeLabel(e.labels),
         kind: e.kind,
-        labels: e.labels
+        // The colour currently applied, which retagBundle moves off `kind` when
+        // filtering leaves a bundle carrying only one other type.
+        kindShown: e.kind,
+        labels: e.labels,
+        labelKinds: e.labelKinds ?? []
       },
       classes: e.kind
     })
@@ -1669,9 +2018,17 @@ function buildStyle(
         label: 'data(label)',
         'font-size': 8,
         color: edgeLabelColor,
+        // An opaque plate behind the text, not a tint. Cytoscape draws a label in
+        // the same pass as the link it belongs to, so there is no way to put every
+        // label above every link - the plate is what keeps a label readable where
+        // links converge, by masking everything drawn beneath it.
         'text-background-color': edgeLabelBg,
-        'text-background-opacity': 0.85,
-        'text-background-padding': '1px'
+        'text-background-opacity': 1,
+        'text-background-shape': 'roundrectangle',
+        'text-background-padding': '2px',
+        // Read back by drawEdgeLabels, which does the actual drawing. Zero here
+        // only stops cytoscape painting a second copy under the links.
+        'text-opacity': 0
       }
     },
     // Self-loops (an IVR's "repeat prompt" routes back to itself). Loops need
@@ -1820,7 +2177,9 @@ function buildStyle(
     { selector: 'edge.dim', style: { opacity: Math.max(0.06, edgeOpacity * 0.3) } },
     // The links being highlighted are always drawn at full strength, whatever the
     // global opacity, so the corridor under inspection reads clearly.
-    { selector: 'edge.lit', style: { opacity: 1, width: 2.2 } },
+    // Drawn last, so the corridor under inspection carries its labels above the
+    // links crossing it (see the note on the base edge label style).
+    { selector: 'edge.lit', style: { opacity: 1, width: 2.2, 'z-index': 30 } },
     {
       selector: 'node.selected',
       style: {

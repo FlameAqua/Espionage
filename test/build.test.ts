@@ -238,3 +238,41 @@ describe('buildTopology — extension contact details', () => {
     expect(bare?.searchTerms ?? []).toHaveLength(0)
   })
 })
+
+// A queue's manager who is also one of its agents collapses into a single
+// source→target link. Filtering by link type is decided per route (see
+// survivingRoutes in graph/view.ts), so each label has to carry its own kind —
+// the link's own `kind` is only whichever relationship was recorded first.
+describe('buildTopology — mixed-kind bundles', () => {
+  const g = buildTopology({
+    ...topo,
+    queues: {
+      path: '',
+      value: [
+        {
+          Number: '8000',
+          Name: 'Sales',
+          Id: '10',
+          Agents: [{ Number: '2001', Id: '1' }],
+          Managers: [{ Number: '2001', Id: '1' }]
+        }
+      ]
+    }
+  })
+  const edge = g.edges.find((e) => e.source === 'queue:8000' && e.target === 'user:2001')
+
+  it('bundles both relationships onto one link', () => {
+    expect(edge?.labels.length).toBeGreaterThan(1)
+  })
+
+  it('records a kind for every label, in the same order', () => {
+    expect(edge?.labelKinds).toHaveLength(edge!.labels.length)
+    const manager = edge!.labels.findIndex((l) => l.includes('manager'))
+    expect(manager).toBeGreaterThanOrEqual(0)
+    expect(edge!.labelKinds?.[manager]).toBe('manager')
+  })
+
+  it('keeps the link itself tagged with its first relationship', () => {
+    expect(edge?.kind).toBe('agent')
+  })
+})

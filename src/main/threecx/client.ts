@@ -447,6 +447,82 @@ async function fetchGroups(): Promise<EntitySet> {
   return last!
 }
 
+/**
+ * Configuration the graph never draws, fetched so Deep Search can reach it.
+ *
+ * Chosen against a live v20 PBX's $metadata (157 endpoints) rather than guessed.
+ * Everything reporting - Report*, *Statistics, *HistoryView, CallLogData,
+ * ActivityLog, AuditLog, EventLogs - is deliberately excluded: those are large,
+ * time-parameterised and not configuration. So are MyTokens / SecurityTokens,
+ * which hold refresh tokens and must never be pulled into a snapshot.
+ *
+ * A PBX that doesn't expose one of these answers 404, which fetchSet turns into
+ * an empty set (see below), so an absent endpoint costs a request and nothing
+ * more. Names differ between builds - Contacts exists here, Phones does not.
+ */
+const EXTRA_COLLECTIONS = [
+  ['parkings', '/xapi/v1/Parkings'],
+  ['fxs', '/xapi/v1/Fxs'],
+  ['fax', '/xapi/v1/Fax'],
+  ['contacts', '/xapi/v1/Contacts'],
+  ['customPrompts', '/xapi/v1/CustomPrompts'],
+  ['promptSets', '/xapi/v1/PromptSets'],
+  ['holidays', '/xapi/v1/Holidays'],
+  ['blackListNumbers', '/xapi/v1/BlackListNumbers'],
+  ['blocklist', '/xapi/v1/Blocklist'],
+  ['emergencyLocations', '/xapi/v1/EmergencyGeoLocations'],
+  ['sipDevices', '/xapi/v1/SipDevices'],
+  ['sbcs', '/xapi/v1/Sbcs']
+] as const
+
+/**
+ * Singletons: one record each, no `value` array.
+ *
+ * Worth the requests because this is where the system's own DNs are declared -
+ * the voicemail, conference, fax and parking extensions. Everywhere else in the
+ * API those numbers only ever appear as the target of a route, which is why the
+ * graph has to synthesise a node for them and can say nothing about what they
+ * are. Folded into one `systemSettings` set, each record tagged with the
+ * singleton it came from so a hit can say which page of 3CX to look on.
+ */
+const SYSTEM_SINGLETONS = [
+  'VoicemailSettings',
+  'ConferenceSettings',
+  'FaxServerSettings',
+  'CallParkingSettings',
+  'EmergencyNotificationsSettings',
+  'MusicOnHoldSettings',
+  'GeneralSettingsForPbx',
+  'OfficeHours',
+  'E164Settings',
+  'DialCodeSettings',
+  'PhonesSettings'
+] as const
+
+/** Fetch one singleton as a single-record set, or nothing if it isn't there. */
+async function fetchSingleton(name: string): Promise<Record<string, unknown> | null> {
+  const sess = session
+  if (!sess) return null
+  try {
+    // A singleton has no `value` array, so getCollection cannot read it: one
+    // plain GET, and anything other than a JSON object is treated as absent.
+    const res = await request(`${sess.baseUrl}/xapi/v1/${name}`, {
+      headers: { Authorization: `Bearer ${sess.token}`, Accept: 'application/json' },
+      allowInsecure: sess.allowInsecure
+    })
+    if (res.status < 200 || res.status >= 300) return null
+    const raw = JSON.parse(res.body) as Record<string, unknown> | null
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    // Strip OData's own annotations, then tag it so a search hit can name the
+    // settings page it came from.
+    const out: Record<string, unknown> = { Setting: name }
+    for (const [k, v] of Object.entries(raw)) if (!k.startsWith('@odata')) out[k] = v
+    return out
+  } catch {
+    return null
+  }
+}
+
 export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Promise<Topology> {
   if (!session) throw new Error('Not connected.')
 
@@ -494,6 +570,20 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
   )
   const [queues2, ringGroups2, groups2, users2, receptionists2] = retried
 
+  // Search-only configuration. Fetched after the spine so a slow or missing
+  // endpoint here can never hold up the graph, and every failure is already
+  // contained by fetchSet.
+  const extraSets = await Promise.all(EXTRA_COLLECTIONS.map(([, path]) => fetchSet(path)))
+  const singletons = await Promise.all(SYSTEM_SINGLETONS.map((n) => fetchSingleton(n)))
+  const extra: Record<string, EntitySet> = {}
+  EXTRA_COLLECTIONS.forEach(([key], i) => {
+    extra[key] = extraSets[i]
+  })
+  extra.systemSettings = {
+    path: '/xapi/v1/(singletons)',
+    value: singletons.filter((r): r is Record<string, unknown> => r !== null)
+  }
+
   // Per-queue agent logins aren't in the config API at all, so optionally read
   // them from the web client's Switchboard and stamp them onto the agent entries
   // (see switchboard.ts). Everything downstream then treats them as if 3CX had
@@ -519,7 +609,8 @@ export async function fetchTopology(opts?: { includeQueueLogins?: boolean }): Pr
     // The script source travels through intact: it is the only thing that says
     // what a route point does, and the details panel shows it. It is withheld
     // when a snapshot is written instead — see stripScriptSource.
-    callFlowApps: await withScriptSources(callFlowApps, session)
+    callFlowApps: await withScriptSources(callFlowApps, session),
+    ...extra
   })
 }
 

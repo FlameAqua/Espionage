@@ -22,6 +22,7 @@ import {
   departmentLabel,
   presenceOf,
   queueLoginState,
+  routeGroupOf,
   type EdgeKind,
   type GraphNode,
   type NodeKind
@@ -1299,6 +1300,27 @@ export function renderApp(
     }
     const kindLabel = EDGE_KIND_META[info.kind as EdgeKind]?.label ?? info.kind
     ctxEl.innerHTML = ''
+    // Right-clicking one route of an expanded link offers to hide just that
+    // route. "Hide this link" below still takes the whole bundle - which is what
+    // it used to do from here, and the only thing it could do before routes were
+    // individually hideable.
+    if (info.tappedRouteId && info.tappedLabel) {
+      const routeId = info.tappedRouteId
+      const routeLabel = info.tappedLabel
+      ctxEl.append(
+        item(ICONS.hide, `Hide the “${routeLabel}” route`, () => {
+          view.hideEdge(routeId)
+          undo.push({
+            type: 'hide',
+            nodeIds: [],
+            edgeIds: [routeId],
+            edgeKinds: [],
+            hidden: true
+          })
+          flash('Route hidden - undo with Ctrl+Z.')
+        })
+      )
+    }
     ctxEl.append(
       item(ICONS.hide, 'Hide this link', () => {
         view.hideEdge(info.edgeId)
@@ -1346,6 +1368,23 @@ export function renderApp(
     placeCtx(x, y)
   }
 
+  /** How many links are hidden right now.
+   *
+   *  A route is a link - a bundled link is several of them drawn as one - so they
+   *  are counted in the same unit. What the two view methods separate is only
+   *  where a hidden one was sitting: a link with nothing left to draw disappears
+   *  and is counted by hiddenEdgeCount, while a route hidden out of a link that
+   *  still carries others leaves the link on screen and so has to be counted by
+   *  hiddenRouteCount instead. Both are one hidden link to the person who hid it.
+   *
+   *  Counted off the graph and not off the hidden-rule set, because one rule -
+   *  a hidden link type - is worth however many links carry that type. That is
+   *  what used to make this number disagree with the panel's heading. */
+  const hiddenLinkTally = (): { total: number; text: string } => {
+    const total = view.hiddenEdgeCount() + view.hiddenRouteCount()
+    return { total, text: `${total} link${total === 1 ? '' : 's'}` }
+  }
+
   // Right-click on empty canvas: a compact Undo / Redo menu.
   const showBgCtx = (x: number, y: number): void => {
     const item = (icon: string, label: string, fn: () => void): HTMLElement => {
@@ -1366,8 +1405,8 @@ export function renderApp(
     else ctxEl.append(disabledItem('↪', 'Redo'))
     // Only way back from "Hide", so it lives on the always-reachable menu.
     const hiddenNodes = view.hiddenCount()
-    const hiddenEdges = view.hiddenEdgeCount()
-    if (hiddenNodes || hiddenEdges) ctxEl.append(divider())
+    const hiddenLinks = hiddenLinkTally()
+    if (hiddenNodes || hiddenLinks.total) ctxEl.append(divider())
     if (hiddenNodes) {
       ctxEl.append(
         item(ICONS.eye, `Unhide all nodes (${hiddenNodes})`, () => {
@@ -1380,9 +1419,12 @@ export function renderApp(
       )
       ctxEl.append(item(ICONS.search, 'Unhide specific nodes…', showUnhidePanel))
     }
-    if (hiddenEdges) {
+    if (hiddenLinks.total) {
+      // The same pair the nodes above get: everything at once, or a list to pick
+      // from. Links go away a type or a route at a time, so the second one is
+      // what usually gets used - but a stray hide should still cost one click.
       ctxEl.append(
-        item(ICONS.eye, `Show ${hiddenEdges} hidden link${hiddenEdges === 1 ? '' : 's'}`, () => {
+        item(ICONS.eye, `Unhide all links (${hiddenLinks.total})`, () => {
           const ids = view.hiddenEdgeIdList()
           const kinds = view.getHiddenEdgeKinds()
           const routes = view.getHiddenRouteGroups()
@@ -1396,9 +1438,11 @@ export function renderApp(
             routeGroups: routes,
             hidden: false
           })
+          openPanelRefresh?.()
           flash('Hidden links restored.')
         })
       )
+      ctxEl.append(item(ICONS.search, 'Unhide specific links…', showHiddenEdgesPanel))
     }
     placeCtx(x, y)
   }
@@ -1834,6 +1878,22 @@ export function renderApp(
         run: () => setDept(bucket)
       })
     }
+    if (view.hiddenCount()) {
+      cmds.push({
+        title: 'Unhide specific nodes…',
+        group: 'View',
+        keywords: 'hidden restore show',
+        run: showUnhidePanel
+      })
+    }
+    if (hiddenLinkTally().total) {
+      cmds.push({
+        title: 'Unhide specific links…',
+        group: 'View',
+        keywords: 'hidden restore show route link',
+        run: showHiddenEdgesPanel
+      })
+    }
     if (view.hiddenCount() || view.hiddenEdgeCount()) {
       cmds.push({
         title: 'Restore hidden nodes and links',
@@ -2014,12 +2074,7 @@ export function renderApp(
       onOpenZones: () => showZoneSettings(),
       onCheckUpdates: () => void checkForUpdates(),
       individuallyHiddenEdges: view.hiddenEdgeIdList().length,
-      onRestoreHiddenEdges: () => {
-        const ids = view.hiddenEdgeIdList()
-        view.unhideEdges(ids)
-        undo.push({ type: 'hide', nodeIds: [], edgeIds: ids, edgeKinds: [], hidden: false })
-        flash('Hidden links restored.')
-      },
+      onRestoreHiddenEdges: () => showHiddenEdgesPanel(),
       onSaveLayoutDefault: () => {
         try {
           localStorage.setItem(LAYOUT_DEFAULT_KEY, JSON.stringify(sizes))
@@ -3093,6 +3148,226 @@ export function renderApp(
     panel
       .querySelector('#unhideEverything')
       ?.addEventListener('click', () => restore(view.hiddenNodeIds(), 'All hidden nodes'))
+  }
+
+  /** What is currently switched off among the links, and a way to put back any
+   *  one piece of it.
+   *
+   *  Links are hidden in three different currencies - a whole link type, a route
+   *  type, or one individual link or route - and the only way back used to be
+   *  "restore everything", so a stray hide cost you every deliberate one too. */
+  const showHiddenEdgesPanel = (): void => {
+    const kinds = view.getHiddenEdgeKinds()
+    const groups = view.getHiddenRouteGroups()
+    const ids = view.hiddenEdgeIdList()
+
+    const nodeById = new Map(graph.nodes.map((n) => [n.id, n]))
+    const nodeLabel = (id: string): string => {
+      const n = nodeById.get(id)
+      if (!n) return id
+      return n.number ? `${n.label} ${n.number}` : n.label
+    }
+    // "queue:8000->user:2001::route:1" names one route of a link; without the
+    // suffix it is the whole link. Either can be sitting in the hidden set.
+    const describe = (id: string): { ends: string; route?: string; kind: EdgeKind } | null => {
+      const m = /^(.*)::route:(\d+)$/.exec(id)
+      const baseId = m ? m[1] : id
+      const index = m ? Number(m[2]) : -1
+      const e = graph.edges.find((x) => x.id === baseId)
+      if (!e) return null
+      return {
+        ends: `${nodeLabel(e.source)} -> ${nodeLabel(e.target)}`,
+        route: index >= 0 ? e.labels[index] : undefined,
+        kind: index >= 0 ? (e.labelKinds?.[index] ?? e.kind) : e.kind
+      }
+    }
+    // What a hidden type is actually costing, so the row says so rather than
+    // leaving it to be guessed.
+    const kindCount = (kind: string): number =>
+      graph.edges.filter((e) =>
+        e.labels.length
+          ? e.labels.some((_, i) => (e.labelKinds?.[i] ?? e.kind) === kind)
+          : e.kind === kind
+      ).length
+    const groupCount = (group: string): number =>
+      graph.edges.filter((e) => e.labels.some((l) => routeGroupOf(l) === group)).length
+
+    // The rules on show; what they cost is hiddenLinkTally(), which titles the
+    // panel so its heading and the menu that opened it agree.
+    const rules = kinds.length + groups.length + ids.length
+    const tally = hiddenLinkTally()
+    if (!rules) {
+      panelShell(
+        'Hidden links',
+        `<p class="text-slate-500 dark:text-slate-400">No links are hidden.</p>`
+      )
+      // Stay registered: hiding something while this is open should fill it in.
+      openPanelRefresh = showHiddenEdgesPanel
+      return
+    }
+
+    const done = (what: string): void => {
+      syncEdgeOptionsFromView()
+      flash(`${what} restored.`)
+      showHiddenEdgesPanel() // refresh the list in place
+    }
+    const restoreKind = (kind: string): void => {
+      view.setHiddenEdgeKinds(view.getHiddenEdgeKinds().filter((k) => k !== kind))
+      undo.push({ type: 'hide', nodeIds: [], edgeIds: [], edgeKinds: [kind], hidden: false })
+      done(EDGE_KIND_META[kind as EdgeKind]?.label ?? kind)
+    }
+    const restoreGroup = (group: string): void => {
+      view.setHiddenRouteGroups(view.getHiddenRouteGroups().filter((g) => g !== group))
+      undo.push({
+        type: 'hide',
+        nodeIds: [],
+        edgeIds: [],
+        edgeKinds: [],
+        routeGroups: [group],
+        hidden: false
+      })
+      done(`“${group}” routes`)
+    }
+    const restoreIds = (which: string[], what: string): void => {
+      view.unhideEdges(which)
+      undo.push({ type: 'hide', nodeIds: [], edgeIds: which, edgeKinds: [], hidden: false })
+      done(what)
+    }
+
+    const row = (
+      swatch: string,
+      main: string,
+      note: string,
+      attr: string
+    ): string => `<li class="flex items-center gap-2 px-1.5 py-0.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
+        <span class="w-4 h-0.5 rounded shrink-0" style="background:${swatch}"></span>
+        <span class="flex-1 truncate">${main}</span>
+        ${note ? `<span class="text-slate-400 text-[10px] shrink-0">${esc(note)}</span>` : ''}
+        <button ${attr} class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-[10px] shrink-0">Unhide</button>
+      </li>`
+    const section = (title: string, count: number, rows: string): string =>
+      rows
+        ? `<div class="mb-2">
+          <h4 class="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">${esc(title)} <span class="text-slate-400">(${count})</span></h4>
+          <ul class="space-y-0.5 text-slate-600 dark:text-slate-300">${rows}</ul>
+        </div>`
+        : ''
+
+    // Link types and route types were two sections, which put "manager" under
+    // "Route types" - true to the code (routeGroupOf('manager') is 'manager')
+    // and useless to read. They are one list of types now, keyed by how they
+    // read on screen, and a type hidden both ways is one row that undoes both.
+    const typeRows = new Map<
+      string,
+      { color: string; count: number; kind?: string; group?: string }
+    >()
+    for (const k of kinds) {
+      const meta = EDGE_KIND_META[k as EdgeKind]
+      const label = meta?.label ?? k
+      const at = typeRows.get(label) ?? { color: meta?.color ?? '#94a3b8', count: 0 }
+      typeRows.set(label, { ...at, count: Math.max(at.count, kindCount(k)), kind: k })
+    }
+    for (const g of groups) {
+      // A route group that names a link type is that link type, so it lands on
+      // the same row rather than a second one under a different heading.
+      const meta = EDGE_KIND_META[g as EdgeKind]
+      const label = meta?.label ?? g
+      const at = typeRows.get(label) ?? {
+        color: meta?.color ?? EDGE_KIND_META.route.color,
+        count: 0
+      }
+      typeRows.set(label, { ...at, count: Math.max(at.count, groupCount(g)), group: g })
+    }
+    const kindRows = [...typeRows.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([label, e]) => {
+        const attrs = [
+          e.kind ? `data-unhide-kind="${esc(e.kind)}"` : '',
+          e.group ? `data-unhide-group="${esc(e.group)}"` : ''
+        ]
+          .filter(Boolean)
+          .join(' ')
+        return row(
+          e.color,
+          esc(label),
+          `${e.count} link${e.count === 1 ? '' : 's'}`,
+          attrs
+        )
+      })
+      .join('')
+    const idRows = ids
+      .map((id) => {
+        const d = describe(id)
+        if (!d) {
+          return row(
+            '#94a3b8',
+            `<span class="text-slate-400 italic">No longer on the graph</span>`,
+            '',
+            `data-unhide-id="${esc(id)}"`
+          )
+        }
+        const main = d.route
+          ? `${esc(d.ends)} <span class="text-slate-400">· ${esc(d.route)}</span>`
+          : esc(d.ends)
+        return row(
+          EDGE_KIND_META[d.kind]?.color ?? '#94a3b8',
+          main,
+          d.route ? 'route' : 'link',
+          `data-unhide-id="${esc(id)}"`
+        )
+      })
+      .join('')
+
+    panelShell(
+      tally.total ? `Hidden links - ${tally.total}` : 'Hidden links',
+      section('Link types', typeRows.size, kindRows) +
+        section('Individual links', ids.length, idRows),
+      `<button id="unhideEveryLink" class="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100 text-[11px]">Unhide all</button>`
+    )
+    // Keep the list live: hiding or restoring anything else re-renders it.
+    openPanelRefresh = showHiddenEdgesPanel
+    for (const b of panel.querySelectorAll<HTMLElement>(
+      '[data-unhide-kind],[data-unhide-group]'
+    )) {
+      b.addEventListener('click', () => {
+        // Clear the type filter before the route filter, so a row standing for
+        // both leaves nothing behind. Only the last one refreshes the list.
+        const kind = b.dataset.unhideKind
+        const group = b.dataset.unhideGroup
+        if (kind && group) {
+          view.setHiddenEdgeKinds(view.getHiddenEdgeKinds().filter((k) => k !== kind))
+          undo.push({
+            type: 'hide',
+            nodeIds: [],
+            edgeIds: [],
+            edgeKinds: [kind],
+            routeGroups: [group],
+            hidden: false
+          })
+          view.setHiddenRouteGroups(view.getHiddenRouteGroups().filter((g) => g !== group))
+          done(EDGE_KIND_META[kind as EdgeKind]?.label ?? kind)
+        } else if (kind) restoreKind(kind)
+        else if (group) restoreGroup(group)
+      })
+    }
+    for (const b of panel.querySelectorAll<HTMLElement>('[data-unhide-id]')) {
+      b.addEventListener('click', () => restoreIds([b.dataset.unhideId!], 'Link'))
+    }
+    panel.querySelector('#unhideEveryLink')?.addEventListener('click', () => {
+      const allIds = view.hiddenEdgeIdList()
+      const allKinds = view.getHiddenEdgeKinds()
+      const allGroups = view.getHiddenRouteGroups()
+      view.unhideAllEdges()
+      undo.push({
+        type: 'hide',
+        nodeIds: [],
+        edgeIds: allIds,
+        edgeKinds: allKinds,
+        routeGroups: allGroups,
+        hidden: false
+      })
+      done('All hidden links')
+    })
   }
 
   // --- Snapshot comparison ------------------------------------------------

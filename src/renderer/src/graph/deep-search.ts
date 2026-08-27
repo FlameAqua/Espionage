@@ -118,6 +118,20 @@ export type CollectionKey =
   | 'trunks'
   | 'groups'
   | 'callFlowApps'
+  // Configuration the graph never draws — see the Topology comment for why.
+  | 'parkings'
+  | 'fxs'
+  | 'fax'
+  | 'contacts'
+  | 'customPrompts'
+  | 'promptSets'
+  | 'holidays'
+  | 'blackListNumbers'
+  | 'blocklist'
+  | 'emergencyLocations'
+  | 'sipDevices'
+  | 'sbcs'
+  | 'systemSettings'
 
 /** Every collection the topology carries, in the order results are grouped —
  *  roughly the order a call travels: in off a trunk, through the rules, to the
@@ -132,7 +146,23 @@ export const DEEP_COLLECTIONS: Array<{ key: CollectionKey; label: string }> = [
   { key: 'queues', label: 'Queues' },
   { key: 'ringGroups', label: 'Ring groups' },
   { key: 'users', label: 'Extensions' },
-  { key: 'groups', label: 'Departments' }
+  { key: 'groups', label: 'Departments' },
+  // Then the rest of the configuration, which has no place on the graph but is
+  // where the answer often actually is: a park orbit, a DECT handset's line, the
+  // fax DN, the prompt an IVR names, a blocked number.
+  { key: 'parkings', label: 'Park orbits' },
+  { key: 'fxs', label: 'DECT / FXS gateways' },
+  { key: 'fax', label: 'Fax extensions' },
+  { key: 'contacts', label: 'Phonebook' },
+  { key: 'customPrompts', label: 'Prompt files' },
+  { key: 'promptSets', label: 'Prompt sets' },
+  { key: 'holidays', label: 'Holidays' },
+  { key: 'blackListNumbers', label: 'Blocked numbers' },
+  { key: 'blocklist', label: 'IP allow / block list' },
+  { key: 'emergencyLocations', label: 'Emergency locations' },
+  { key: 'sipDevices', label: 'SIP devices' },
+  { key: 'sbcs', label: 'SBCs' },
+  { key: 'systemSettings', label: 'System settings' }
 ]
 
 /** Deep enough for anything 3CX nests, shallow enough that a surprise can't

@@ -1,5 +1,4 @@
 provider: github
 owner: FlameAqua
-repo: 3cx-spy
-private: true
+repo: Espionage
 updaterCacheDirName: espionage-updater

@@ -102,6 +102,14 @@ export interface GraphEdge {
   target: string
   /** One entry per underlying relationship collapsed into this edge. */
   labels: string[]
+  /** The kind of each entry in `labels`, same order and length. A bundle can mix
+   *  kinds - a queue's manager who is also a ring group member collapses into one
+   *  link - so filtering by link type has to be decided per route, not per link.
+   *  Absent on edges built before this existed (and on unlabelled links, which
+   *  have only `kind`); fall back to `kind` then. */
+  labelKinds?: EdgeKind[]
+  /** The link's dominant kind: the first relationship recorded for it. Drives its
+   *  colour and its class. See labelKinds for what it does NOT decide. */
   kind: EdgeKind
   /** For `agent` edges: whether that agent is logged in to THIS queue.
    *  3CX v20 lets a supervisor log an agent out of one queue while leaving them

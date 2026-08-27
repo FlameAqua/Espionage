@@ -1,10 +1,10 @@
 {
   "name": "espionage",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Interactive graph viewer for a 3CX phone system's call flow",
   "main": "./out/main/index.js",
   "author": "Adrian Szydlo",
-  "homepage": "https://github.com/FlameAqua/3cx-spy",
+  "homepage": "https://github.com/FlameAqua/Espionage",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",

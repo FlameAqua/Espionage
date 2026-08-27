@@ -276,4 +276,40 @@ export interface Topology {
   /** Route points: the DNs a Call Flow Designer script is deployed on. Optional
    *  because snapshots written before this existed simply won't have it. */
   callFlowApps?: EntitySet
+
+  // --- Configuration beyond the call-flow spine -----------------------------
+  // Not used to build the graph. These exist so Deep Search can answer "where is
+  // this number configured?" about the parts of the system the topology never
+  // draws - a park orbit, a DECT handset's line, the fax DN, a prompt filename.
+  // All optional: a snapshot written before they existed simply won't have them,
+  // and a PBX that doesn't expose one yields an empty set rather than an error.
+
+  /** Park orbits (`*0`, `*1`, …). Real DNs the graph only ever synthesised. */
+  parkings?: EntitySet
+  /** DECT / FXS base stations, and the extensions bound to each of their lines. */
+  fxs?: EntitySet
+  /** Fax extensions. */
+  fax?: EntitySet
+  /** The company phonebook - the best answer for an EXTERNAL number. */
+  contacts?: EntitySet
+  /** Uploaded prompt files. Joins an IVR's `PromptFilename`. */
+  customPrompts?: EntitySet
+  /** Prompt sets. `PromptSet` GUIDs on users/queues/IVRs join `Folder` here. */
+  promptSets?: EntitySet
+  /** Holidays, as their own records rather than only nested under a department. */
+  holidays?: EntitySet
+  /** Blocked caller numbers. */
+  blackListNumbers?: EntitySet
+  /** IP allow/block entries. */
+  blocklist?: EntitySet
+  /** Emergency locations. Joins a user's `EmergencyLocationId`. */
+  emergencyLocations?: EntitySet
+  /** Registered SIP devices. */
+  sipDevices?: EntitySet
+  /** Session border controllers. */
+  sbcs?: EntitySet
+  /** System-wide settings, one record each: the voicemail / conference / fax /
+   *  parking DNs live here, and are otherwise only ever guessed at from a
+   *  routing reference that points at them. */
+  systemSettings?: EntitySet
 }

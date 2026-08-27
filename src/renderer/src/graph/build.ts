@@ -104,11 +104,17 @@ class Builder {
     const id = `${source}->${target}`
     let edge = this.edgeByPair.get(id)
     if (!edge) {
-      edge = { id, source, target, kind, labels: [] }
+      edge = { id, source, target, kind, labels: [], labelKinds: [] }
       this.edges.push(edge)
       this.edgeByPair.set(id, edge)
     }
-    if (label && !edge.labels.includes(label)) edge.labels.push(label)
+    // Kept in step with `labels` so labelKinds[i] is always the kind of
+    // labels[i] - that pairing is what lets a link type be hidden out of a
+    // bundle without taking the rest of the bundle with it.
+    if (label && !edge.labels.includes(label)) {
+      edge.labels.push(label)
+      edge.labelKinds?.push(kind)
+    }
     return edge
   }
 

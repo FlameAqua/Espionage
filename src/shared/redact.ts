@@ -3,8 +3,16 @@
 // auth id) are never used by the graph and must never be shown or persisted —
 // a snapshot is a shareable file, so leaking them would be a real exposure.
 
-// Match: any *Password, plus AuthID and VMPIN (exact, case-insensitive).
-const SENSITIVE = /password$|^(?:authid|vmpin)$/i
+// Deliberately broad, and matched anywhere in the field name rather than
+// anchored. The old pattern was `password$|^(authid|vmpin)$`, which let two
+// credentials through on a collection already being fetched: a trunk's
+// `SeparateAuthId` (not an exact "authid") and `Messaging.MESSAGING_API_KEY`.
+// Both were reaching the renderer and being written into shared snapshots.
+//
+// Over-redaction costs a field nobody reads; under-redaction ships a secret, so
+// this errs the safe way. Non-string values are never touched (see below), which
+// is what keeps `PinProtected`, `PinProtectTimeout` and `FxsLines[].Key` intact.
+const SENSITIVE = /password|secret|credential|token|auth_?id|api_?key|key|pin$|pinnumber$/i
 
 const REDACTED = '[redacted]'
 

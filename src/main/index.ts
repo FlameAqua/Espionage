@@ -123,6 +123,7 @@ function normalizeTopology(raw: unknown): Topology | null {
 
 function registerAppIpc(): void {
   ipcMain.handle('app:openWindow', (_evt, hash: string) => createWindow(hash))
+  ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('app:copy', (_evt, text: string) => clipboard.writeText(text))
   ipcMain.handle('app:openExternal', (_evt, url: string) => {
     // Only ever open web links (e.g. the 3CX console), never file:// etc.

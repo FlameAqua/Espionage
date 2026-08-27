@@ -71,3 +71,40 @@ describe('stripScriptSource', () => {
     expect(stripScriptSource(bare)).toBe(bare)
   })
 })
+
+// Field names taken from a live v20 PBX's own responses. The first two were
+// reaching the renderer and being written into shared snapshots: the old pattern
+// matched `password$` and the exact words `authid` / `vmpin`, and neither of
+// these is either.
+describe('redactSecrets — credentials the old pattern let through', () => {
+  it('redacts a trunk\u2019s SeparateAuthId', () => {
+    const out = redactSecrets({ SeparateAuthId: 'abc123', Number: '8001' })
+    expect(out.SeparateAuthId).toBe('[redacted]')
+    expect(out.Number).toBe('8001')
+  })
+
+  it('redacts a trunk\u2019s messaging API key, nested', () => {
+    const out = redactSecrets({ Messaging: { MESSAGING_API_KEY: 'k-live-1', Provider: 'generic' } })
+    expect(out.Messaging.MESSAGING_API_KEY).toBe('[redacted]')
+    expect(out.Messaging.Provider).toBe('generic')
+  })
+
+  it('redacts an FXS gateway\u2019s Secret and a transcription key', () => {
+    const out = redactSecrets({ Secret: 's', TranscribeSecretKey: 'k', Model: 'SIP-W70B' })
+    expect(out.Secret).toBe('[redacted]')
+    expect(out.TranscribeSecretKey).toBe('[redacted]')
+    expect(out.Model).toBe('SIP-W70B')
+  })
+
+  it('redacts a conference PIN', () => {
+    expect(redactSecrets({ PinNumber: '123456' }).PinNumber).toBe('[redacted]')
+  })
+
+  // The type guard is what keeps the broad name match from eating real data.
+  it('leaves non-string fields alone however they are named', () => {
+    const out = redactSecrets({ PinProtected: false, PinProtectTimeout: 0, Key: 1 })
+    expect(out.PinProtected).toBe(false)
+    expect(out.PinProtectTimeout).toBe(0)
+    expect(out.Key).toBe(1)
+  })
+})

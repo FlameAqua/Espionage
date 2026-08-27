@@ -42,9 +42,8 @@ publish:
   provider: github
   # Must match OWNER/REPO in src/main/updater.ts.
   owner: FlameAqua
-  repo: 3cx-spy
-  private: true
-  # Default channel. The release workflow overrides this per-tag
-  # (-c.publish.releaseType): tags with a -beta/-rc suffix publish as
-  # pre-releases, a bare vX.Y.Z publishes as a normal release.
-  releaseType: prerelease
+  repo: Espionage
+  # A public repo: the installed app reads the release feed anonymously.
+  # The release workflow decides per-tag whether a build is a pre-release
+  # (a -beta/-rc suffix) or a normal release (a bare vX.Y.Z).
+  releaseType: release

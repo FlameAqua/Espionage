@@ -1,10 +1,17 @@
 // Auto-update wiring around electron-updater.
 //
-// Releases live in a PRIVATE GitHub repo, so electron-updater talks to the
-// GitHub API with an embedded read-only token (see UPDATE_TOKEN below). The
-// flow is driven from the UI: as soon as an update is found it downloads
-// automatically (with progress), but it is only *installed* when the user
-// clicks "Restart" — we never quit out from under them.
+// Releases live in a PUBLIC GitHub repo, so no credential is involved: the
+// updater reads the release feed anonymously. The flow is driven from the UI:
+// as soon as an update is found it downloads automatically (with progress), but
+// it is only *installed* when the user clicks "Restart" — we never quit out from
+// under them.
+//
+// This used to carry a read-only token embedded at build time, because the
+// release repo was private. Builds that still have that token keep working
+// against a public repo — GitHub accepts a valid token on public resources — so
+// the token must stay ALIVE until those builds have updated past this one.
+// Revoking it while they are still out there answers 401 and strands them on
+// manual downloads.
 
 import { app, BrowserWindow, ipcMain } from 'electron'
 import electronUpdater from 'electron-updater'
@@ -12,17 +19,11 @@ import type { UpdateStatus } from '../shared/types'
 
 const { autoUpdater } = electronUpdater
 
-// --- Private-repo configuration ------------------------------------------
-// Owner/repo are NOT secret. Edit them to match the repository that hosts the
-// release assets + latest.yml, and keep them in sync with the `publish` block
-// in electron-builder.yml.
+// --- Update source --------------------------------------------------------
+// The repository that hosts the release assets + latest.yml. Keep in step with
+// the `publish` block in electron-builder.yml.
 const OWNER = 'FlameAqua'
-const REPO = '3cx-spy'
-
-// A GitHub token with read-only access to the private update repo, embedded at
-// build time from MAIN_VITE_UPDATE_TOKEN (see .env.example). Without it a
-// private repo returns 404 and updates silently fail.
-const UPDATE_TOKEN = import.meta.env.MAIN_VITE_UPDATE_TOKEN ?? ''
+const REPO = 'Espionage'
 
 function broadcast(status: UpdateStatus): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -38,17 +39,12 @@ function configure(): void {
   // Pull as soon as an update is found, but leave installing to the user.
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = false
-  // Beta channel: let v1.0.0-beta.2 supersede v1.0.0-beta.1, and betas roll
-  // forward into the eventual stable release.
+  // Stable releases only. With prereleases allowed, electron-updater picks the
+  // newest release FLAGGED as a prerelease rather than the highest version, which
+  // pins clients to the last beta forever once a stable release exists.
   autoUpdater.allowPrerelease = false
 
-  autoUpdater.setFeedURL({
-    provider: 'github',
-    owner: OWNER,
-    repo: REPO,
-    private: true,
-    token: UPDATE_TOKEN
-  })
+  autoUpdater.setFeedURL({ provider: 'github', owner: OWNER, repo: REPO })
 
   autoUpdater.on('checking-for-update', () => broadcast({ kind: 'checking' }))
   autoUpdater.on('update-available', (info) =>
@@ -98,10 +94,6 @@ export function initUpdater(): void {
   })
 
   if (!app.isPackaged) return
-  if (!UPDATE_TOKEN) {
-    console.warn('[updater] No MAIN_VITE_UPDATE_TOKEN embedded - private-repo updates disabled.')
-    return
-  }
 
   configure()
   // Give the first window a moment to mount its status listener before checking.
